@@ -3,7 +3,7 @@ use clap::Parser;
 use std::env;
 use std::path::PathBuf;
 use crate::android::cli::AndroidCli;
-use crate::dev::DevelopmentCli;
+use crate::dev::{DevelopmentCli, Platform as DevPlatform};
 use crate::devices::cli::DevicesCli;
 use crate::host::Host;
 use crate::host::cli::HostCli;
@@ -66,6 +66,29 @@ impl Cli {
         let cwd = env::current_dir()
             .map_err(|_| PistonError::Generic("Error getting working directory".into()))?;
         let Self { piston: PistonCmd::Piston { cmd } } = Self::parse();
+        let Some(cmd) = cmd else { return HostCli::setup_identity(true); };
+        match &cmd {
+            PistonSubCmd::Setup => return HostCli::setup_identity(true),
+            PistonSubCmd::Share => return HostCli::share_identity(),
+            PistonSubCmd::Restore => return HostCli::restore_identity(),
+            PistonSubCmd::Version | PistonSubCmd::ListDevices => (),
+            PistonSubCmd::Dev(args) if matches!(
+                args.platform, Some(DevPlatform::Android | DevPlatform::Linux),
+            ) => (),
+            PistonSubCmd::Build(args) if args.dry_run || !matches!(
+                Platform::from_target(
+                    args.common.subcommand_args.target.as_deref().unwrap_or(Host::default_target()),
+                ),
+                Platform::Ios | Platform::Macos,
+            ) => (),
+            PistonSubCmd::Run(args) if args.device.as_deref() == Some("android") || !matches!(
+                Platform::from_target(
+                    args.common.subcommand_args.target.as_deref().unwrap_or(Host::default_target()),
+                ),
+                Platform::Ios | Platform::Macos,
+            ) => (),
+            _ => HostCli::setup_identity(false)?,
+        }
 
         if let PistonSubCmd::Dev(args) = cmd { return DevelopmentCli::start(args); }
         if let PistonSubCmd::Deploy(args) = cmd { return DeploymentCli::start(args); }
@@ -80,7 +103,8 @@ impl Cli {
         };
 
         match cmd {
-            PistonSubCmd::Dev(_) | PistonSubCmd::Deploy(_) | PistonSubCmd::Version => {
+            PistonSubCmd::Dev(_) | PistonSubCmd::Deploy(_) | PistonSubCmd::Version
+            | PistonSubCmd::Setup | PistonSubCmd::Share | PistonSubCmd::Restore => {
                 unreachable!()
             }
             PistonSubCmd::Build(args) => {
@@ -215,6 +239,12 @@ struct RunArgs {
 
 #[derive(clap::Subcommand)]
 enum PistonSubCmd {
+    /// Create or restore a developer identity for an Apple team.
+    Setup,
+    /// Select a team identity and print its private copy-and-paste transfer value.
+    Share,
+    /// Restore a developer identity from cargo piston share.
+    Restore,
     /// Build and run on the host, a mobile device/emulator, or a Linux VM.
     Dev(crate::dev::DevelopmentArgs),
     /// Upload an iOS build to TestFlight or the App Store.
@@ -230,7 +260,7 @@ enum PistonSubCmd {
 }
 
 #[derive(clap::Subcommand)]
-enum PistonCmd { Piston { #[clap(subcommand)] cmd: PistonSubCmd, }, }
+enum PistonCmd { Piston { #[clap(subcommand)] cmd: Option<PistonSubCmd>, }, }
 
 #[derive(Debug)]
 enum Platform { Android, Ios, Linux, Windows, Macos, Unknown, }

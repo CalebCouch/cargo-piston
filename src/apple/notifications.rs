@@ -95,7 +95,13 @@ impl NotificationSetup {
         id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
     }
 
-    pub fn configure(&self, path: &Path, key_id: &str, refresh: bool) -> Result<String> {
+    pub fn expected_identity(&self) -> Option<&str> {
+        self.settings.get("identity")
+            .filter(|_| self.settings.get("team") == Some(&self.signing.team))
+            .map(String::as_str)
+    }
+
+    pub fn configure(&self, path: &Path, key_id: &str, refresh: bool, store: &mut Credentials) -> Result<String> {
         if !Self::valid_id(key_id) || !Self::valid_id(&self.signing.team) {
             return Err(PistonError::Generic(
                 "APNs Key ID and Team ID must be 10 uppercase letters or digits.".into(),
@@ -122,44 +128,16 @@ impl NotificationSetup {
         })?;
         let credentials =
             ApnsCredentials { key, key_id: key_id.into(), team_id: self.signing.team.clone() };
-        let account = format!("team:{}", self.signing.team);
         let same_app = self.settings.get("team") == Some(&self.signing.team)
             && self.settings.get("topic") == Some(&self.signing.topic);
-        let expected = self
-            .settings
-            .get("identity")
-            .filter(|_| self.settings.get("team") == Some(&self.signing.team));
-        let mut store = Credentials::new()?;
-        let secret: Secret = match store.get(&account) {
-            Some(bytes) => serde_json::from_slice(bytes).map_err(|_| {
-                PistonError::Generic(
-                    "Piston's deployment identity in Keychain is invalid. Restore its backup."
-                        .into(),
-                )
-            })?,
-            None if expected.is_some() => {
-                return Err(PistonError::Generic(format!(
-                    "The deployment identity for team {} is missing from Keychain. Restore the \
-                 cargo-piston / credentials item containing {account} from the Mac that configured \
-                 this app. \
-                 A new identity cannot update the existing notification configuration.",
-                    self.signing.team,
-                )));
-            }
-            None => {
-                let secret = Secret::new();
-                store.save(&account, serde_json::to_vec(&secret).unwrap())?;
-                secret
-            }
-        };
+        let secret = store.identity(&self.signing.team, self.expected_identity())?
+            .ok_or_else(|| PistonError::Generic(
+                "The team's developer identity is missing. \
+                 Run cargo piston setup or cargo piston restore.".into(),
+            ))?;
         let owner = secret.name().to_string();
-        if expected.is_some_and(|expected| expected != &owner) {
-            return Err(PistonError::Generic(
-                "The Keychain identity does not own this app's notification configuration.".into(),
-            ));
-        }
         let init = (self.signing.topic.clone(), self.signing.sandbox);
-        let mut registration = Registration::new(&secret, &init, &mut store)?;
+        let mut registration = Registration::new(&secret, &init, store)?;
         let application = registration.instance.id().to_string();
         if same_app && self.settings.get("application").is_some_and(|id| id != &application) {
             return Err(PistonError::Generic(
@@ -171,7 +149,7 @@ impl NotificationSetup {
             .build()
             .map_err(|error| PistonError::Generic(error.to_string()))?;
         runtime.block_on(async {
-            let publish = registration.publish(credentials, refresh, secret, init, &mut store);
+            let publish = registration.publish(credentials, refresh, secret, init, store);
             tokio::time::timeout(Duration::from_secs(90), publish).await
                 .map_err(|_| PistonError::Generic(
                     "Notification setup timed out before confirmation. Check your connection and rerun; \

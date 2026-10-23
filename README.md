@@ -212,11 +212,43 @@ the contract location and APNs credentials. Piston reads the item once during
 setup and updates that same item as progress is confirmed; simultaneous setup
 commands cannot overwrite each other's credentials.
 
-Secrets are never written into the project or passed to Cargo. Keep a secure
-Keychain backup when moving to another Mac. An existing project's missing or
-mismatched owner identity produces an error; Piston does not silently replace it.
-Xcode's signing certificates remain managed by Apple and may have separate
-Keychain access prompts. Public settings and key-file paths remain in Cargo.toml.
+### Developer identities
+
+On a Mac with no Piston credentials, the first Apple build or development/deployment
+command asks whether to create or restore a developer identity. Choose **restore**
+when joining a team that already uses Piston. Creating an identity asks for the
+Apple Team ID; it does not create an Apple account or a signing certificate.
+Help, version, device listing, dry-run, and Android/Linux development commands do
+not require Apple identity setup.
+You can also open setup directly, outside a Cargo project:
+
+```sh
+cargo piston                    # create-or-restore setup
+cargo piston setup              # set up another team
+cargo piston share              # choose a stored team identity and copy its transfer line
+cargo piston restore            # paste a transfer line on another developer's Mac
+```
+
+The share menu lists Apple Team IDs and public AIR identities. Selecting one prints
+a single `piston-identity:` line containing that team's private identity. Share it
+privately: it grants full authority over every app using that identity. It is not
+permission-limited delegation. Piston exports neither other teams' identities nor
+the entire Keychain item. Apple account access, signing certificates, and `.p8`
+files are configured separately; they are not included in the transfer.
+
+Restore validates the identity and its team before saving it into the same
+`cargo-piston` / `credentials` Keychain item. Restoring the same identity again is
+safe; a different identity for an existing team is rejected. Other identities and
+notification registrations remain intact. Notification setup offers restore when
+Cargo.toml names an owner missing from this Mac, and checks that the restored
+identity matches before continuing. AIR registration locations are derived from
+the identity, app topic, and environment, so a restored identity can resume the
+same notification contracts on another Mac.
+
+Secrets are never written into the project or passed to Cargo. Xcode's signing
+certificates remain managed by Apple and may have separate Keychain access prompts.
+Public settings and key-file paths remain in Cargo.toml. Identity storage currently
+requires macOS Keychain; native Linux development does not require this setup.
 
 Cargo.toml stores public references and the original APNs key-file path:
 

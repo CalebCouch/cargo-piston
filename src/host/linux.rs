@@ -136,11 +136,15 @@ impl LinuxToolchain {
 pub struct Credentials;
 
 impl Credentials {
+    pub fn needs_setup() -> Result<bool> { Ok(false) }
+
     pub fn new() -> Result<Self> {
         Err(PistonError::Generic("Apple notification setup requires macOS Keychain.".into()))
     }
 
     pub fn get(&self, _account: &str) -> Option<&[u8]> { None }
+
+    pub fn accounts(&self) -> Vec<String> { Vec::new() }
 
     pub fn save(&mut self, _account: &str, _secret: Vec<u8>) -> Result<()> {
         Err(PistonError::Generic("Apple notification setup requires macOS Keychain.".into()))

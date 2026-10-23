@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal, Write};
-use crate::host::Host;
+use crate::host::{Credentials, Host};
 use crate::host::cli::HostCli;
 use crate::manifest::Manifest;
 use crate::{PistonError, Result};
@@ -32,6 +32,8 @@ impl NotificationCli {
     }
 
     pub fn configure(setup: &NotificationSetup) -> Result<String> {
+        let mut store = Credentials::new()?;
+        HostCli::identity(&mut store, Some(&setup.signing.team), setup.expected_identity())?;
         let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
         let environment = if setup.signing.sandbox { "development" } else { "production" };
         let path = setup.settings.get("key_path").map(String::as_str).unwrap_or("");
@@ -40,7 +42,7 @@ impl NotificationCli {
             match setup.key_path(path) {
                 Ok(path) => {
                     println!("Checking {environment} notifications for {}", setup.signing.topic);
-                    return setup.configure(&path, id, false);
+                    return setup.configure(&path, id, false, &mut store);
                 }
                 Err(error) if interactive => eprintln!("{error}"),
                 Err(error) => return Err(error),
@@ -125,7 +127,7 @@ impl NotificationCli {
             println!(
                 "Registering {environment} APNs configuration; waiting for AIR confirmation..."
             );
-            let application = setup.configure(&path, &key_id, true)?;
+            let application = setup.configure(&path, &key_id, true, &mut store)?;
             println!(
                 "APNs configuration confirmed in AIR and shared with the notification service. \
                 Public settings saved in Cargo.toml. Apple key permissions are verified on push delivery."

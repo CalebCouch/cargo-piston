@@ -1,3 +1,4 @@
+use security_framework::item::{ItemClass, ItemSearchOptions};
 use security_framework::os::macos::keychain::SecKeychain;
 use security_framework::os::macos::keychain_item::SecKeychainItem;
 use std::collections::HashMap;
@@ -8,11 +9,28 @@ use crate::{PistonError, Result};
 
 pub struct Credentials {
     entries: HashMap<String, Vec<u8>>,
-    item: SecKeychainItem,
+    keychain: SecKeychain,
+    item: Option<SecKeychainItem>,
     _lock: File,
 }
 
 impl Credentials {
+    pub fn needs_setup() -> Result<bool> {
+        let keychain = SecKeychain::default().map_err(Self::keychain_error)?;
+        match ItemSearchOptions::new()
+            .keychains(&[keychain])
+            .class(ItemClass::generic_password())
+            .service("cargo-piston")
+            .account("credentials")
+            .load_attributes(true)
+            .search()
+        {
+            Ok(_) => Ok(false),
+            Err(error) if error.code() == -25300 => Ok(true),
+            Err(error) => Err(Self::keychain_error(error)),
+        }
+    }
+
     pub fn new() -> Result<Self> {
         let root = PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
             PistonError::Generic("Cannot locate Piston's credential lock without HOME.".into())
@@ -35,30 +53,25 @@ impl Credentials {
         lock.try_lock().map_err(|error| {
             PistonError::Generic(format!(
                 "Cannot lock Piston's credentials: {error}. Finish any other Piston notification \
-             setup before retrying this command.",
+                 or identity setup before retrying this command.",
             ))
         })?;
         let keychain = SecKeychain::default().map_err(Self::keychain_error)?;
         let (bytes, item) = match keychain.find_generic_password("cargo-piston", "credentials") {
-            Ok(found) => found,
-            Err(error) if error.code() == -25300 => {
-                keychain
-                    .add_generic_password("cargo-piston", "credentials", b"{}")
-                    .map_err(Self::keychain_error)?;
-                keychain
-                    .find_generic_password("cargo-piston", "credentials")
-                    .map_err(Self::keychain_error)?
-            }
+            Ok((bytes, item)) => (bytes.to_vec(), Some(item)),
+            Err(error) if error.code() == -25300 => (b"{}".to_vec(), None),
             Err(error) => return Err(Self::keychain_error(error)),
         };
         let entries = serde_json::from_slice(&bytes).map_err(|_| {
             PistonError::Generic(
-            "Piston's Keychain item cargo-piston / credentials is invalid. Restore its backup; \
-             do not delete it or replace an existing deployment identity.".into(),
-        )
+                "Piston's Keychain item cargo-piston / credentials is invalid. Restore its backup; \
+                 do not delete it or replace an existing deployment identity.".into(),
+            )
         })?;
-        Ok(Self { entries, item, _lock: lock })
+        Ok(Self { entries, keychain, item, _lock: lock })
     }
+
+    pub fn accounts(&self) -> Vec<String> { self.entries.keys().cloned().collect() }
 
     pub fn get(&self, account: &str) -> Option<&[u8]> {
         self.entries.get(account).map(Vec::as_slice)
@@ -67,12 +80,22 @@ impl Credentials {
     pub fn save(&mut self, account: &str, secret: Vec<u8>) -> Result<()> {
         if self.get(account) == Some(secret.as_slice()) { return Ok(()); }
         let previous = self.entries.insert(account.into(), secret);
-        if let Err(error) = self.item.set_password(&serde_json::to_vec(&self.entries).unwrap()) {
+        let bytes = serde_json::to_vec(&self.entries).unwrap();
+        let result = match &mut self.item {
+            Some(item) => item.set_password(&bytes),
+            None => self.keychain.add_generic_password("cargo-piston", "credentials", &bytes),
+        };
+        if let Err(error) = result {
             match previous {
                 Some(previous) => { self.entries.insert(account.into(), previous); }
                 None => { self.entries.remove(account); }
             }
             return Err(Self::keychain_error(error));
+        }
+        if self.item.is_none() {
+            let (_, item) = self.keychain.find_generic_password("cargo-piston", "credentials")
+                .map_err(Self::keychain_error)?;
+            self.item = Some(item);
         }
         Ok(())
     }
