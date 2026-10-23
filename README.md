@@ -361,6 +361,11 @@ info_plist = "ios/Info.plist"
 # resources = ["ios/LaunchScreen.storyboard", "ios/wordmark.png"]
 ```
 
+`minimum_os` defaults to `17.0` and sets `IPHONEOS_DEPLOYMENT_TARGET` for compilation
+as well as the bundle's minimum iOS version. Device, simulator, and store builds
+link the executable with `/usr/lib/swift` and `@executable_path/Frameworks` runtime
+search paths. Existing project Rust flags are preserved.
+
 Paths in this metadata are relative to the selected package. Supply your app's privacy
 descriptions, such as camera access, in the optional Info.plist. Identity, executable,
 version, and minimum OS fields are resolved by Piston. Storyboards listed as resources

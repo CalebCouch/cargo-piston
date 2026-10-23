@@ -350,13 +350,18 @@ impl IOSApplication {
     fn compile(&mut self, target: &str, developer: &Path, report: &mut dyn FnMut(&str)) -> Result<PathBuf> {
         self.args.cargo.target = Some(target.into());
         let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
-        command.arg("build").arg("--message-format=json-render-diagnostics");
+        command.arg("rustc").arg("--message-format=json-render-diagnostics");
         self.args.cargo.apply(&mut command);
         if self.args.locked { command.arg("--locked"); }
         if self.args.offline { command.arg("--offline"); }
+        command.args([
+            "--", "-C", "link-arg=-Wl,-rpath,/usr/lib/swift",
+            "-C", "link-arg=-Wl,-rpath,@executable_path/Frameworks",
+        ]);
         command
             .current_dir(self.package.manifest_path.parent().unwrap())
             .env("DEVELOPER_DIR", developer)
+            .env("IPHONEOS_DEPLOYMENT_TARGET", &self.config.minimum_os)
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
         command.env_remove("RAMP_NOTIFICATION_APPLICATION");
