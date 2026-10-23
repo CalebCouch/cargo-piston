@@ -2,14 +2,70 @@
 
 # How to Use Cargo Piston
 
-Cargo piston is a utility tool for easily building & running rust binaries on MacOS and Linux host machines. Features are currently limited to MacOS host machines only. This crate supports building outputs for all of the listed compatible Android, Linux, MacOS, iOS, and Windows targets. Development is planned to support building all outputs on a Linux host machine, with the exception of MacOS and iOS outputs.
+Cargo Piston builds and runs Rust applications on macOS and Linux hosts. The `dev`
+command selects the host by default. On macOS it also supports iOS devices and
+Simulator, Android devices and emulators, and a Linux desktop VM. On Linux it runs
+native Linux applications and Android development with an installed SDK. Apple
+development requires macOS. The older `build` and `run` commands retain their
+separate packaging configuration, including Windows GNU builds from macOS.
 
-```
-HOST MACHINE | SUPPORTED OUTPUTS
-++++++++++++++++++++++++++++++++
-MacOS        | Android, iOS, MacOS, Linux, Windows
-Linux        | Future support for Android, Linux, and Windows planned
-```
+## Code organization
+
+Destination modules (`ios.rs`, `macos.rs`, `android.rs`, `linux.rs`, and `windows.rs`)
+own app packaging and deployment for that destination. `host/macos.rs` and
+`host/linux.rs` expose matching host and toolchain APIs, selected at their module
+declarations with `cfg`. These select the machine running Piston, not the app being
+built, so a macOS host can still build Android and Windows GNU outputs.
+
+Shared Apple signing and keychain operations live in `apple.rs`. App Store Connect
+authentication and API requests live separately in `apple/app_store.rs`, used by
+Apple signing and deployment. App Store screenshot preparation and upload live in
+`apple/app_store/artwork.rs`
+and `apple/app_store/release.rs`. Shared iOS app building lives in `ios/application.rs`;
+`ios/development.rs` owns connected-device development and `ios/distribution.rs` owns
+Xcode App Store archives, exports, and binary uploads. Rust modules use named files
+such as `host.rs`, with child modules in the matching directory.
+
+Start tracing a command in `src/cli.rs`. CLI files own argument parsing, prompts,
+terminal messages, recovery-page opening, and the sequence of operations. Service
+structures in the neighboring files perform builds, signing, device operations,
+network requests, and persistence. Services return results and recovery actions;
+they do not prompt or call back into CLI flows. Native tool and app output can
+still stream directly to the terminal.
+
+| Flow | CLI entry points under `src/` |
+| --- | --- |
+| Command dispatch and shared arguments | `cli.rs` |
+| Development platform selection | `dev/cli.rs`, then `host/cli.rs` for the default host |
+| macOS, iOS, Android development and older build/run commands | `macos/cli.rs`, `ios/cli.rs`, `android/cli.rs` |
+| Linux development and packaging | `linux/cli.rs`, then `linux/macos/cli.rs` for the VM or `host/linux/cli.rs` for native runs |
+| Windows GNU packaging | `windows/cli.rs` |
+| Device listing | `devices/cli.rs` |
+| App Store and TestFlight deployment | `ios/deployment/cli.rs` |
+| Compile, archive, export, and upload an iOS store build | `ios/distribution/cli.rs` |
+| App Store account setup and screenshots | `apple/app_store/setup/cli.rs`, `apple/app_store/release/cli.rs` |
+| TestFlight status monitoring and compliance actions | `apple/app_store/testflight/cli.rs` |
+| Signing-team selection and notification setup | `apple/xcode/cli.rs`, `apple/notifications/cli.rs` |
+| Xcode selection, download, and component setup on macOS | `host/macos/apple/cli.rs` |
+
+For example, `cargo piston deploy testflight` follows `cli.rs` →
+`ios/deployment/cli.rs` → account setup → `ios/distribution/cli.rs` →
+`apple/app_store/testflight/cli.rs`. A pending upload resumes monitoring directly.
+The distribution CLI shows team selection, notification setup, compilation,
+archiving, export, and upload in execution order.
+
+`project.rs` handles Cargo project selection and builds. `macos/development.rs`
+prepares local app bundles, `android/development.rs` builds and installs Maverick
+APKs, and `ios/simulator.rs` manages Simulator runs. Linux VM operations live in
+`linux/macos.rs`; the Swift viewer's window lifetime controls the VM.
+`apple/xcode.rs` generates signing projects, `apple/notifications.rs` registers
+notification credentials, and `apple/push.rs` prepares and verifies entitlements.
+Native Keychain access belongs to `host/macos/credentials.rs`.
+
+Piston generates platform metadata, including `Info.plist`, into the app's build
+output using project settings. Application runtime behavior belongs in Maverick.
+The old bundled Android photo picker and its camera declarations remain commented
+out. The Android development path packages Maverick's Gradle bridge instead.
 
 ## Installing Piston
 Cargo piston is a global cargo crate. There are two ways you can install it. Choose option one unless you have a reason not to.
@@ -20,7 +76,575 @@ Cargo piston is a global cargo crate. There are two ways you can install it. Cho
 2. Or obtain the source code locally via `git clone https://github.com/dav-anderson/cargo-piston` and then run the following command with the proper path to the source code
 `cargo install --path </path/to/cargo-piston>`
 
-After installation you must properly setup your `.env` and project `Cargo.toml` (shown below). You also must install your desired build targets via rustup.
+The iOS development command below does not require a `.env` file. The older platform
+build/run commands use the configuration described later in this document.
+
+## Development
+
+Select one platform per command. Omitting it runs the app on the host:
+
+```sh
+cargo piston dev                 # macOS on a Mac, Linux on Linux
+cargo piston dev macos
+cargo piston dev ios             # connected iPhone/iPad, otherwise iOS Simulator
+cargo piston dev android         # connected Android device, otherwise emulator
+cargo piston dev linux           # Linux desktop VM on a Mac, native on Linux
+```
+
+The command builds, installs where needed, and streams application output in the
+terminal. `--simulator` explicitly selects an iOS Simulator or Android emulator;
+`--device` selects a particular phone, simulator, or AVD. A running simulator or
+emulator is reused when it matches the request. Only the selected platform starts.
+An Android emulator started by the command closes when the session ends, fails, or
+is interrupted with Ctrl-C. A previously running emulator stays open.
+
+### macOS
+
+`cargo piston dev` builds for the Mac's native architecture, creates a `.app`
+bundle, and runs its executable with terminal output. Use
+`--target x86_64-apple-darwin` or `--target aarch64-apple-darwin` to select an architecture.
+Development builds use ad-hoc signing unless push notifications require an Apple
+team and provisioning. Universal distribution builds remain a separate build path.
+
+The root `icon.png`, `icon.jpg`, or `icon.jpeg` becomes the app icon. Optional
+`bundle_id`, `info_plist`, `entitlements`, and `resources` settings belong under
+`[package.metadata.piston.macos]`; paths are relative to the application package.
+
+### Android
+
+Android development requires a `cdylib` application and a Maverick dependency
+containing its `android/` Gradle bridge. Use `maverick_os::start!` or `ramp::run!`
+for the application entry point so the library exports Android's entry function.
+Piston generates the app manifest and
+Gradle packaging project in `target/piston/android`; the activity, permission
+handling, and other runtime code come from Maverick. Piston selects the device's
+supported Rust ABI, builds the library with cargo-ndk, signs a debug APK, installs
+it, launches it, and streams its logcat output.
+
+```sh
+cargo piston dev android
+cargo piston dev android --simulator
+cargo piston dev android --device emulator-5554 --target aarch64-linux-android
+```
+
+Piston reuses Android Studio's SDK and Java installation, installs missing SDK
+components and Rust tooling, and creates an AVD if none exists. SDK license prompts
+remain interactive. On macOS, missing command-line tooling can be installed using
+Homebrew. Set `ANDROID_HOME` and `JAVA_HOME`, or optional `sdk`, `java`, and `ndk`
+paths in `[package.metadata.piston.android]`, to use other installations. An optional
+`bundle_id` in that table selects the Android application ID. Connected phones need
+USB debugging enabled and this computer approved on the device.
+
+Android push-account setup and store distribution are not part of this development
+path. Apple push setup below applies to macOS and physical iOS devices; the iOS
+Simulator path builds without configuring remote push notifications.
+
+### Linux
+
+On macOS, `cargo piston dev linux` uses Lima and a dedicated desktop window. Piston
+installs Lima through Homebrew when needed, creates an Ubuntu VM, installs the
+guest build and desktop dependencies, copies the project and local dependencies,
+and builds inside Linux. The default VM uses two CPUs, 4 GiB RAM, and a sparse
+24 GiB disk. Source copies and the Cargo cache remain in the VM for later runs;
+host folders are not mounted.
+
+Closing the window, stopping with Ctrl-C, or a build/run failure shuts down the
+VM started by that command. Piston refuses to take over an already-running VM.
+An existing stopped Lima VM can be selected explicitly:
+
+```sh
+cargo piston dev linux --vm my-linux-vm
+cargo piston dev linux --lima /path/to/limactl --lima-home /path/to/lima-state --vm my-linux-vm
+```
+
+The selected `vm`, `lima`, and `lima_home` are saved under
+`[package.metadata.piston.linux]` in Cargo.toml. VM builds use the guest's native
+Rust target; an explicit `--target` must match it. Guest
+setup currently targets Ubuntu/Debian package tooling. The desktop uses software
+rendering, with no GPU passthrough. On a Linux host, the command builds and runs
+locally instead of starting a VM.
+
+### Push notification setup
+
+Run the ordinary development, deployment, or macOS build command:
+
+```sh
+cargo piston dev
+cargo piston dev ios
+cargo piston deploy testflight
+cargo piston build --target macos
+```
+
+During setup, Piston asks **Does this app use push notifications?** if the app has
+no saved choice or notification configuration. Both yes and no are saved in
+Cargo.toml, so later commands do not ask again. Answering no continues the normal
+build or deployment without notification setup. Answering yes starts the setup
+below, then continues the original command. Existing notification configuration
+already counts as yes. There is no `--notifications` flag.
+
+For apps that use notifications, Piston asks for an **APNs** key ID or downloaded
+`.p8` path and opens Apple's
+[Keys page](https://developer.apple.com/account/resources/authkeys/list).
+Choose Apple Push Notification service when creating the key, and configure its
+topic and environment scope for the app and selected Apple team. App Store Connect
+API keys do not grant APNs access. A filename such as `AuthKey_ABCDEFGHIJ.p8`
+supplies the key ID; entering an ID searches Spotlight for that exact filename.
+The selected key must remain outside the project and repository. Apple allows
+downloading each private key only once.
+
+After successful setup, ordinary builds reuse the saved configuration. To change
+the choice, edit `enabled` in `[package.metadata.piston.notifications]`. To rotate
+the APNs key, update the environment's `key_path` and `key_id`, or remove those two
+fields to be prompted again. Unattended builds require a saved choice or existing
+configuration; Piston reports how to supply it instead of guessing.
+Development and production have separate settings; configuring development does
+not assume that its APNs key also permits production. iPhone development uses the
+sandbox even with `--release`; TestFlight and App Store exports use production.
+For macOS, development builds use the sandbox and distribution exports use production.
+The existing `--prepare-only` deployment option checks App Store Connect and tools;
+notification registration runs when preparing the actual application build.
+
+Piston keeps its private deployment identities and notification registrations in
+one macOS Keychain item: service `cargo-piston`, account `credentials`. Each Apple
+team has its own AIR deployment identity inside that item, shared by that team's
+apps. Each app/environment retains its own private registration state, including
+the contract location and APNs credentials. Piston reads the item once during
+setup and updates that same item as progress is confirmed; simultaneous setup
+commands cannot overwrite each other's credentials.
+
+Secrets are never written into the project or passed to Cargo. Keep a secure
+Keychain backup when moving to another Mac. An existing project's missing or
+mismatched owner identity produces an error; Piston does not silently replace it.
+Xcode's signing certificates remain managed by Apple and may have separate
+Keychain access prompts. Public settings and key-file paths remain in Cargo.toml.
+
+Cargo.toml stores public references and the original APNs key-file path:
+
+```toml
+[package.metadata.piston.notifications]
+enabled = true
+
+[package.metadata.piston.notifications.ios.development]
+team = "ABCDEFGHIJ"
+topic = "org.example.app"
+identity = "<public AIR owner name>"
+keychain = "cargo-piston/credentials"
+application = "<public AIR application ID>"
+key_id = "1234567890"
+key_path = "/Users/developer/.keys/AuthKey_1234567890.p8"
+```
+
+Production settings use `notifications.ios.production`; macOS uses
+`notifications.macos.development` and `notifications.macos.production`.
+macOS signing saves its team under `package.metadata.piston.macos.team` and accepts
+`bundle_id` and an optional `entitlements` path in that table. When no macOS bundle
+ID is specified, an existing `piston.ios.bundle_id` is reused before the older
+macOS builder's default identifier.
+
+Piston creates or opens an ordinary `air_notifications::NotificationApplication`
+contract, waits for confirmed credential acceptance in AIR, and shares its private
+location with the notification service using AIR Inbox. Interrupted setup resumes
+the same application, and rotating credentials preserves its public ID. Confirmed
+AIR storage is distinct from Apple accepting an APNs delivery; key scope and
+revocation are ultimately checked when the notification service contacts Apple.
+
+Only the public ID is supplied as `RAMP_NOTIFICATION_APPLICATION` to the actual
+Cargo compilation, including both architectures in universal macOS builds.
+RAMP reads it with `option_env!`, so changing the ID invalidates the relevant Cargo
+build cache. Piston depends on AIR and `air_notifications`, not the UI stack.
+
+Notification-enabled builds request Push Notifications in the generated Xcode
+project and preserve custom entitlements. Piston verifies the final signature,
+embedded profile, team, topic, expiry, and APNs environment before installing or
+returning the app. iOS distribution checks the exported IPA. macOS notifications
+use Xcode automatic provisioning even when the older `.env` signing fields are
+absent; distribution exports retain an archive and installer in `target/piston/macos`.
+Mac App Store exports enable App Sandbox and outgoing network access. Developer ID
+exports retain the existing notarization step and its `DeveloperID-Notary` profile.
+
+This setup requires an Apple team with Push Notifications access. App runtime
+permission requests and per-installation push destinations remain in Maverick/RAMP.
+
+### iPhone and iPad
+
+From an application crate with a Rust binary target, run:
+
+```sh
+cargo piston dev ios
+```
+
+Piston selects the connected device, installs missing Rust target libraries, builds the
+application, prepares an app bundle, asks Xcode to sign it for development, installs it,
+and launches it with its standard output and standard error attached to your terminal.
+Ctrl-C stops the console session and is forwarded to the app. Repeating the command
+installs an update without uninstalling the app or erasing its container.
+Each run cleans Xcode's generated signing products before importing the Rust app,
+so Xcode signs the copied executable again. Cargo's compilation cache is preserved.
+
+This initial development path requires macOS, Xcode 15 or newer, and iOS/iPadOS 17 or
+newer. Add your Apple Account in Xcode Settings > Accounts once, connect and unlock
+your device and enable Developer Mode on the device. Piston starts pairing for an
+unpaired USB phone; accept the Trust This Computer prompt on the phone. It verifies
+the live development connection before building.
+Piston handles Xcode first-launch setup, automatic provisioning, and device
+registration using that account. Apple authentication, device trust, Developer Mode,
+and any macOS administrator approval remain interactive Apple requirements. Full
+Xcode installation requires Apple's installer; command-line tools alone are insufficient.
+
+With one configured signing team and one connected device, no other configuration is
+required. When several signing teams are available, Piston displays a numbered menu
+with each team's name and ID. Enter its number to continue the same build, or `q` to
+cancel. Piston saves the chosen team in `package.metadata.piston.ios.team` for later runs.
+An explicit `--team` changes the saved team and skips the menu; scripts without
+an interactive terminal must choose a team explicitly. Wired devices take priority
+over wireless devices. If several devices remain, select one with `--device`:
+
+```sh
+cargo piston dev ios --device "My iPhone" --team ABCDE12345
+cargo piston dev ios --target aarch64-apple-ios --release
+cargo piston dev ios --manifest-path apps/example/Cargo.toml --bin example --features camera
+cargo piston dev ios -- --example-app-argument
+cargo piston dev ios --simulator
+```
+
+Physical devices use `aarch64-apple-ios`. If no device is connected, Piston opens an
+iOS Simulator and uses `aarch64-apple-ios-sim` on Apple Silicon or `x86_64-apple-ios`
+on Intel. Missing simulator runtimes are installed through Xcode. An explicit
+simulator target also selects the simulator path. Catalyst and non-iOS targets are
+rejected. Package, binary, features, profile, manifest, target directory, `--locked`,
+and `--offline` options are passed through to Cargo. Piston reads the executable
+path from Cargo's build output.
+
+The default development bundle identifier is `dev.piston.<team>.<package>` so a
+development installation can coexist with the store app. Use `--bundle-id` or optional
+Cargo metadata to select another identifier and configure application capabilities:
+
+```toml
+[package.metadata.piston.ios]
+# team = "ABCDE12345"
+# bundle_id = "com.example.myapp.dev"
+minimum_os = "17.0"
+info_plist = "ios/Info.plist"
+# entitlements = "ios/App.entitlements"
+# resources = ["ios/LaunchScreen.storyboard", "ios/wordmark.png"]
+```
+
+Paths in this metadata are relative to the selected package. Supply your app's privacy
+descriptions, such as camera access, in the optional Info.plist. Identity, executable,
+version, and minimum OS fields are resolved by Piston. Storyboards listed as resources
+are compiled; PNG/JPEG resources also become named image assets in the same catalog as the app icon,
+so launch storyboards can resolve them before the app runs. Other resources are copied into the bundle.
+The resources list is optional:
+fonts, images, and other data embedded by Maverick, Ramp, PTSD, or the application are
+already in the executable and must not be listed again. Piston generates the OS app icon
+separately from the root icon file. Embedded dynamic frameworks currently need their own
+signing integration.
+
+The iOS app version uses numeric `major.minor.patch` from `package.version`; Cargo
+prerelease labels and build metadata are omitted. Store deployments automatically
+choose an integer build number higher than the app's existing iOS builds and the
+saved `package.metadata.piston.ios.build_number`. Piston saves it as a string in
+`Cargo.toml` before building. Device development uses that saved build number, or
+the numeric Cargo version before the first store deployment. iOS bundles support both
+iPhone and iPad, and default to all interface orientations. An app can restrict orientations through
+its supplied Info.plist.
+
+Place `icon.png`, `icon.jpg`, or `icon.jpeg` beside the selected package's
+`Cargo.toml`. Piston uses the first existing file in that order and compiles the
+iPhone and iPad app icons into the generated bundle. No icon-path configuration
+is needed. Without an icon file, the development command preserves any supplied icon
+settings; otherwise the system uses its default app icon.
+
+### Setup and recovery
+
+Piston installs missing Rust target libraries, prepares Xcode components, starts USB
+pairing, and requests automatic development signing and device registration. Apple
+Account sign-in, verification codes, Trust prompts, and enabling Developer Mode need
+your interaction. Piston reports the specific failure and the next steps in readable
+terminal output. When no signing account is configured or Xcode rejects its login,
+Piston opens the selected Xcode app directly to Settings > Accounts. Successful runs
+and unrelated build failures keep the Xcode UI closed. Rerun the same command after
+completing sign-in; if macOS cannot open the settings automatically, Piston prints the
+manual navigation steps.
+
+- **Apple Account rejected or expired:** open Xcode > Settings > Accounts, select the
+  account for the listed team, and complete sign-in and verification. Confirm your team
+  appears. If Xcode continues rejecting that account, remove and add the account again
+  in Xcode. Credentials stay in Xcode; Piston does not collect them. A missing-profile
+  message alongside rejected login is a consequence of the login failure.
+- **Developer Mode is disabled or hidden:** after pairing, reopen Settings on the
+  phone and scroll to the bottom of Privacy & Security. Enable Developer Mode, accept
+  the restart, unlock the phone, and confirm Turn On. If the setting remains hidden,
+  select the phone in Xcode's device manager and let Xcode prepare it.
+- **Project folder access denied:** allow the terminal app access to the project in
+  macOS System Settings > Privacy & Security > Files and Folders, or move the project
+  outside a protected Documents/Desktop/Downloads folder.
+
+Authentication is verified by Xcode when it requests signing assets. A team cached
+in Xcode settings does not prove the account's login is still valid. Once sign-in is
+working, Piston asks Xcode to create the development profile; manual profile setup
+is normally unnecessary. Cargo reuses completed compilation on the next attempt.
+
+Generated bundles, device diagnostics, and the signing project are placed under
+`<cargo-target-dir>/piston/ios/<package>/`. Xcode runs in the background; signing
+failures include recovery steps, relevant diagnostics, and the full log path. This
+command performs a single build/install/launch cycle; automatic reload and store
+submission are separate future workflows.
+
+## Deploy iOS to App Store Connect
+
+Run `cargo piston deploy` from the app crate. It validates the screenshot folders,
+checks App Store access, prepares images, builds a release ARM64 iOS app, archives
+and signs it with Xcode, and uploads its screenshots and binary to App Store Connect.
+No connected phone is used. Xcode may require an existing development provisioning
+profile to create the initial archive; a team with no registered devices receives
+instructions to register a development iPhone once. Export then signs for App Store
+distribution. Uploading does not submit the app for review or release it.
+
+Keep the app icon next to `Cargo.toml` and screenshots in these conventional folders:
+
+```text
+Cargo.toml
+icon.png
+store/
+  apple/
+    iphone/
+      01.png
+      02.png
+    ipad/
+      01.png
+```
+
+PNG, JPG, and JPEG inputs are accepted. Both families are required because Piston's
+iOS apps support iPhone and iPad. Put one to ten screenshots in each folder, using
+zero-padded filenames to select display order. Use screenshots from one supported display
+size per folder so each family forms a consistent gallery. This first implementation updates
+the app's primary App Store language; other localizations are preserved.
+
+Piston reads Apple's current screenshot specifications on each deployment. It keeps
+accepted dimensions or downsizes to an accepted size with exactly the same aspect
+ratio. It does not stretch, crop, or upscale the app's UI to invent another device
+layout. Capture the actual iPhone and iPad layouts. Invalid images produce a message
+with the source filename and accepted dimensions. Opaque alpha channels are removed;
+images containing transparent pixels need an opaque source. Generated RGB PNGs go
+under `<cargo-target-dir>/piston/ios/<package>/store/screenshots/`; originals stay intact.
+The root icon must be square, opaque, and at least 1024 pixels on each side for deployment.
+
+Set the store bundle identifier once in the app's Cargo metadata:
+
+```toml
+[package.metadata.piston.ios]
+bundle_id = "com.example.myapp"
+# team = "ABCDE12345"
+```
+
+It must match an app record in App Store Connect. The default development identifier
+is never used for a store upload. Select the signing team from the existing menu,
+set it in metadata, or pass `--team`. Use the team belonging to the API key below.
+
+App Store Connect API access is separate from Xcode's saved Apple Account. Run your
+deploy command in a terminal. When credentials are missing or invalid, Piston opens
+Apple's API-key page and guides you through setup. Enter the Issuer ID first, then
+either the Team API Key ID or the downloaded `.p8` file's path. Piston finds files by Key ID or infers the Key
+ID from an `AuthKey_<KEY_ID>.p8` filename. Renamed files need the Key ID entered manually.
+The Issuer ID comes from Apple's Team Keys page: it cannot be derived from the private
+key. Piston checks API access and remembers the complete configuration for later runs.
+Enter `q` to cancel. For automatic signing and uploads, create a
+Team Key with Admin access; the Account Holder may first need to enable API access.
+Store distribution requires Apple Developer Program membership.
+
+On that same **Team Keys** page, click **Download API Key** beside the key you created.
+The downloaded file is normally named `AuthKey_<KEY_ID>.p8`; check your browser's
+downloads for its location and enter that file's path at Piston's prompt, for example
+`~/Downloads/AuthKey_<KEY_ID>.p8`. Apple permits only one download. If the link is
+missing, locate the previously downloaded file. If it is lost, create a new Team Key
+and restart Piston setup with its new Key ID and file.
+
+On macOS, Piston searches Spotlight by the exact key filename, including indexed
+locations outside the usual folders. It also checks `private_keys/` beside the selected
+package, `~/.appstoreconnect/private_keys/`, `~/.private_keys/`, `~/private_keys/`, and
+`~/Downloads/` directly, so a recent download does not have to wait for indexing.
+Duplicate results for the same canonical file are combined. Multiple different matches
+produce a selection menu; scripts must set `ASC_KEY_PATH` to choose one. Discovery
+uses filenames, and the selected file and IDs are verified against Apple before saving.
+Spotlight cannot find excluded, unindexed or inaccessible files; entering a path still
+works for an accessible file in an unindexed folder. Piston does not alter search privacy
+settings or copy private key files.
+
+Piston writes remembered settings to the selected package's `Cargo.toml`, under
+`package.metadata.piston`. Account setup adds:
+
+```toml
+[package.metadata.piston.app_store_connect]
+issuer_id = "YOUR-ISSUER-UUID"
+key_id = "YOURKEY1234"
+key_path = "/path/to/AuthKey_YOURKEY1234.p8"
+```
+
+Only identifiers and the key-file location are saved; the private key stays in its
+original `.p8` file. Keep that file outside the repository, such as
+`~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8`. A manually configured `key_path`
+may use `~/` or a path relative to the package. Use `--setup` on your deploy command
+to replace the account settings in `Cargo.toml`.
+
+Signing-team selections are saved as `package.metadata.piston.ios.team`.
+An explicit `--team` changes that saved choice after selection. Successful TestFlight
+uploads save `app_id`, `version`, `build_number`, and `state` in
+`package.metadata.piston.testflight`, so
+deployment can resume even after `cargo clean`. The legacy Apple signing path saves
+its `team` and `identity` in `package.metadata.piston.apple.signing`.
+
+Old settings and receipt files are not read or migrated. Run deployment in an
+interactive terminal to enter the account setup again. Updates preserve unrelated
+manifest settings, comments, and formatting, and write the selected package's
+manifest even when using `--package` from a workspace. Build products, downloaded
+tools, diagnostics, and provisioning files remain build artifacts; private keys and
+OS-managed credentials remain in their key files or keychain. Xcode is discovered
+on each run.
+
+For CI, supply `ASC_ISSUER_ID` and either `ASC_KEY_ID` or `ASC_KEY_PATH` through the
+environment. A standard filename supplies the missing Key ID; a unique search match
+supplies the missing file path. Supplying all three remains supported.
+The app's `.env` also supports these names, including their lowercase forms. Shell
+values override `.env`; relative key paths resolve against the selected package.
+If any of these explicit values are supplied, Piston uses that configuration instead
+of mixing it with Cargo.toml account settings from another key. Environment overrides
+are not automatically saved. An explicitly supplied path
+always takes precedence over search results. Noninteractive runs report missing configuration and
+exit instead of prompting. Keep `.env` and private keys out of source control.
+
+Create the iOS app record in [App Store Connect → Apps](https://appstoreconnect.apple.com/apps)
+with the same bundle identifier. Piston uses its primary language and the numeric
+Cargo version. App Store deployment can create the draft version when necessary.
+
+```sh
+cargo piston deploy --manifest-path path/to/Cargo.toml
+cargo piston deploy --prepare-only
+cargo piston deploy --screenshots-only
+```
+
+`--prepare-only` performs read-only account/specification checks and prepares local
+screenshots, without building, signing, or uploading. It still requires API access.
+`--screenshots-only` updates the screenshot gallery for the Cargo version without
+uploading a binary. The normal command uploads both. Cargo package, binary, feature,
+manifest, target-directory, `--locked`, and `--offline` options are supported; offline
+applies to Cargo dependency resolution, while App Store operations need network access.
+
+Images already uploaded by Piston are reused by content hash. Piston waits for image
+processing before changing gallery placements and verifies the resulting display order.
+The local folders define the screenshot galleries selected for this deployment;
+other languages, device groups, and app-preview videos remain untouched. Library
+images are retained so existing placements can be restored if a replacement fails.
+
+The App Store version must be editable. If it is approved or under review, create a
+new version by increasing `package.version`, or resolve the pending review in App Store
+Connect. An unreleased app version can have multiple uploaded builds; Piston assigns
+a new build number without changing `package.version`. After uploading, complete the listing,
+privacy and review information in App Store Connect, then select the processed build
+and submit when ready. Piston never fabricates that information or submits automatically.
+
+Before compiling a new upload, Piston checks Apple's iOS release and build history.
+The Cargo version may equal an existing unreleased version. Piston stops if it is
+equal to or below a previously released version, because Apple closes released
+versions to new uploads. For an eligible version, Piston automatically increments
+the build number, including past expired builds. Versions are compared numerically
+(`1.10.0` is newer than `1.9.0`).
+Monitoring an existing TestFlight upload still resumes normally, and screenshot-only
+updates do not require a new binary version.
+
+## Deploy to TestFlight
+
+```sh
+cargo piston deploy testflight
+```
+
+This iOS path builds a release app, archives and signs it for distribution, uploads
+it to App Store Connect, and waits for Apple's TestFlight processing result. It uses
+the same bundle identifier, team, root icon, resources, and API-key configuration
+as App Store deployment. App Store screenshots and an editable store listing are
+not required or changed. One command targets iOS; it does not upload a macOS build.
+`cargo piston deploy` and `cargo piston deploy app-store` retain the App Store workflow.
+
+Uploads require Xcode 26 or later with the iOS 26 SDK or later under Apple's current
+[upload requirements](https://developer.apple.com/news/upcoming-requirements/?id=04282026a).
+Piston checks the toolchain and API-key configuration before compiling. Apple builds
+automatically use the newest compatible installed Xcode, searching `/Applications`,
+`~/Applications`, the current `xcode-select` location, and Spotlight. Selection checks
+the app's declared macOS requirements and whether its tools run. `DEVELOPER_DIR`
+remains an explicit override and may point to an `.app` or its `Contents/Developer`
+directory. Invalid or too-old overrides produce an error rather than being ignored.
+Piston passes the chosen path to its build commands without changing `xcode-select`.
+Installed versions, including prereleases, can be selected; downloadable versions
+are stable releases only.
+
+If no suitable Xcode is installed, Piston checks the community-maintained
+[Xcode Releases catalog](https://xcodereleases.com/) for the newest stable version
+whose macOS, CPU, and SDK requirements fit. It prefers the Apple silicon installer
+on Apple silicon and a Universal installer on Intel. Download URLs must point to
+Apple's official developer downloads. There is no fixed fallback version. Catalog
+access is needed only for setup; existing installations can be used offline.
+
+In an interactive terminal, Piston opens the exact `.xip` download, waits for the
+completed file in Downloads or Spotlight, extracts it with Apple's `xip`, verifies
+Apple's app signature and the expected version/build, and installs it alongside
+existing versions in `~/Applications/Xcode-<version>-<build>.app`. It then selects
+that Xcode for the current command, prepares its first-launch components, and
+continues the build. It does not overwrite existing applications or remove the
+download. Extraction and verification logs remain in the temporary installation
+directory; component logs are under `~/Library/Logs/Piston/Xcode`.
+
+Apple sign-in may still be required in the browser. If license acceptance or
+administrator approval is needed, Piston asks through Apple's command-line license
+viewer or `sudo`, then continues. It never accepts license terms for you. Physical
+device builds do not download optional simulator runtimes. Press Ctrl-C to cancel
+while waiting or installing.
+
+For a custom download location or noninteractive setup, set
+`PISTON_XCODE_ARCHIVE=/absolute/path/to/Xcode.xip`. The archive must match the version
+and build selected from the catalog. Noninteractive runs never open a browser or
+wait for a download, and report any license or administrator setup still required.
+If this Mac cannot run a suitable release, Piston opens Software Update and explains
+the minimum macOS version. See [Apple's compatibility table](https://developer.apple.com/xcode/system-requirements/).
+
+```sh
+cargo piston deploy testflight --prepare-only
+cargo piston deploy testflight --manifest-path path/to/Cargo.toml --team ABCDE12345
+cargo piston deploy testflight --setup
+```
+
+`--prepare-only` prepares account access and the toolchain without building or uploading.
+The normal deploy command stays running until Apple marks the build ready for internal
+TestFlight testing, or reports a failure. It prints each build/upload stage once,
+then checks Apple's processing status every 15 seconds in the background. A new
+status line, with elapsed time, appears only when that status changes. Xcode setup
+also reports stage changes without repeated waiting messages. There is no processing
+time limit and no separate status command to run.
+
+After Ctrl-C or an interruption, rerun the same deploy command. Piston resumes the
+pending upload saved in `Cargo.toml`, including the delay before Apple lists it.
+The saved app version and build number identify the exact upload. Resuming it does
+not require a current Xcode installation. Expired or invalid uploads are replaced
+with a new build number on the next deployment.
+
+After deployment completes, running the command again builds and uploads fresh code
+with the same Cargo version and a new build number. To replace a pending upload
+instead of resuming it, run `cargo piston deploy testflight --new-build`.
+`--prepare-only` displays the selected version and build number without reserving it.
+
+A processed build may still need export-compliance answers. Piston opens that exact
+build's TestFlight page once when manual answers are required. Click **Provide Export
+Compliance Information** to open Apple's questionnaire. Piston also prints the direct
+build link and keeps monitoring until Apple clears the build, including during Apple's
+compliance review. Groups configured for automatic internal distribution receive
+eligible builds automatically; otherwise select an Internal Testing group in App
+Store Connect and add the build. External testers require beta information and
+Apple's beta review. This command does not create testers, invite people, submit
+an external beta review, or submit the app for public App Store review.
+
+## Existing platform build setup
+
+Configure your `.env` and project `Cargo.toml` as shown below and install the desired
+build targets via rustup.
 
 For example if you want to build for MacOS devices you would want to add the following build targets:
 
@@ -140,13 +764,10 @@ version = "0.0.1"
 
 ### App Icon example
 
-```
-[package.metadata]
-icon_path = absolute/path/to/icon.png
-```
-
-An app icon is not required. If you do not supply one, a placeholder will be 
-substituted.
+Place `icon.png`, `icon.jpg`, or `icon.jpeg` in the package root beside `Cargo.toml`.
+PNG takes precedence, followed by JPG and JPEG. The `icon_path` metadata setting
+is no longer used. The older platform builders retain their placeholder when no
+icon file is supplied.
 
 ### Including assets
 
@@ -306,23 +927,13 @@ Not yet implemented
 
 # MacOS & IOS Output Configuration (MACOS HOST ONLY)
 
-## install the X code app via the apple app store
+## Xcode setup
 
-Navigate to the following URL in safari and download the x code app
-
-`https://apps.apple.com/us/app/xcode/id497799835`
-
-## install X code command line tools
-
-`xcode-select --install`
-
-After you've installed the X code app and command line tools, point xcode-select to the proper installation path
-
-`sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
-
-## Accept x code licenses
-
-`sudo xcodebuild -license accept`
+Piston discovers and uses the newest compatible installed Xcode for Apple builds.
+When none is suitable, it downloads and prepares a compatible release as described
+in [Deploy to TestFlight](#deploy-to-testflight). Use `DEVELOPER_DIR` to override its
+selection. You do not need to change the system-wide `xcode-select` setting. License
+acceptance and administrator approval, when required, are handled interactively.
 
 ## Automated Signing & Automated Device Provisioning
 
@@ -468,13 +1079,11 @@ You can now build & sign MacOS apps for external release.
 
 External release setup (above) is not required for iOS because iOS apps cannot be distributed outside of the App store.
 
-### Install the Xcode IOS SDK
+### Prepare Xcode
 
-`xcodebuild -downloadPlatform iOS`
-
-Accept the Xcode license
-
-`sudo xcodebuild -license accept`
+Piston selects and prepares the full Xcode installation automatically. Physical iOS
+device builds use its included iPhoneOS SDK and do not need simulator downloads.
+See [Deploy to TestFlight](#deploy-to-testflight) for setup and explicit overrides.
 
 Install libimobile device via homebrew (if you wish to deploy directly to iOS devices via USB cable)
 

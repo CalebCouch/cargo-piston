@@ -1,23 +1,35 @@
-use crate::Helper;
-use crate::PistonError;
-use crate::asc::{AscApiKey, AscClient};
-use crate::devices::IOSDevice;
 use cargo_metadata::{Metadata, MetadataCommand};
 use std::collections::HashMap;
-use std::fs;
-use std::fs::{File, copy, create_dir_all, remove_file};
+use std::fs::{self, File, copy, create_dir_all, remove_file};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use crate::project::Project;
+use crate::apple::{AppleSigning, AppleSigningTarget, AscApiKey};
+use crate::devices::IOSDevice;
+use crate::host::Host;
+use crate::PistonError;
+pub use crate::cli::ApplicationArgs;
+
+mod application;
+pub use application::IOSApplication;
+pub mod cli;
+pub mod deployment;
+mod development;
+mod simulator;
+pub use deployment::DeploymentArgs;
+pub mod distribution;
+pub use distribution::IOSStore;
 
 pub struct IOSBuilder {
+    developer: PathBuf,
+    manifest: PathBuf,
     release: bool,
     target: String,
     cwd: PathBuf,
-    output_path: Option<PathBuf>,
+    output_path: PathBuf,
     ipa_path: Option<PathBuf>,
     icon_path: String,
-    _assets: String,
     cargo_path: String,
     app_name: String,
     app_version: String,
@@ -31,275 +43,105 @@ pub struct IOSBuilder {
 }
 
 impl IOSBuilder {
-    pub fn start(
-        release: bool,
-        target: String,
-        cwd: PathBuf,
-        env_vars: HashMap<String, String>,
-        device_target: Option<IOSDevice>,
-    ) -> Result<(PathBuf, String), PistonError> {
-        println!("building for iOS");
-        //check operating system (requires MacOS)
-        if std::env::consts::OS != "macos" {
-            return Err(PistonError::UnsupportedOSError {
-                os: std::env::consts::OS.to_string(),
-                target: target,
-            });
-        }
-
-        let mut op = IOSBuilder::new(release, target, cwd, env_vars, device_target)?;
-        //>>prebuild
-        op.pre_build()?;
-
-        //>>build
-        op.build()?;
-
-        //>>Postbuild
-        op.post_build()?;
-
-        //return bundle output path and bundle id from cargo.toml & plist
-        Ok((op.ipa_path.unwrap(), op.bundle_id))
-    }
-
     fn new(
-        release: bool,
-        target: String,
-        cwd: PathBuf,
-        env_vars: HashMap<String, String>,
-        device_target: Option<IOSDevice>,
+        release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>,
+        device_target: Option<IOSDevice>, developer: PathBuf,
     ) -> Result<Self, PistonError> {
-        println!(
-            "creating IOSBuilder: release: {:?}, target: {:?}, cwd: {:?}",
-            release,
-            target.to_string(),
-            cwd
-        );
-        //parse env vars
-        let cargo_path = env_vars
-            .get("cargo_path")
-            .cloned()
-            .unwrap_or("cargo".to_string());
+        let cargo_path = env_vars.get("cargo_path").cloned().unwrap_or("cargo".to_string());
         let idp_path = env_vars.get("idp_path").cloned();
         let keystore_path = env_vars.get("keystore_path").cloned();
         let team_id = env_vars.get("team_id").cloned();
-        //parse cargo.toml
         let metadata: Metadata = MetadataCommand::new()
-            .current_dir(cwd.clone())
+            .current_dir(&cwd)
             .exec()
             .map_err(|e| PistonError::CargoParseError(e.to_string()))?;
 
-        let icon_path = Helper::get_icon_path(&metadata, &cwd);
-        let assets = Helper::get_assets_path(&metadata);
-        let app_name = Helper::get_app_name(&metadata)?;
-        let app_version = Helper::get_app_version(&metadata)?;
-        let bundle_id = Helper::get_bundle_id(&metadata, &app_name);
-        let min_os_version = Helper::get_min_os(&metadata);
+        let icon_path = Project::get_icon_path(&metadata, &cwd);
+        let manifest = metadata.root_package().unwrap().manifest_path.clone().into_std_path_buf();
+        let app_name = Project::get_app_name(&metadata)?;
+        let capitalized = Project::capitalize_first(&app_name);
+        let profile = if release { "release" } else { "debug" };
+        let output_path = cwd.join(format!("target/{profile}/ios/{capitalized}.app"));
+        let version = &metadata.root_package().unwrap().version;
+        let app_version = format!("{}.{}.{}", version.major, version.minor, version.patch);
+        let bundle_id = Project::get_bundle_id(&metadata, &app_name);
+        let min_os_version = Project::get_min_os(&metadata);
 
-        let asc_api_key: Option<AscApiKey> = match AscApiKey::from_hm(&env_vars) {
-            Ok(key) => Some(key),
-            Err(e) => {
-                println!(
-                    "Failed to obtain AscApiKey, check .env configuration: {}",
-                    e
-                );
-                None
-            }
-        };
-        Ok(IOSBuilder {
-            release: release,
-            target: target.to_string(),
-            cwd: cwd,
-            output_path: None,
+        let asc_api_key = AscApiKey::from_hm(&env_vars).ok();
+        Ok(Self {
+            developer,
+            manifest,
+            release,
+            target,
+            cwd,
+            output_path,
             ipa_path: None,
-            icon_path: icon_path,
-            _assets: assets,
-            cargo_path: cargo_path,
-            app_name: app_name,
-            app_version: app_version,
-            bundle_id: bundle_id,
-            min_os_version: min_os_version,
-            asc_api_key: asc_api_key,
-            device_target: device_target,
-            idp_path: idp_path,
-            keystore_path: keystore_path,
-            team_id: team_id,
+            icon_path,
+            cargo_path,
+            app_name,
+            app_version,
+            bundle_id,
+            min_os_version,
+            asc_api_key,
+            device_target,
+            idp_path,
+            keystore_path,
+            team_id,
         })
     }
 
-    fn pre_build(&mut self) -> Result<(), PistonError> {
-        //TODO check xcode for updates?
-        //TODO allow user to specify a security cert for offline signing?
-        println!("Pre build for ios");
-        //check for xcode installation
-        let xcode_app = "/Applications/Xcode.app";
-        if !Path::new(xcode_app).exists() {
-            return Err(PistonError::XcodeInstallError(format!(
-                "Xcode installation not found at {} Please download xcode from the apple app store at https://apps.apple.com/us/app/xcode/id497799835",
-                xcode_app
-            )))?;
-        }
-        //Check for xcode-select command line tools installation and pathing
-        let xcode_select = Command::new("xcode-select")
-            .arg("-p")
-            .output()
-            .map_err(|e| {
-                PistonError::XcodeSelectInstallError(format!(
-                    "Failed to verify xcode tools installation: {}",
-                    e
-                ))
-            });
+    fn pre_build(&self) -> Result<(), PistonError> {
+        let capitalized = Project::capitalize_first(&self.app_name);
+        let bundle_path = &self.output_path;
 
-        let expected_path = format!("{}/Contents/Developer", xcode_app);
+        if bundle_path.as_path().exists() { let _ = fs::remove_dir_all(bundle_path); }
 
-        let path = String::from_utf8(xcode_select.unwrap().stdout)
-            .unwrap()
-            .trim()
-            .to_string();
-        //verify that xcode-select path matches the expected query
-        if path == expected_path {
-            println!("xcode-select path match")
-        } else {
-            return Err(PistonError::XcodeSelectPathingError(format!(
-                "Xcode-select path query of {} does not match the expected value of {}...set the path with 'sudo xcode-select -s /Applications/Xcode.app/Contents/Developer'",
-                path, expected_path
-            )));
-        }
-        //check for xcode ios sdk
-        let sdk_output = Command::new("xcodebuild")
-            .arg("-showsdks")
-            .output()
-            .map_err(|e| PistonError::XcodeBuildError(format!("Failed to run xcodebuild -showsdks. Something is likely missing from your installation: {}", e)));
-
-        let sdk_binding = sdk_output.unwrap();
-        let sdks = String::from_utf8_lossy(&sdk_binding.stdout);
-        if !sdks.contains("iOS") {
-            return Err(PistonError::IOSSdkMissingError(
-                "IOS sdk is missing. Try running 'xcodebuild -downloadPlatform iOS'".to_string(),
-            ));
-        }
-        //build the app bundle
-        let cwd: PathBuf = self.cwd.clone();
-        let capitalized = Helper::capitalize_first(&self.app_name.clone());
-        let release = if self.release { "release" } else { "debug" };
-        //fix the path to match ios convention
-        let partial_path: PathBuf = if self.release {
-            format!("target/{}/ios/{}.app", release, capitalized).into()
-        } else {
-            format!("target/{}/ios/{}.app", release, capitalized).into()
-        };
-        self.output_path = Some(cwd.join(&partial_path));
-        if self.output_path.as_ref().is_none() {
-            return Err(PistonError::Generic("output path not provided".to_string()));
-        }
-        let bundle_path = self.output_path.as_ref().unwrap();
-        println!("Bundle path: {:?}", bundle_path);
-
-        //empty the app bundle directory if it exists
-        if bundle_path.as_path().exists() {
-            let _ = fs::remove_dir_all(bundle_path);
-        }
-
-        //Create the app bundle directory
         create_dir_all(bundle_path).map_err(|e| PistonError::CreateDirAllError {
             path: bundle_path.to_path_buf(),
             source: e,
         })?;
 
-        println!("syncing resources...");
         let parent = bundle_path.parent();
-        println!("parent path: {:?}", parent);
         let assets_path = parent.unwrap().join("Assets.xcassets");
-        println!("Assets path: {:?}", assets_path.display());
         let appicon_path = assets_path.join("AppIcon.appiconset");
-        println!("App icon path: {:?}", appicon_path);
 
-        let path = appicon_path.as_path();
+        if appicon_path.exists() { let _ = fs::remove_dir_all(&appicon_path); }
 
-        //empty the AppIcon dir if it exists
-        if appicon_path.exists() {
-            let _ = fs::remove_dir_all(path);
-        }
-
-        //create the AppIcon and Assets directory
-        create_dir_all(path).map_err(|e| PistonError::CreateDirAllError {
-            path: self.output_path.as_ref().unwrap().to_path_buf(),
+        create_dir_all(&appicon_path).map_err(|e| PistonError::CreateDirAllError {
+            path: self.output_path.clone(),
             source: e,
         })?;
 
-        //if icon path was provided...convert
-        println!("icon path provided, configuring icon");
-        //resize the icon to both appropriate ios dimensions
         let icon_path120: PathBuf = appicon_path.join("ios_icon120.png");
-        Helper::resize_png(
-            &self.icon_path.as_ref(),
-            &icon_path120.display().to_string(),
-            120,
-            120,
-        )?;
+        Project::resize_png(&self.icon_path, &icon_path120.display().to_string(), 120, 120)?;
         let icon_path180: PathBuf = appicon_path.join("ios_icon180.png");
-        Helper::resize_png(
-            &self.icon_path.as_ref(),
-            &icon_path180.display().to_string(),
-            180,
-            180,
-        )?;
+        Project::resize_png(&self.icon_path, &icon_path180.display().to_string(), 180, 180)?;
 
-        //create Contents.json within Appicon.appiconset
         let contents_path: PathBuf = appicon_path.join("Contents.json");
-        //if a contents file exists, first remove it.
         if contents_path.exists() {
             remove_file(&contents_path).map_err(|e| PistonError::RemoveFileError {
-                path: contents_path.clone().to_path_buf(),
+                path: contents_path.clone(),
                 source: e,
             })?;
         }
-        //create a new Contents.json file
-        let mut contents_file =
-            File::create(&contents_path).map_err(|e| PistonError::CreateFileError {
-                path: contents_path.clone().to_path_buf(),
-                source: e,
-            })?;
+        let mut contents_file = File::create(&contents_path)
+            .map_err(|e| PistonError::CreateFileError { path: contents_path.clone(), source: e })?;
 
-        //populate the Contents.json file
         let json_contents = r#"{
     "images": [
-        {
-            "size": "120x120",
-            "idiom": "iphone",
-            "filename": "ios_icon120.png",
-            "scale": "1x"
-        },
-        {
-            "size": "180x180",
-            "idiom": "iphone",
-            "filename": "ios_icon180.png",
-            "scale": "1x" 
-        }
+        { "size": "120x120", "idiom": "iphone", "filename": "ios_icon120.png", "scale": "1x" },
+        { "size": "180x180", "idiom": "iphone", "filename": "ios_icon180.png", "scale": "1x" }
     ],
-    "info": {
-        "version": 1,
-        "author": "xcode"
-    }
+    "info": { "version": 1, "author": "xcode" }
 }"#;
 
-        //write the contents.json file
         contents_file
             .write_all(json_contents.trim().as_bytes())
             .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
 
-        //TODO sync assets is currently disabled
-        //eventually this will move assets into subdirs contained within Assets.xcassets/
-
-        // sync assets
-        // let bind = &self.assets.clone();
-        // let assets_src = Path::new(&bind);
-        // let parent = self.output_path.clone().unwrap().parent();
-        // let assets_tgt = parent.join("Assets.xcassets");
-        // Helper::sync_assets(assets_src, &assets_tgt)?;
-
         let assets_output = bundle_path.join("Assets.car");
-        //compile assets to Testbuild.app/Assets.car
         let status = Command::new("xcrun")
+            .env("DEVELOPER_DIR", &self.developer)
             .args([
                 "actool",
                 "--output-format",
@@ -324,23 +166,16 @@ impl IOSBuilder {
             )));
         }
 
-        //establish Info.plist path ~/ios/release/Appname.app/Info.plist
         let plist_path: PathBuf = bundle_path.join("Info.plist");
-        //if a plist file exists, first remove it.
         if plist_path.exists() {
             remove_file(&plist_path).map_err(|e| PistonError::RemoveFileError {
-                path: plist_path.clone().to_path_buf(),
+                path: plist_path.clone(),
                 source: e,
             })?;
         }
-        //create a new Info.plist file
-        let mut plist_file =
-            File::create(&plist_path).map_err(|e| PistonError::CreateFileError {
-                path: plist_path.clone().to_path_buf(),
-                source: e,
-            })?;
+        let mut plist_file = File::create(&plist_path)
+            .map_err(|e| PistonError::CreateFileError { path: plist_path.clone(), source: e })?;
 
-        //populate the Info.plist file
         let plist_content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -398,13 +233,13 @@ impl IOSBuilder {
 </dict>
 </plist>
 "#,
-            &capitalized,
-            &self.bundle_id.clone(),
-            &capitalized,
-            &capitalized,
-            &self.app_version.clone(),
-            &self.app_version.clone(),
-            &self.min_os_version.clone()
+            capitalized,
+            self.bundle_id,
+            capitalized,
+            capitalized,
+            self.app_version,
+            self.app_version,
+            self.min_os_version
         );
 
         plist_file
@@ -423,9 +258,7 @@ impl IOSBuilder {
         Ok(())
     }
 
-    fn build(&mut self) -> Result<(), PistonError> {
-        println!("build for ios");
-        //build the binary for the specified target
+    fn build(&self) -> Result<(), PistonError> {
         let cargo_args = format!(
             "build --target {} {}",
             self.target,
@@ -433,9 +266,10 @@ impl IOSBuilder {
         );
         let cargo_cmd = format!("{} {}", self.cargo_path, cargo_args);
         let builder = Command::new("bash")
+            .env("DEVELOPER_DIR", &self.developer)
             .arg("-c")
             .arg(&cargo_cmd)
-            .current_dir(self.cwd.clone())
+            .current_dir(&self.cwd)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
@@ -450,9 +284,12 @@ impl IOSBuilder {
 
         Ok(())
     }
+}
 
-    fn post_build(&mut self) -> Result<(), PistonError> {
-        println!("post build for ios");
+impl IOSBuilder {
+    fn post_build(&mut self) -> Result<Vec<String>, PistonError> {
+        let mut messages = Vec::new();
+        messages.push(format!("post build for ios"));
         let provision_cache = self.cwd.join("target").join("ios-cache").join("profiles");
         if !provision_cache.exists() {
             create_dir_all(&provision_cache).map_err(|e| PistonError::CreateDirAllError {
@@ -463,98 +300,69 @@ impl IOSBuilder {
         let binary_path = self
             .cwd
             .join("target")
-            .join(self.target.clone())
+            .join(&self.target)
             .join(if self.release { "release" } else { "debug" })
-            .join(self.app_name.clone());
-        let capitalized = Helper::capitalize_first(&self.app_name.clone());
-        let bundle_path = self.output_path.as_ref().unwrap().join(&capitalized);
-        //bundle path should be cwd + target + <target output> + <--release flag or None for debug> + <appname>.exe
-        //move the target binary into the app bundle at the proper location
+            .join(&self.app_name);
+        let capitalized = Project::capitalize_first(&self.app_name);
+        let bundle_path = self.output_path.join(&capitalized);
         copy(&binary_path, &bundle_path).map_err(|e| PistonError::CopyFileError {
-            input_path: binary_path.clone().to_path_buf(),
-            output_path: bundle_path.clone().to_path_buf(),
+            input_path: binary_path.clone(),
+            output_path: bundle_path.clone(),
             source: e,
         })?;
-        // Make the binary executable
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let exe_name = self.app_name.clone();
-            let exe_path = self.output_path.as_ref().unwrap().join(&exe_name);
-
-            fs::set_permissions(&exe_path, std::fs::Permissions::from_mode(0o755)).map_err(
-                |e| PistonError::Generic(format!("Failed to make binary executable: {}", e)),
-            )?;
-        }
-        //strip extended attributes
+        let exe_path = self.output_path.join(&self.app_name);
+        Host::make_executable(&exe_path)?;
         let output = Command::new("xattr")
             .args(["-cr", &bundle_path.display().to_string()])
             .output()
             .map_err(|e| PistonError::Generic(e.to_string()))?;
         if !output.status.success() {
-            return Err(PistonError::Generic(
-                String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            return Err(PistonError::Generic(String::from_utf8_lossy(&output.stderr).to_string()));
         }
-        //output the proper location in the terminal for the user to see
-        println!("iOS app bundle available at: {}", &bundle_path.display());
+        messages.push(format!("iOS app bundle available at: {}", &bundle_path.display()));
 
-        //check for apple signing certificate
         if self.keystore_path.is_none() || self.asc_api_key.is_none() {
-            println!("Keystore path or ASC API key missing from .env, skipping automated signing");
+            messages.push(format!(
+                "Keystore path or ASC API key missing from .env, skipping automated signing"
+            ));
         } else {
-            println!("keystore path & ASC API key properly configured");
-            let asc_client = AscClient {
-                api_key: self.asc_api_key.clone(),
-                keystore_path: self.keystore_path.clone().unwrap(),
-            };
-            //obtain security certificate
+            messages.push(format!("keystore path & ASC API key properly configured"));
+            let asc_client = AppleSigning::new(
+                self.asc_api_key.clone().unwrap(),
+                self.keystore_path.clone().unwrap(),
+                &self.manifest,
+            )?;
             let security_cert = asc_client.create_or_find_security_cert(self.team_id.clone())?;
             let security_profile = format!("{} ({})", security_cert.1, security_cert.0);
-            println!("your security profile is: {:?}", security_profile);
-            let output_path = self.output_path.clone().unwrap();
-            let app_name = self.app_name.clone();
-            let bundle_id = self.bundle_id.clone();
-            //if a device target is provided, check if the target device is provisioned
-            if !self.device_target.is_none() {
-                println!("device target exists, checking for existing provisioning");
-                let target_id = self.device_target.clone().unwrap().id;
-                let idp_path = self.idp_path.clone().unwrap();
-                let provisioned = AscClient::is_device_provisioned(
-                    &output_path,
-                    &target_id,
-                    &idp_path,
+            messages.push(format!("your security profile is: {:?}", security_profile));
+            let output_path = &self.output_path;
+            if let Some(device) = &self.device_target {
+                messages.push(format!("device target exists, checking for existing provisioning"));
+                let target_id = &device.id;
+                let idp_path = self.idp_path.as_ref().unwrap();
+                let provisioned = AppleSigning::is_device_provisioned(
+                    output_path,
+                    target_id,
+                    idp_path,
                     &provision_cache,
                 )?;
-                //if device is not provisioned and api access is available, attempt to provision
-                if provisioned == false && !self.asc_api_key.is_none() {
-                    println!(
+                if !provisioned {
+                    messages.push(format!(
                         "attempting to provision target device {:?}",
                         self.device_target
-                    );
-                    let app_name = self.app_name.clone();
-                    //provision device here
+                    ));
                     asc_client.provision_ios_device(
-                        &target_id,
-                        &bundle_id,
-                        &app_name,
+                        target_id,
+                        &self.bundle_id,
+                        &self.app_name,
                         &security_profile,
-                        &output_path,
-                        &idp_path,
+                        output_path,
+                        idp_path,
                         &provision_cache,
                     )?;
                 }
             }
-            //sign the app bundle
-            AscClient::sign_app_bundle(
-                &app_name,
-                &output_path,
-                &security_profile,
-                &bundle_id,
-                true,
-                false,
-            )?;
-            //remove any existing .ipa
+            AppleSigning::sign_app_bundle(output_path, &security_profile, AppleSigningTarget::Ios)?;
             let parent = output_path.parent().unwrap();
             let ipa_path = parent.join(format!("{}.ipa", &capitalized));
             self.ipa_path = Some(ipa_path.clone());
@@ -564,34 +372,27 @@ impl IOSBuilder {
                     source: e,
                 })?;
             }
-            //remove any existing payload dir and its contents
             let payload_path = parent.join("Payload");
-            if payload_path.exists() {
-                let _ = fs::remove_dir_all(&payload_path);
-            }
-            //create ~/Payload dir
+            if payload_path.exists() { let _ = fs::remove_dir_all(&payload_path); }
             create_dir_all(&payload_path).map_err(|e| PistonError::CreateDirAllError {
                 path: payload_path.to_path_buf(),
                 source: e,
             })?;
-            //recursively copy app bundle contents to payload dir
             let dest = payload_path.join(format!("{}.app", &capitalized));
-            let status = Command::new("cp")
-                .arg("-r")
-                .arg(&output_path)
-                .arg(&dest)
-                .output()
-                .map_err(|e| PistonError::CopyFileError {
-                    input_path: output_path.clone().to_path_buf(),
-                    output_path: dest.clone().to_path_buf(),
-                    source: e,
+            let status =
+                Command::new("cp").arg("-r").arg(output_path).arg(&dest).output().map_err(|e| {
+                    PistonError::CopyFileError {
+                        input_path: output_path.to_path_buf(),
+                        output_path: dest.clone(),
+                        source: e,
+                    }
                 })?;
 
             if !status.status.success() {
                 return Err(PistonError::Generic(format!(
                     "error copying {} to {} Error message: {}",
-                    output_path.clone().display(),
-                    dest.clone().display(),
+                    output_path.display(),
+                    dest.display(),
                     String::from_utf8_lossy(&status.stderr)
                 )));
             }
@@ -610,50 +411,21 @@ impl IOSBuilder {
                     String::from_utf8_lossy(&status.stderr)
                 )));
             }
-            //cleanup temp payload dir
             let _ = std::fs::remove_dir_all(payload_path);
 
-            println!("Your app is available at: {:?}", &ipa_path.display());
+            messages.push(format!("Your app is available at: {:?}", &ipa_path.display()));
         }
-        Ok(())
+        Ok(messages)
     }
 }
 
-pub struct IOSRunner {}
+pub struct IOSRunner;
 
 impl IOSRunner {
-    pub fn start(
-        release: bool,
-        cwd: PathBuf,
-        env_vars: HashMap<String, String>,
-        device: &IOSDevice,
-    ) -> Result<(), PistonError> {
-        println!("running for IOS");
-        let target_string = "aarch64-apple-ios".to_string();
-        if std::env::consts::OS != "macos" {
-            println!("error cannot run mac on linux");
-            return Err(PistonError::UnsupportedOSError {
-                os: std::env::consts::OS.to_string(),
-                target: target_string,
-            });
-        }
-        //build the app bundle and sign
-        let builder =
-            IOSBuilder::start(release, target_string, cwd, env_vars, Some(device.clone()))?;
-        //deploy the app bundle to the target device
-        IOSRunner::deploy_usb(
-            device.id.as_ref(),
-            &builder.0.display().to_string(),
-            &builder.1,
-        )?;
-
-        Ok(())
-    }
-
     //TODO this is currently broken
-    fn deploy_usb(device_id: &str, output_path: &str, bundle_id: &str) -> Result<(), PistonError> {
-        // Force-remove any old version of the app (same bundle ID)
+    fn deploy_usb(device_id: &str, output_path: &str, bundle_id: &str, developer: &std::path::Path) -> Result<(), PistonError> {
         let _ = Command::new("xcrun")
+            .env("DEVELOPER_DIR", &developer)
             .args([
                 "devicectl",
                 "device",
@@ -665,42 +437,19 @@ impl IOSRunner {
                 bundle_id,
             ])
             .output();
-        println!(
-            "installing app ID: {} located at: {} to device: {}",
-            bundle_id, output_path, device_id
-        );
         let output = Command::new("xcrun")
-            .args([
-                "devicectl",
-                "device",
-                "install",
-                "app",
-                "--device",
-                &device_id,
-                &output_path,
-            ])
+            .env("DEVELOPER_DIR", &developer)
+            .args(["devicectl", "device", "install", "app", "--device", device_id, output_path])
             .output()
             .map_err(|e| PistonError::XcrunInstallError(e.to_string()))?;
         if !output.status.success() {
-            println!("Failed to install with Xcrun: {:?}", &output);
             return Err(PistonError::XcrunInstallError(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ));
         }
-        println!(
-            "Running bundle id: {} on device: {}",
-            &bundle_id, &device_id
-        );
         let output = Command::new("xcrun")
-            .args([
-                "devicectl",
-                "device",
-                "process",
-                "launch",
-                "--device",
-                &device_id,
-                &bundle_id,
-            ])
+            .env("DEVELOPER_DIR", &developer)
+            .args(["devicectl", "device", "process", "launch", "--device", device_id, bundle_id])
             .output()
             .map_err(|e| PistonError::XcrunLaunchError(e.to_string()))?;
         if !output.status.success() {

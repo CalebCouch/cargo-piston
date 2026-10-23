@@ -1,8 +1,10 @@
-use crate::error::PistonError;
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use std::process::Stdio;
+use crate::error::PistonError;
+use crate::host::Host;
+
+pub mod cli;
 
 #[derive(Debug, Clone)]
 pub struct IOSDevice {
@@ -12,174 +14,47 @@ pub struct IOSDevice {
 
 #[derive(Debug, Clone)]
 pub struct AndroidDevice {
-    // model: String,
     pub id: String,
 }
 
 #[derive(Debug)]
 pub struct Devices {
+    pub android_available: bool,
     pub ios: Vec<IOSDevice>,
     pub android: Vec<AndroidDevice>,
 }
 
 impl Devices {
-    pub fn list_devices(
-        env_vars: HashMap<String, String>,
-        silent: bool,
-    ) -> Result<Self, PistonError> {
-        //new devices struct
-        let mut devices = Devices {
-            ios: Vec::new(),
-            android: Vec::new(),
-        };
-
-        let sdk_path: Option<String> = env_vars.get("sdk_path").cloned();
-        let adb_path = format!("{}/platform-tools/adb", sdk_path.unwrap_or_default());
-        //query Android devices if adb_path is configured in .env
-        if Path::new(&adb_path).exists() {
-            devices.populate_android(adb_path)?;
-        } else {
-            println!("Android installation not found");
-        }
-        //query iOS devices if on MacOS
-        if std::env::consts::OS == "macos" {
-            devices.populate_ios()?;
-        }
-        //print the device results to the terminal
-        if !silent {
-            devices.print_devices();
-        }
-        //return the struct
+    pub fn discover(env_vars: HashMap<String, String>) -> Result<Self, PistonError> {
+        let sdk_path = env_vars.get("sdk_path").map(String::as_str).unwrap_or_default();
+        let adb_path = format!("{sdk_path}/platform-tools/adb");
+        let android_available = Path::new(&adb_path).exists();
+        let android =
+            if android_available { Self::android_devices(&adb_path)? } else { Vec::new() };
+        let ios = Host::ios_devices()?;
+        let devices = Self { ios, android, android_available };
         Ok(devices)
     }
 
-    pub fn populate_android(&mut self, adb_path: String) -> Result<(), PistonError> {
-        //Run the command `adb devices`
-        let output = match Command::new(adb_path).arg("devices").output() {
-            Ok(o) => o,
-            Err(e) => return Err(PistonError::ADBDevicesError(e.to_string())),
-        };
-
-        //convert the output to utf8
-        let stdout = match str::from_utf8(&output.stdout) {
-            Ok(o) => o,
-            Err(e) => return Err(PistonError::ParseUTF8Error(e.to_string())),
-        };
-
-        //split the output into lines
-        let lines: Vec<&str> = stdout.lines().collect();
-
-        //Skip the first line ("list of devices attached") and process the results
-        for line in lines.iter().skip(1) {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                let parts: Vec<&str> = trimmed.split_whitespace().collect();
-                if parts.len() == 2 && parts[1] == "device" {
-                    //add the device serial to the vector
-                    self.android.push(AndroidDevice {
-                        //TODO make this model field more dynamic for chipset architecture currently useless
-                        // model: "Android Device".to_string(),
-                        id: parts[0].to_string(),
-                    });
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    fn populate_ios(&mut self) -> Result<(), PistonError> {
-        // Run the command `xcrun xctrace list devices`
-        let output = Command::new("xcrun")
-            .args(["xctrace", "list", "devices"])
-            .stdout(Stdio::piped())
+    fn android_devices(adb_path: &str) -> Result<Vec<AndroidDevice>, PistonError> {
+        let output = Command::new(adb_path)
+            .arg("devices")
             .output()
-            .map_err(|e| PistonError::XcrunDevicectlError(e.to_string()))?;
-
-        // Convert the output to a UTF-8 string
+            .map_err(|e| PistonError::ADBDevicesError(e.to_string()))?;
         let stdout = str::from_utf8(&output.stdout)
             .map_err(|e| PistonError::ParseUTF8Error(e.to_string()))?;
-
-        let mut in_devices_section = false;
-
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-
-            if trimmed.is_empty() {
-                continue;
-            }
-
-            // Section tracking
-            if trimmed == "== Devices ==" {
-                in_devices_section = true;
-                continue;
-            }
-            if trimmed == "== Simulators ==" || trimmed == "== Devices Offline ==" {
-                in_devices_section = false;
-                continue;
-            }
-
-            if !in_devices_section {
-                continue;
-            }
-
-            // Must start with iPhone (case insensitive)
-            if !trimmed.to_lowercase().contains("iphone") {
-                println!("Checking for iphone");
-                continue;
-            }
-
-            // Extract model and identifier.
-            // Extract model and ID from the last parentheses
-            if let (Some(last_open), Some(last_close)) = (trimmed.rfind('('), trimmed.rfind(')')) {
-                if last_open < last_close {
-                    let id = trimmed[(last_open + 1)..last_close].trim().to_string();
-                    let model = trimmed[0..last_open].trim().to_string();
-
-                    // === Key filter ===
-                    // Only accept entries where the ID looks like a real device UDID (40 hex chars)
-                    if id.len() > 6 {
-                        self.ios.push(IOSDevice { model, id });
-                    }
+        Ok(stdout
+            .lines()
+            .skip(1)
+            .filter_map(|line| {
+                let mut parts = line.split_whitespace();
+                let id = parts.next()?;
+                if parts.next() == Some("device") && parts.next().is_none() {
+                    Some(AndroidDevice { id: id.to_string() })
+                } else {
+                    None
                 }
-            }
-        }
-
-        Ok(())
-    }
-    pub fn print_devices(&self) {
-        //empty device list
-        if self.ios.is_empty() && self.android.is_empty() {
-            println!();
-            println!("Cargo Piston Device List:");
-            println!();
-            println!("No devices connected");
-        } else {
-            //Android device list
-            println!();
-            println!("Cargo Piston Device List:");
-            println!();
-            if !self.android.is_empty() {
-                println!("Android:");
-                for (index, device) in self.android.iter().enumerate() {
-                    println!();
-                    println!("Device {}:", index + 1);
-                    println!("id: {}", device.id);
-                }
-                if !self.ios.is_empty() {
-                    println!();
-                }
-            }
-            //iOS device list
-            if !self.ios.is_empty() {
-                println!("iOS:");
-                for (index, device) in self.ios.iter().enumerate() {
-                    println!();
-                    println!("Device {}:", index + 1);
-                    println!("Model: {}", device.model);
-                    println!("id: {}", device.id);
-                }
-            }
-        }
+            })
+            .collect())
     }
 }

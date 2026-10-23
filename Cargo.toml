@@ -2,7 +2,7 @@
 name = "cargo-piston"
 description = "Utility tool for streamlining the configuration of rust binaries for various operating systems"
 repository = "https://github.com/dav-anderson/cargo-piston"
-version = "0.5.2"
+version = "0.5.3"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -10,6 +10,7 @@ license = "MIT OR Apache-2.0"
 backhand = "0.25.1"
 cargo-subcommand = "0.12"
 clap = {version = "4", features = ["derive"]}
+ctrlc = {version = "3.4", features = ["termination"]}
 env_logger = "0.10"
 cargo_metadata = "0.23.1"
 serde_json = "1.0.145"
@@ -20,3 +21,14 @@ jsonwebtoken = { version="10.2.0", features =["rust_crypto"] }
 serde = { version = "1.0.228", features = ["derive"] }
 base64 = "0.22"
 
+sha2 = "0.10.9"
+toml_edit = "0.25.17"
+tempfile = "3"
+plist = "1.8"
+air = "3.0.1"
+air_notifications = "0.1.1"
+air_server = "1.0.2"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.6"

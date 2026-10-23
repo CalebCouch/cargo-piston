@@ -1,5 +1,3 @@
-use crate::error::PistonError;
-use crate::helper::Helper;
 use cargo_metadata::{DependencyKind, Metadata, MetadataCommand};
 use image::{self, DynamicImage, ImageEncoder, imageops};
 use std::collections::HashMap;
@@ -7,72 +5,31 @@ use std::fs::{File, copy, create_dir_all, remove_file, write};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::project::Project;
+use crate::error::PistonError;
+
+pub mod cli;
 
 pub struct WindowsBuilder {
     release: bool,
     target: String,
     cwd: PathBuf,
-    output_path: Option<PathBuf>,
+    output_path: PathBuf,
     icon_path: String,
     assets: String,
     embed_resources_ok: bool,
     cargo_path: String,
-    //TODO automatic signing (not gpg)
-    // gpg_path: Option<String>,
     app_name: String,
-    // key_id: Option<String>,
-    // key_pass: Option<String>,
 }
 
 impl WindowsBuilder {
-    pub fn start(
-        release: bool,
-        target: String,
-        cwd: PathBuf,
-        env_vars: HashMap<String, String>,
-    ) -> Result<(), PistonError> {
-        println!("Building for Windows");
-        let mut op = WindowsBuilder::new(release, target, cwd, env_vars)?;
-        //TODO check for signing certificate & sign?
-        //>>prebuild
-        op.pre_build()?;
-
-        //>>build
-        op.build()?;
-
-        //>>Postbuild
-        op.post_build()?;
-
-        Ok(())
-    }
-
-    fn new(
-        release: bool,
-        target: String,
-        cwd: PathBuf,
-        env_vars: HashMap<String, String>,
-    ) -> Result<Self, PistonError> {
-        println!(
-            "creating windowsBuilder: release: {:?}, target: {:?}, cwd: {:?}",
-            release,
-            target.to_string(),
-            cwd
-        );
-        //Read cargo_path with fallback
-        let cargo_path: String = env_vars
-            .get("cargo_path")
-            .cloned()
-            .unwrap_or("cargo".to_string());
-        // let gpg_path: Option<String> = env_vars.get("gpg_path").cloned();
-        // let key_id: Option<String> = env_vars.get("windows_gpg_key_id").cloned();
-        // let key_pass: Option<String> = env_vars.get("windows_gpg_key_pass").cloned();
-        //parse cargo.toml
+    fn new(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<Self, PistonError> {
+        let cargo_path: String = env_vars.get("cargo_path").cloned().unwrap_or("cargo".to_string());
         let metadata: Metadata = MetadataCommand::new()
-            .current_dir(cwd.clone())
+            .current_dir(&cwd)
             .exec()
             .map_err(|e| PistonError::CargoParseError(e.to_string()))?;
 
-        // check if embed resources is installed
         let embed_resources_ok: bool = if let Some(root_pkg) = metadata.root_package() {
             root_pkg
                 .dependencies
@@ -81,111 +38,67 @@ impl WindowsBuilder {
         } else {
             false
         };
-        let icon_path = Helper::get_icon_path(&metadata, &cwd);
-        let assets = Helper::get_assets_path(&metadata);
-        let app_name = Helper::get_app_name(&metadata)?;
+        let icon_path = Project::get_icon_path(&metadata, &cwd);
+        let assets = Project::get_assets_path(&metadata);
+        let app_name = Project::get_app_name(&metadata)?;
+        let output_path =
+            cwd.join(if release { "target/release/windows" } else { "target/debug/windows" });
         Ok(WindowsBuilder {
-            release: release,
-            target: target.to_string(),
-            cwd: cwd,
-            output_path: None,
-            icon_path: icon_path,
-            assets: assets,
-            embed_resources_ok: embed_resources_ok,
-            cargo_path: cargo_path,
-            // gpg_path: gpg_path,
-            app_name: app_name,
-            // key_id: key_id,
-            // key_pass: key_pass
+            release,
+            target,
+            cwd,
+            output_path,
+            icon_path,
+            assets,
+            embed_resources_ok,
+            cargo_path,
+            app_name,
         })
     }
 
-    fn pre_build(&mut self) -> Result<(), PistonError> {
-        println!("building the dynamic app bundle");
-        let cwd: PathBuf = self.cwd.clone();
-        let rel_output: PathBuf = if self.release {
-            "target/release/windows".into()
-        } else {
-            "target/debug/windows".into()
-        };
-        self.output_path = Some(cwd.join(&rel_output));
-        //empty the target directory if it exists
-        if self.output_path.as_ref().is_none() {
-            return Err(PistonError::Generic("output path not provided".to_string()));
-        }
-        let path = self.output_path.as_ref().unwrap().as_path();
-        //empty the dir if it exists
-        Helper::empty_directory(path, &["assets"])?;
-        //create the target directory
+    fn pre_build(&self) -> Result<(), PistonError> {
+        let cwd = &self.cwd;
+        let rel_output = self.output_path.strip_prefix(&self.cwd).unwrap();
+        let path = self.output_path.as_path();
+        Project::empty_directory(path, &["assets"])?;
         create_dir_all(path).map_err(|e| PistonError::CreateDirAllError {
-            path: self.output_path.as_ref().unwrap().to_path_buf(),
+            path: self.output_path.clone(),
             source: e,
         })?;
-        let rc_path: PathBuf = self.output_path.as_ref().unwrap().join("app.rc");
+        let rc_path: PathBuf = self.output_path.join("app.rc");
         let rc_icon: &PathBuf = &rel_output.join("windows_icon.ico");
         let content = format!("IDI_ICON1 ICON \"{}\"", rc_icon.display());
-        //create the app.rc file
         write(&rc_path, content.as_bytes())
             .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
-        //TODO add a winres config check to the cargo.toml for app naming...or maybe just automate this?
-        //[package.metadata.winres]
-        //OriginalFilename = "<appname>.exe"
 
-        //sync assets
-        let bind = &self.assets.clone();
-        let assets_src = Path::new(&bind);
+        let assets_src = Path::new(&self.assets);
         let assets_tgt = path.join("assets");
-        Helper::sync_assets(assets_src, &assets_tgt)?;
-        //if icon path was provided...embed
+        Project::sync_assets(assets_src, &assets_tgt)?;
         if self.embed_resources_ok {
-            println!("icon path provided and embed resources installed, configuring icon");
-            //convert the .png at icon_path to a .ico which resides in the app bundle
             let icon_output: PathBuf = cwd.join(rc_icon);
-            let img_path_clone = self.icon_path.clone();
-            let img_path = Path::new(&img_path_clone);
-            //open the image
+            let img_path = Path::new(&self.icon_path);
             let img = image::open(img_path).map_err(|e| PistonError::OpenImageError {
                 path: img_path.to_path_buf(),
                 source: e,
             })?;
-            // Resize to the specified size
             let resized = imageops::resize(&img, 64, 64, imageops::FilterType::Lanczos3);
             let resized_img = DynamicImage::ImageRgba8(resized);
-            //create the image file
-            let file = std::fs::File::create(icon_output.clone()).map_err(|e| {
-                PistonError::CreateFileError {
-                    path: icon_output.clone().to_path_buf(),
-                    source: e,
-                }
+            let file = File::create(&icon_output).map_err(|e| PistonError::CreateFileError {
+                path: icon_output.to_path_buf(),
+                source: e,
             })?;
-            //write the image file
             let mut writer = std::io::BufWriter::new(file);
-            //encode the image file
             let encoder = image::codecs::ico::IcoEncoder::new(&mut writer);
             encoder
-                .write_image(
-                    resized_img.as_bytes(),
-                    64,
-                    64,
-                    image::ExtendedColorType::Rgba8,
-                )
-                .map_err(|e| PistonError::WriteImageError(e))?;
-            println!(
-                "Converted {} to ICO ({}x{}) and saved as {}",
-                self.icon_path,
-                64,
-                64,
-                icon_output.display()
-            );
+                .write_image(resized_img.as_bytes(), 64, 64, image::ExtendedColorType::Rgba8)
+                .map_err(PistonError::WriteImageError)?;
             let build_path: PathBuf = cwd.join("build.rs");
-            //if a build.rs file exists, first remove it.
             if build_path.exists() {
                 remove_file(&build_path).map_err(|e| PistonError::RemoveFileError {
-                    path: build_path.clone().to_path_buf(),
+                    path: build_path.to_path_buf(),
                     source: e,
                 })?;
             }
-            //populate the build.rs content
             let build_content = format!(
                 r#"
                 use std::io;
@@ -200,28 +113,18 @@ impl WindowsBuilder {
                 "#,
                 &icon_output.display()
             );
-            //Generate a build.rs file
-            let mut build_file =
-                File::create(&build_path).map_err(|e| PistonError::CreateFileError {
-                    path: build_path.clone().to_path_buf(),
-                    source: e,
-                })?;
-            //write the file and flush the buffer
+            let mut build_file = File::create(&build_path).map_err(|e| {
+                PistonError::CreateFileError { path: build_path.to_path_buf(), source: e }
+            })?;
             build_file
                 .write_all(build_content.as_bytes())
                 .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
-            build_file
-                .flush()
-                .map_err(|e| PistonError::FileFlushError(e.to_string()))?;
-            println!("Created Build.rs at {}", &build_path.display());
+            build_file.flush().map_err(|e| PistonError::FileFlushError(e.to_string()))?;
         }
-        println!("done configuring Windows bundle");
         Ok(())
     }
 
     fn build(&self) -> Result<(), PistonError> {
-        println!("building");
-        //build the binary for the specified target
         let cargo_args = format!(
             "build --target {} {}",
             self.target,
@@ -231,7 +134,7 @@ impl WindowsBuilder {
         let builder = Command::new("bash")
             .arg("-c")
             .arg(&cargo_cmd)
-            .current_dir(self.cwd.clone())
+            .current_dir(&self.cwd)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
@@ -247,27 +150,18 @@ impl WindowsBuilder {
     }
 
     fn post_build(&self) -> Result<(), PistonError> {
-        println!("post building");
         let binary_path = self
             .cwd
             .join("target")
-            .join(self.target.clone())
+            .join(&self.target)
             .join(if self.release { "release" } else { "debug" })
-            .join(format!("{}.exe", self.app_name.clone()));
-        let bundle_path = self
-            .output_path
-            .as_ref()
-            .unwrap()
-            .join(format!("{}.exe", self.app_name.clone()));
-        //bundle path should be cwd + target + <target output> + <--release flag or None for debug> + <appname>.exe
-        //move the target binary into the app bundle at the proper location
+            .join(format!("{}.exe", self.app_name));
+        let bundle_path = self.output_path.join(format!("{}.exe", self.app_name));
         copy(&binary_path, &bundle_path).map_err(|e| PistonError::CopyFileError {
-            input_path: binary_path.clone().to_path_buf(),
-            output_path: bundle_path.clone().to_path_buf(),
+            input_path: binary_path.to_path_buf(),
+            output_path: bundle_path.to_path_buf(),
             source: e,
         })?;
-        //output the proper location in the terminal for the user to see
-        println!("app bundle available at: {}", &bundle_path.display());
         Ok(())
     }
 }
