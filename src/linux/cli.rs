@@ -1,12 +1,48 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::path::PathBuf;
-use crate::PistonError;
+use crate::Result;
 use super::{GPGSigner, LinuxBuilder};
+
+#[derive(Debug)]
+pub enum Error {
+    LinuxAppImageTargetUnsupported { target: String },
+    LinuxRuntimeMissing { path: PathBuf },
+    LinuxImageError(String),
+    LinuxSigningInput(std::io::Error),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::LinuxAppImageTargetUnsupported { target } => write!(
+                f, "Unsupported AppImage target: {target}. \
+                    Supported architectures: x86_64, aarch64, arm, i686, ppc64le, riscv64.",
+            ),
+            Self::LinuxRuntimeMissing { path } => {
+                write!(f, "AppImage runtime not found at {}", path.display())
+            }
+            Self::LinuxImageError(source) => write!(f, "Cannot package AppImage: {source}"),
+            Self::LinuxSigningInput(source) => {
+                write!(f, "Cannot send the signing passphrase to GPG: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::LinuxSigningInput(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
 impl Cli {
-    pub fn build(release: bool, appimage: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<(), PistonError> {
+    pub fn build(release: bool, appimage: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<()> {
         println!("building for linux");
         let op = LinuxBuilder::new(release, appimage, target, cwd, env_vars)?;
         println!("Preparing linux application resources");

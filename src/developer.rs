@@ -8,12 +8,14 @@ use std::fs::{self, File};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use crate::cli::Error as SharedError;
 use crate::host::Host;
 use crate::manifest::Manifest;
-use crate::{PistonError, Result};
+use crate::Result;
 
 pub mod cli;
 pub use cli::Cli;
+use cli::Error;
 
 #[derive(Clone, Hash, Serialize, Deserialize)]
 pub struct Developer {
@@ -60,7 +62,7 @@ impl Credentials {
         let home = match std::env::var_os("CARGO_HOME") {
             Some(path) => PathBuf::from(path),
             None => PathBuf::from(std::env::var_os("HOME")
-                .ok_or(PistonError::MissingEnvironment { name: "HOME" })?).join(".cargo"),
+                .ok_or(SharedError::MissingEnvironment { name: "HOME" })?).join(".cargo"),
         };
         let directory = home.join("piston");
         fs::create_dir_all(&directory).unwrap();
@@ -69,7 +71,7 @@ impl Credentials {
         if lock_path.symlink_metadata().is_ok() { Self::secure(&lock_path, false)?; }
         let lock = File::options().read(true).write(true).create(true).open(&lock_path).unwrap();
         Host::private_permissions(&lock_path, false).unwrap();
-        lock.try_lock().map_err(|source| PistonError::DeveloperStorageLock {
+        lock.try_lock().map_err(|source| Error::DeveloperStorageLock {
             path: lock_path, source: Box::new(source),
         })?;
         let path = directory.join("identities.json");
@@ -97,7 +99,7 @@ impl Credentials {
     pub fn identity(&self, team: &str, expected: Option<&str>) -> Result<Option<Secret>> {
         let Some(secret) = self.identities.get(team) else { return Ok(None); };
         if expected.is_some_and(|expected| expected != secret.name().to_string()) {
-            return Err(PistonError::IdentityOwnerMismatch);
+            return Err(Error::IdentityOwnerMismatch.into());
         }
         Ok(Some(secret.clone()))
     }
@@ -113,7 +115,7 @@ impl Credentials {
 
     pub fn backup_identity(&self, team: &str) -> Result<String> {
         let secret = self.identities.get(team)
-            .ok_or_else(|| PistonError::IdentityMissing { team: team.into() })?;
+            .ok_or_else(|| Error::IdentityMissing { team: team.into() })?;
         let bytes = serde_json::to_vec(&(team, secret)).unwrap();
         Ok(format!("piston-identity:{}", STANDARD.encode(bytes)))
     }
@@ -123,15 +125,15 @@ impl Credentials {
             .and_then(|data| STANDARD.decode(data).ok());
         let restored: Option<(String, Secret)> =
             bytes.and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let (restored_team, secret) = restored.ok_or(PistonError::IdentityImportInvalid)?;
+        let (restored_team, secret) = restored.ok_or(Error::IdentityImportInvalid)?;
         if let Some(team) = team.filter(|team| *team != restored_team) {
-            return Err(PistonError::IdentityTeamMismatch {
+            return Err(Error::IdentityTeamMismatch {
                 expected: team.into(), actual: restored_team,
-            });
+            }.into());
         }
         Self::validate_identity(&restored_team, &secret, expected)?;
         if self.identities.get(&restored_team).is_some_and(|existing| *existing != secret) {
-            return Err(PistonError::IdentityConflict { team: restored_team });
+            return Err(Error::IdentityConflict { team: restored_team }.into());
         }
         let name = secret.name();
         self.store_identity(&restored_team, secret);
@@ -145,38 +147,38 @@ impl Credentials {
 
     pub async fn load(&mut self, team: &str) -> Result<()> {
         let secret = self.identity(team, None)?
-            .ok_or_else(|| PistonError::IdentityMissing { team: team.into() })?;
+            .ok_or_else(|| Error::IdentityMissing { team: team.into() })?;
         tokio::time::timeout(Duration::from_secs(90), async {
             if self.client.is_none() {
                 let server = self.resolver.resolve(Name::orange_me(), None).await;
                 self.client = Some(Client::new((*server).clone(), "wss").await
-                    .map_err(PistonError::DeveloperConnection)?);
+                    .map_err(Error::DeveloperConnection)?);
             }
             let location = Instance::<Developer>::generate_location(&secret, &team.to_string())
-                .map_err(|error| PistonError::DeveloperContract(error.to_string()))?;
+                .map_err(|error| Error::DeveloperContract(error.to_string()))?;
             let mut instance = match self.instances.remove(team) {
                 Some(instance) => instance,
                 None => Instance::receive(secret.clone(), location)
-                    .map_err(|error| PistonError::DeveloperContract(error.to_string()))?,
+                    .map_err(|error| Error::DeveloperContract(error.to_string()))?,
             };
             self.synchronize(team, &mut instance).await?;
             if instance.confirmed().is_none() {
                 instance = Instance::new(secret.clone(), team.to_string())
-                    .map_err(|error| PistonError::DeveloperContract(error.to_string()))?;
+                    .map_err(|error| Error::DeveloperContract(error.to_string()))?;
                 let request = instance.start();
                 if !matches!(self.exchange(team, &mut instance, request).await?, Output::Init(_)) {
-                    return Err(PistonError::DeveloperRejected { team: team.into() });
+                    return Err(Error::DeveloperRejected { team: team.into() }.into());
                 }
                 instance = Instance::receive(secret.clone(), location)
-                    .map_err(|error| PistonError::DeveloperContract(error.to_string()))?;
+                    .map_err(|error| Error::DeveloperContract(error.to_string()))?;
                 self.synchronize(team, &mut instance).await?;
             }
             if instance.confirmed().is_none_or(|state| state.owner != secret.name()) {
-                return Err(PistonError::DeveloperOwnerMismatch { team: team.into() });
+                return Err(Error::DeveloperOwnerMismatch { team: team.into() }.into());
             }
             self.instances.insert(team.into(), instance);
             Ok(())
-        }).await.map_err(|_| PistonError::DeveloperTimeout { team: team.into() })?
+        }).await.map_err(|_| Error::DeveloperTimeout { team: team.into() })?
     }
 
     pub fn get(&self, team: &str, account: &str) -> Option<&[u8]> {
@@ -190,18 +192,18 @@ impl Credentials {
             self.synchronize(team, &mut instance).await?;
             if instance.confirmed().unwrap().entries.get(account) != Some(&bytes) {
                 if !instance.send((account.into(), bytes.clone())) {
-                    return Err(PistonError::DeveloperRejected { team: team.into() });
+                    return Err(Error::DeveloperRejected { team: team.into() }.into());
                 }
                 self.synchronize(team, &mut instance).await?;
                 if instance.confirmed().unwrap().entries.get(account) != Some(&bytes) {
-                    return Err(PistonError::DeveloperUnconfirmed {
+                    return Err(Error::DeveloperUnconfirmed {
                         team: team.into(), account: account.into(),
-                    });
+                    }.into());
                 }
             }
             self.instances.insert(team.into(), instance);
             Ok(())
-        }).await.map_err(|_| PistonError::DeveloperTimeout { team: team.into() })?
+        }).await.map_err(|_| Error::DeveloperTimeout { team: team.into() })?
     }
 
     fn store_identity(&mut self, team: &str, secret: Secret) {
@@ -220,7 +222,7 @@ impl Credentials {
     fn secure(path: &Path, directory: bool) -> Result<()> {
         let metadata = fs::symlink_metadata(path).unwrap();
         if (directory && !metadata.is_dir()) || (!directory && !metadata.is_file()) {
-            return Err(PistonError::DeveloperStoragePath { path: path.into() });
+            return Err(Error::DeveloperStoragePath { path: path.into() }.into());
         }
         Host::private_permissions(path, directory).unwrap();
         Ok(())
@@ -229,12 +231,12 @@ impl Credentials {
     fn validate_identity(team: &str, secret: &Secret, expected: Option<&str>) -> Result<()> {
         if team.len() != 10
             || !team.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-        { return Err(PistonError::IdentityTeamInvalid { team: team.into() }); }
+        { return Err(Error::IdentityTeamInvalid { team: team.into() }.into()); }
         if !secret.path().is_empty()
             || secret.name().to_string() != secret.harden(None).public_key().to_string()
-        { return Err(PistonError::IdentityRootMismatch); }
+        { return Err(Error::IdentityRootMismatch.into()); }
         if expected.is_some_and(|expected| expected != secret.name().to_string()) {
-            return Err(PistonError::IdentityOwnerMismatch);
+            return Err(Error::IdentityOwnerMismatch.into());
         }
         Ok(())
     }
@@ -244,7 +246,7 @@ impl Credentials {
         loop {
             match self.exchange(team, instance, request).await? {
                 Output::Subscribed => return Ok(()),
-                Output::Garbage => return Err(PistonError::DeveloperRejected { team: team.into() }),
+                Output::Garbage => return Err(Error::DeveloperRejected { team: team.into() }.into()),
                 _ => {}
             }
             request = instance.request().unwrap();
@@ -254,7 +256,7 @@ impl Credentials {
     async fn exchange(&mut self, team: &str, instance: &mut Instance<Developer>, request: Request) -> Result<Output<bool>> {
         let responses = self.client.as_ref().unwrap().send(request).await;
         let response = responses.recv().await
-            .map_err(|_| PistonError::DeveloperDisconnected { team: team.into() })?;
+            .map_err(|_| Error::DeveloperDisconnected { team: team.into() })?;
         Ok(instance.response(&mut self.resolver, response).await)
     }
 }

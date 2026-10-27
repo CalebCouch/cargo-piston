@@ -4,7 +4,8 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::{PistonError, Result};
+use crate::Result;
+use crate::cli::Error;
 
 #[derive(Debug)]
 pub struct Manifest {
@@ -13,7 +14,7 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(path: &Path) -> Result<Self> {
-        let path = fs::canonicalize(path).map_err(|source| PistonError::ReadFile {
+        let path = fs::canonicalize(path).map_err(|source| Error::ReadFile {
             path: path.to_path_buf(), source,
         })?;
         Ok(Self { path })
@@ -44,7 +45,7 @@ impl Manifest {
         let (original, mut document) = self.read()?;
         let mut item = document.as_item_mut();
         for (index, name) in ["package", "metadata", "piston"].iter().chain(section).enumerate() {
-            let table = item.as_table_like_mut().ok_or_else(|| PistonError::ManifestTableRequired {
+            let table = item.as_table_like_mut().ok_or_else(|| Error::ManifestTableRequired {
                 path: self.path.clone(), section: section.join("."),
             })?;
             if !table.contains_key(name)
@@ -56,7 +57,7 @@ impl Manifest {
             }
             item = table.get_mut(name).unwrap();
         }
-        let table = item.as_table_like_mut().ok_or_else(|| PistonError::ManifestTableRequired {
+        let table = item.as_table_like_mut().ok_or_else(|| Error::ManifestTableRequired {
             path: self.path.clone(), section: section.join("."),
         })?;
         for (name, setting) in settings {
@@ -98,39 +99,39 @@ impl Manifest {
         let temporary =
             self.path.with_file_name(format!(".Cargo.toml.piston-{}-{stamp}", std::process::id()));
         let result = (|| -> Result<()> {
-            let permissions = fs::metadata(&self.path).map_err(|source| PistonError::FileMetadata {
+            let permissions = fs::metadata(&self.path).map_err(|source| Error::FileMetadata {
                 path: self.path.clone(), source,
             })?.permissions();
             if permissions.readonly() {
-                return Err(PistonError::ManifestReadOnly { path: self.path.clone() });
+                return Err(Error::ManifestReadOnly { path: self.path.clone() }.into());
             }
             let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
-                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })?;
+                .map_err(|source| Error::ManifestWrite { path: self.path.clone(), source })?;
             fs::set_permissions(&temporary, permissions)
                 .and_then(|_| file.write_all(updated.as_bytes()))
                 .and_then(|_| file.sync_all())
-                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })?;
+                .map_err(|source| Error::ManifestWrite { path: self.path.clone(), source })?;
             let current = fs::read_to_string(&self.path)
-                .map_err(|source| PistonError::ReadFile { path: self.path.clone(), source })?;
+                .map_err(|source| Error::ReadFile { path: self.path.clone(), source })?;
             if current != original {
-                return Err(PistonError::ManifestChanged { path: self.path.clone() });
+                return Err(Error::ManifestChanged { path: self.path.clone() }.into());
             }
             fs::rename(&temporary, &self.path)
-                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })
+                .map_err(|source| Error::ManifestWrite { path: self.path.clone(), source }.into())
         })();
         if result.is_err() { let _ = fs::remove_file(&temporary); }
         result
     }
 
     fn read(&self) -> Result<(String, DocumentMut)> {
-        let contents = fs::read_to_string(&self.path).map_err(|source| PistonError::ReadFile {
+        let contents = fs::read_to_string(&self.path).map_err(|source| Error::ReadFile {
             path: self.path.clone(), source,
         })?;
-        let document = contents.parse::<DocumentMut>().map_err(|source| PistonError::ManifestParse {
+        let document = contents.parse::<DocumentMut>().map_err(|source| Error::ManifestParse {
             path: self.path.clone(), source,
         })?;
         if document.get("package").and_then(Item::as_table_like).is_none() {
-            return Err(PistonError::ManifestPackageMissing { path: self.path.clone() });
+            return Err(Error::ManifestPackageMissing { path: self.path.clone() }.into());
         }
         Ok((contents, document))
     }

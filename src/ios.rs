@@ -4,11 +4,12 @@ use std::fs::{self, File, copy, create_dir_all, remove_file};
 use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use crate::Result;
+use crate::cli::Error;
 use crate::project::Project;
 use crate::apple::{AppleSigning, AppleSigningTarget, AscApiKey};
 use crate::devices::IOSDevice;
 use crate::host::Host;
-use crate::PistonError;
 pub use crate::cli::ApplicationArgs;
 
 mod application;
@@ -47,7 +48,7 @@ impl IOSBuilder {
     fn new(
         release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>,
         device_target: Option<IOSDevice>, developer: PathBuf,
-    ) -> Result<Self, PistonError> {
+    ) -> Result<Self> {
         let cargo_path = env_vars.get("cargo_path").cloned().unwrap_or("cargo".to_string());
         let idp_path = env_vars.get("idp_path").cloned();
         let keystore_path = env_vars.get("keystore_path").cloned();
@@ -55,7 +56,7 @@ impl IOSBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| PistonError::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParseError(e.to_string()))?;
 
         let icon_path = Project::get_icon_path(&metadata, &cwd);
         let manifest = metadata.root_package().unwrap().manifest_path.clone().into_std_path_buf();
@@ -91,13 +92,13 @@ impl IOSBuilder {
         })
     }
 
-    fn pre_build(&self) -> Result<(), PistonError> {
+    fn pre_build(&self) -> Result<()> {
         let capitalized = Project::capitalize_first(&self.app_name);
         let bundle_path = &self.output_path;
 
         if bundle_path.as_path().exists() { let _ = fs::remove_dir_all(bundle_path); }
 
-        create_dir_all(bundle_path).map_err(|e| PistonError::CreateDirAllError {
+        create_dir_all(bundle_path).map_err(|e| Error::CreateDirAllError {
             path: bundle_path.to_path_buf(),
             source: e,
         })?;
@@ -108,7 +109,7 @@ impl IOSBuilder {
 
         if appicon_path.exists() { let _ = fs::remove_dir_all(&appicon_path); }
 
-        create_dir_all(&appicon_path).map_err(|e| PistonError::CreateDirAllError {
+        create_dir_all(&appicon_path).map_err(|e| Error::CreateDirAllError {
             path: self.output_path.clone(),
             source: e,
         })?;
@@ -120,13 +121,13 @@ impl IOSBuilder {
 
         let contents_path: PathBuf = appicon_path.join("Contents.json");
         if contents_path.exists() {
-            remove_file(&contents_path).map_err(|e| PistonError::RemoveFileError {
+            remove_file(&contents_path).map_err(|e| Error::RemoveFileError {
                 path: contents_path.clone(),
                 source: e,
             })?;
         }
         let mut contents_file = File::create(&contents_path)
-            .map_err(|e| PistonError::CreateFileError { path: contents_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateFileError { path: contents_path.clone(), source: e })?;
 
         let json_contents = r#"{
     "images": [
@@ -138,7 +139,7 @@ impl IOSBuilder {
 
         contents_file
             .write_all(json_contents.trim().as_bytes())
-            .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFileError(e.to_string()))?;
 
         let assets_output = bundle_path.join("Assets.car");
         let status = Command::new("xcrun")
@@ -158,21 +159,21 @@ impl IOSBuilder {
                 &assets_output.display().to_string(),
             ])
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "xcrun".into(), source: e })?;
 
         if !status.status.success() {
-            return Err(PistonError::CommandFailed { program: "xcrun".into(), output: status });
+            return Err(Error::CommandFailed { program: "xcrun".into(), output: status }.into());
         }
 
         let plist_path: PathBuf = bundle_path.join("Info.plist");
         if plist_path.exists() {
-            remove_file(&plist_path).map_err(|e| PistonError::RemoveFileError {
+            remove_file(&plist_path).map_err(|e| Error::RemoveFileError {
                 path: plist_path.clone(),
                 source: e,
             })?;
         }
         let mut plist_file = File::create(&plist_path)
-            .map_err(|e| PistonError::CreateFileError { path: plist_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateFileError { path: plist_path.clone(), source: e })?;
 
         let plist_content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -242,21 +243,21 @@ impl IOSBuilder {
 
         plist_file
             .write_all(plist_content.trim().as_bytes())
-            .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFileError(e.to_string()))?;
 
         let output = Command::new("plutil")
             .args(["-convert", "binary1", &plist_path.display().to_string()])
             .output()
-            .map_err(|e| PistonError::PlutilConvertError(e.to_string()))?;
+            .map_err(|e| crate::apple::cli::Error::PlutilConvertError(e.to_string()))?;
         if !output.status.success() {
-            return Err(PistonError::PlutilConvertError(
+            return Err(crate::apple::cli::Error::PlutilConvertError(
                 String::from_utf8_lossy(&output.stderr).to_string(),
-            ));
+            ).into());
         }
         Ok(())
     }
 
-    fn build(&self) -> Result<(), PistonError> {
+    fn build(&self) -> Result<()> {
         let cargo_args = format!(
             "build --target {} {}",
             self.target,
@@ -271,10 +272,10 @@ impl IOSBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
 
         if !builder.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
+            return Err(Error::CommandFailed { program: "bash".into(), output: builder }.into());
         }
 
         Ok(())
@@ -282,10 +283,10 @@ impl IOSBuilder {
 }
 
 impl IOSBuilder {
-    fn post_build(&mut self) -> Result<(), PistonError> {
+    fn post_build(&mut self) -> Result<()> {
         let provision_cache = self.cwd.join("target").join("ios-cache").join("profiles");
         if !provision_cache.exists() {
-            create_dir_all(&provision_cache).map_err(|e| PistonError::CreateDirAllError {
+            create_dir_all(&provision_cache).map_err(|e| Error::CreateDirAllError {
                 path: provision_cache.to_path_buf(),
                 source: e,
             })?;
@@ -298,7 +299,7 @@ impl IOSBuilder {
             .join(&self.app_name);
         let capitalized = Project::capitalize_first(&self.app_name);
         let bundle_path = self.output_path.join(&capitalized);
-        copy(&binary_path, &bundle_path).map_err(|e| PistonError::CopyFileError {
+        copy(&binary_path, &bundle_path).map_err(|e| Error::CopyFileError {
             input_path: binary_path.clone(),
             output_path: bundle_path.clone(),
             source: e,
@@ -307,10 +308,9 @@ impl IOSBuilder {
         Host::make_executable(&exe_path)?;
         let output = Command::new("xattr")
             .args(["-cr", &bundle_path.display().to_string()])
-            .output()
-            .map_err(|e| PistonError::Generic(e.to_string()))?;
+            .output()?;
         if !output.status.success() {
-            return Err(PistonError::Generic(String::from_utf8_lossy(&output.stderr).to_string()));
+            return Err(cli::Error::ExtendedAttributesFailed { output: output.stderr }.into());
         }
 
         if self.keystore_path.is_some() && self.asc_api_key.is_some() {
@@ -348,21 +348,21 @@ impl IOSBuilder {
             let ipa_path = parent.join(format!("{}.ipa", &capitalized));
             self.ipa_path = Some(ipa_path.clone());
             if ipa_path.as_path().exists() {
-                remove_file(&ipa_path).map_err(|e| PistonError::RemoveFileError {
+                remove_file(&ipa_path).map_err(|e| Error::RemoveFileError {
                     path: ipa_path.to_path_buf(),
                     source: e,
                 })?;
             }
             let payload_path = parent.join("Payload");
             if payload_path.exists() { let _ = fs::remove_dir_all(&payload_path); }
-            create_dir_all(&payload_path).map_err(|e| PistonError::CreateDirAllError {
+            create_dir_all(&payload_path).map_err(|e| Error::CreateDirAllError {
                 path: payload_path.to_path_buf(),
                 source: e,
             })?;
             let dest = payload_path.join(format!("{}.app", &capitalized));
             let status =
                 Command::new("cp").arg("-r").arg(output_path).arg(&dest).output().map_err(|e| {
-                    PistonError::CopyFileError {
+                    Error::CopyFileError {
                         input_path: output_path.to_path_buf(),
                         output_path: dest.clone(),
                         source: e,
@@ -370,7 +370,7 @@ impl IOSBuilder {
                 })?;
 
             if !status.status.success() {
-                return Err(PistonError::CommandFailed { program: "cp".into(), output: status });
+                return Err(Error::CommandFailed { program: "cp".into(), output: status }.into());
             }
 
             let status = Command::new("zip")
@@ -379,10 +379,10 @@ impl IOSBuilder {
                 .arg("Payload")
                 .current_dir(parent)
                 .output()
-                .map_err(|e| PistonError::CommandSpawn { program: "zip".into(), source: e })?;
+                .map_err(|e| Error::CommandSpawn { program: "zip".into(), source: e })?;
 
             if !status.status.success() {
-                return Err(PistonError::CommandFailed { program: "zip".into(), output: status });
+                return Err(Error::CommandFailed { program: "zip".into(), output: status }.into());
             }
             let _ = std::fs::remove_dir_all(payload_path);
 
@@ -395,7 +395,7 @@ pub struct IOSRunner;
 
 impl IOSRunner {
     //TODO this is currently broken
-    fn deploy_usb(device_id: &str, output_path: &str, bundle_id: &str, developer: &std::path::Path) -> Result<(), PistonError> {
+    fn deploy_usb(device_id: &str, output_path: &str, bundle_id: &str, developer: &std::path::Path) -> Result<()> {
         let _ = Command::new("xcrun")
             .env("DEVELOPER_DIR", &developer)
             .args([
@@ -413,21 +413,21 @@ impl IOSRunner {
             .env("DEVELOPER_DIR", &developer)
             .args(["devicectl", "device", "install", "app", "--device", device_id, output_path])
             .output()
-            .map_err(|e| PistonError::XcrunInstallError(e.to_string()))?;
+            .map_err(|e| cli::Error::XcrunInstallError(e.to_string()))?;
         if !output.status.success() {
-            return Err(PistonError::XcrunInstallError(
+            return Err(cli::Error::XcrunInstallError(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+            ).into());
         }
         let output = Command::new("xcrun")
             .env("DEVELOPER_DIR", &developer)
             .args(["devicectl", "device", "process", "launch", "--device", device_id, bundle_id])
             .output()
-            .map_err(|e| PistonError::XcrunLaunchError(e.to_string()))?;
+            .map_err(|e| cli::Error::XcrunLaunchError(e.to_string()))?;
         if !output.status.success() {
-            return Err(PistonError::XcrunLaunchError(
+            return Err(cli::Error::XcrunLaunchError(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
-            ));
+            ).into());
         }
         Ok(())
     }

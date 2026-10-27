@@ -1,10 +1,73 @@
 use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use crate::apple::app_store;
 use crate::{developer, host};
 use crate::manifest::Manifest;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::{AccountSetup, AscApiKey};
+
+#[derive(Debug)]
+pub enum Error {
+    InteractiveRequired,
+    CredentialsMissing,
+    InputRead(io::Error),
+    Cancelled,
+    StoreCredentialsInvalid(serde_json::Error),
+    StoreKeyIdInvalid,
+    StoreIssuerInvalid,
+    StoreKeyMissing { key_id: String },
+    StoreKeyAmbiguous { key_id: String, paths: Vec<PathBuf> },
+    StoreKeySearchFallback(Box<dyn std::error::Error>),
+    StoreKeySearchDenied { path: PathBuf },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InteractiveRequired => write!(f,
+                "--setup needs an interactive terminal.\n\n\
+                 Rerun this deployment command in a terminal to replace the team's API key."),
+            Self::CredentialsMissing => write!(f,
+                "App Store Connect credentials have not been set up.\n\n\
+                 Rerun this command in a terminal to import a Team API key.\n\
+                 For unattended setup, set ASC_ISSUER_ID and ASC_KEY_ID or ASC_KEY_PATH."),
+            Self::InputRead(source) => write!(f, "Cannot read setup input: {source}"),
+            Self::Cancelled => write!(f, "App Store Connect setup cancelled."),
+            Self::StoreCredentialsInvalid(source) => write!(f,
+                "Invalid App Store Connect credentials in the developer contract: {source}. \
+                 Rerun deployment with --setup to replace them."),
+            Self::StoreKeyIdInvalid => write!(f,
+                "Provide a 10-character Team API Key ID or an AuthKey_<KEY_ID>.p8 file path."),
+            Self::StoreIssuerInvalid => write!(f,
+                "Enter the Issuer ID shown above Team Keys (ASC_ISSUER_ID), in UUID format."),
+            Self::StoreKeyMissing { key_id } => write!(f,
+                "Cannot find AuthKey_{key_id}.p8 using system search or the standard key folders. \
+                 Set ASC_KEY_PATH or use the interactive setup."),
+            Self::StoreKeyAmbiguous { key_id, paths } => {
+                writeln!(f, "Multiple files match Key ID {key_id}. Set ASC_KEY_PATH to choose one:")?;
+                for path in paths { writeln!(f, "{}", path.display())?; }
+                Ok(())
+            }
+            Self::StoreKeySearchFallback(source) => write!(f,
+                "{source} Checking standard key folders directly."),
+            Self::StoreKeySearchDenied { path } => write!(f,
+                "Cannot search {}: permission denied. Supply the key file path if stored there.",
+                path.display()),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InputRead(source) => Some(source),
+            Self::StoreCredentialsInvalid(source) => Some(source),
+            Self::StoreKeySearchFallback(source) => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
@@ -15,15 +78,14 @@ impl Cli {
         let mut setup = AccountSetup::new(root, team, store)?;
         let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
         if reconfigure && !interactive {
-            return Err(PistonError::Generic(
-                "--setup needs an interactive terminal.\n\n\
-                 Rerun this deployment command in a terminal to replace the team's API key.".into(),
-            ));
+            return Err(Error::InteractiveRequired.into());
         }
         eprintln!("Loading App Store Connect credentials from AIR for team {}", setup.team);
         let saved = match setup.load(reconfigure) {
             Ok(saved) => saved,
-            Err(error @ PistonError::StoreCredentialsInvalid(_)) if interactive => {
+            Err(error) if interactive && matches!(
+                error.downcast_ref::<Error>(), Some(Error::StoreCredentialsInvalid(_)),
+            ) => {
                 eprintln!("{error}");
                 None
             }
@@ -38,10 +100,11 @@ impl Cli {
                     setup.remember()?;
                     return Ok((key, setup.team));
                 }
-                Err(PistonError::ASCAuthenticationError(error)) if interactive => {
-                    eprintln!("{error}");
-                }
-                Err(error @ PistonError::StoreKeyInvalid { .. }) if interactive => {
+                Err(error) if interactive && matches!(
+                    error.downcast_ref::<app_store::cli::Error>(),
+                    Some(app_store::cli::Error::ASCAuthenticationError(_)
+                        | app_store::cli::Error::StoreKeyInvalid { .. }),
+                ) => {
                     eprintln!("{error}");
                 }
                 Err(error) => return Err(error),
@@ -62,11 +125,7 @@ impl Cli {
             }
         }
         if !interactive {
-            return Err(PistonError::Generic(
-                "App Store Connect credentials have not been set up.\n\n\
-                 Rerun this command in a terminal to import a Team API key.\n\
-                 For unattended setup, set ASC_ISSUER_ID and ASC_KEY_ID or ASC_KEY_PATH.".into(),
-            ));
+            return Err(Error::CredentialsMissing.into());
         }
         eprintln!(
             "\nApp Store Connect setup\n  Project: {}\n  Apple team: {}\n",
@@ -182,13 +241,11 @@ impl Cli {
             eprint!("\n{label}");
             if !default.is_empty() { eprint!(" [{default}]"); }
             eprint!(" (q to cancel): ");
-            io::stderr().flush().map_err(|error| PistonError::Generic(error.to_string()))?;
+            io::stderr().flush()?;
             let mut input = String::new();
-            let count = io::stdin().read_line(&mut input).map_err(|error| {
-                PistonError::Generic(format!("Cannot read setup input: {error}"))
-            })?;
+            let count = io::stdin().read_line(&mut input).map_err(Error::InputRead)?;
             if count == 0 || input.trim().eq_ignore_ascii_case("q") {
-                return Err(PistonError::Generic("App Store Connect setup cancelled.".into()));
+                return Err(Error::Cancelled.into());
             }
             let input = input.trim();
             if !input.is_empty() { return Ok(input.into()); }

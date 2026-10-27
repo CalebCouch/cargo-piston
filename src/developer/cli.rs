@@ -1,10 +1,105 @@
 use clap::Parser;
+use std::fmt;
 use std::io::{self, Write};
+use std::path::PathBuf;
 use crate::host;
 use crate::manifest::Manifest;
 use crate::project::Project;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::Credentials;
+
+#[derive(Debug)]
+pub enum Error {
+    DeveloperStorageLock { path: PathBuf, source: Box<dyn std::error::Error> },
+    DeveloperStoragePath { path: PathBuf },
+    DeveloperConnection(String),
+    DeveloperContract(String),
+    DeveloperTimeout { team: String },
+    DeveloperDisconnected { team: String },
+    DeveloperRejected { team: String },
+    DeveloperOwnerMismatch { team: String },
+    DeveloperUnconfirmed { team: String, account: String },
+    IdentityMissing { team: String },
+    IdentityImportInvalid,
+    IdentityTeamMismatch { expected: String, actual: String },
+    IdentityConflict { team: String },
+    IdentityTeamInvalid { team: String },
+    IdentityRootMismatch,
+    IdentityOwnerMismatch,
+    IdentitiesMissing,
+    IdentitySetupRequired,
+    IdentitySetupCancelled,
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DeveloperStorageLock { path, source } => write!(f,
+                "Cannot lock developer identities at {}: {source}. Finish the other Piston \
+                 identity or deployment operation and retry.", path.display()),
+            Self::DeveloperStoragePath { path } => write!(f,
+                "Developer identity storage must use ordinary private files and directories: {}",
+                path.display()),
+            Self::DeveloperConnection(source) => write!(f, "Cannot connect to AIR: {source}"),
+            Self::DeveloperContract(source) => write!(f, "Cannot open the developer contract: {source}"),
+            Self::DeveloperTimeout { team } => write!(f,
+                "AIR did not confirm developer credentials for team {team} within 90 seconds. \
+                 Check your connection and retry; Piston will read the existing contract first."),
+            Self::DeveloperDisconnected { team } => {
+                write!(f, "AIR disconnected while synchronizing developer credentials for team {team}.")
+            }
+            Self::DeveloperRejected { team } => write!(f,
+                "AIR rejected a developer contract record for team {team}. Verify the restored \
+                 team identity before retrying."),
+            Self::DeveloperOwnerMismatch { team } => write!(f,
+                "The developer contract for team {team} does not match the local identity. \
+                 Restore the team's saved cargo piston backup."),
+            Self::DeveloperUnconfirmed { team, account } => write!(f,
+                "AIR did not retain the requested {account} credentials for team {team}. \
+                 Another session may have changed them; reload the contract and retry."),
+            Self::IdentityMissing { team } => write!(f, "No identity is stored for team {team}."),
+            Self::IdentityImportInvalid => {
+                write!(f, "Paste the complete piston-identity: line from cargo piston backup.")
+            }
+            Self::IdentityTeamMismatch { expected, actual } => {
+                write!(f, "This identity belongs to Apple team {actual}, not {expected}. \
+                    Ask for that team's identity.")
+            }
+            Self::IdentityConflict { team } => write!(f,
+                "Team {team} already has a different saved identity. Piston will not overwrite it. \
+                 Use the matching identity or the intended computer."),
+            Self::IdentityTeamInvalid { team } => {
+                write!(f, "Apple Team ID {team:?} must contain 10 uppercase letters or digits.")
+            }
+            Self::IdentityRootMismatch => {
+                write!(f, "Invalid team identity: the root key does not match.")
+            }
+            Self::IdentityOwnerMismatch => write!(f,
+                "This identity does not own the project's developer configuration. Ask a teammate \
+                 to run cargo piston backup on the computer that configured it, then run \
+                 cargo piston restore \"secret data\"."),
+            Self::IdentitiesMissing => write!(f,
+                "No developer identities are saved on this computer.\n\n\
+                 Create one from your project: cargo piston\n\
+                 Restore a backup: cargo piston restore \"secret data\""),
+            Self::IdentitySetupRequired => write!(f,
+                "Identity setup needs an interactive terminal.\n\n\
+                 Run cargo piston in your project to select or create an identity.\n\
+                 To use an existing backup, restore it first:\n\n  \
+                 cargo piston restore \"secret data\""),
+            Self::IdentitySetupCancelled => write!(f, "Identity setup cancelled."),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::DeveloperStorageLock { source, .. } => Some(source.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
@@ -17,7 +112,9 @@ impl Cli {
                 if requested_team.is_none_or(|requested| requested == team) {
                     match store.identity(team, Some(identity)) {
                         Ok(Some(_)) => return Ok((store, team.clone())),
-                        Ok(None) | Err(PistonError::IdentityOwnerMismatch) => (),
+                        Ok(None) => (),
+                        Err(error) if matches!(error.downcast_ref::<Error>(),
+                            Some(Error::IdentityOwnerMismatch)) => (),
                         Err(error) => return Err(error),
                     }
                 }
@@ -61,7 +158,8 @@ impl Cli {
                             eprintln!("\nIdentity ready for Apple team {team}.");
                             eprintln!("Keep a private backup: cargo piston backup");
                         }
-                        Err(error @ PistonError::IdentityTeamInvalid { .. }) if requested_team.is_none() => {
+                        Err(error) if requested_team.is_none() && matches!(error.downcast_ref::<Error>(),
+                            Some(Error::IdentityTeamInvalid { .. })) => {
                             eprintln!("{error}"); continue;
                         }
                         Err(error) => return Err(error),
@@ -92,11 +190,7 @@ impl Cli {
         let store = Credentials::new()?;
         let identities = store.identities();
         if identities.is_empty() {
-            return Err(PistonError::Generic(
-                "No developer identities are saved on this computer.\n\n\
-                 Create one from your project: cargo piston\n\
-                 Restore a backup: cargo piston restore \"secret data\"".into(),
-            ));
+            return Err(Error::IdentitiesMissing.into());
         }
         eprintln!("\nBack up a developer identity\n\nChoose an Apple team:\n");
         for (index, (team, _)) in identities.iter().enumerate() {
@@ -134,20 +228,14 @@ impl Cli {
 
     fn prompt(label: &str) -> Result<String> {
         if !host::Cli::interactive() {
-            return Err(PistonError::Generic(
-                "Identity setup needs an interactive terminal.\n\n\
-                 Run cargo piston in your project to select or create an identity.\n\
-                 To use an existing backup, restore it first:\n\n  \
-                 cargo piston restore \"secret data\"".into(),
-            ));
+            return Err(Error::IdentitySetupRequired.into());
         }
         eprint!("{label}: ");
-        io::stderr().flush().map_err(|error| PistonError::Generic(error.to_string()))?;
+        io::stderr().flush()?;
         let mut input = String::new();
-        let count = io::stdin().read_line(&mut input)
-            .map_err(|error| PistonError::Generic(error.to_string()))?;
+        let count = io::stdin().read_line(&mut input)?;
         if count == 0 || input.trim().eq_ignore_ascii_case("q") {
-            return Err(PistonError::Generic("Identity setup cancelled.".into()));
+            return Err(Error::IdentitySetupCancelled.into());
         }
         Ok(input.trim().to_owned())
     }

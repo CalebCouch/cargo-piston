@@ -1,4 +1,6 @@
 use clap::Parser;
+use std::fmt;
+use crate::Result;
 use crate::apple::app_store::{release, setup, testflight};
 use crate::apple::{AppStoreRelease, IOSArtwork, TestFlight};
 use crate::ios::{self, distribution, ApplicationArgs, IOSStore};
@@ -6,7 +8,23 @@ use crate::manifest::Manifest;
 use crate::developer;
 use crate::host;
 use crate::project::Project;
-use crate::{PistonError, Result};
+
+#[derive(Debug)]
+pub enum Error { NewBuildDestination, ScreenshotsDestination }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NewBuildDestination => "--new-build is only needed for TestFlight deployments.",
+            Self::ScreenshotsDestination =>
+                "TestFlight does not use App Store screenshots.\n\n\
+                 To update the store gallery, run:\n\
+                   cargo piston deploy app-store --screenshots-only",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, Parser)]
 pub struct DeploymentArgs {
@@ -38,9 +56,7 @@ impl Cli {
         args.application.team = Some(team);
         if args.destination == Destination::Testflight { return Self::testflight(args); }
         if args.new_build {
-            return Err(PistonError::Generic(
-                "--new-build is only needed for TestFlight deployments.".into(),
-            ));
+            return Err(Error::NewBuildDestination.into());
         }
         let mut application = ios::Cli::application(args.application, true)?;
         let root = application.package().manifest_path.parent().unwrap().as_std_path();
@@ -90,11 +106,7 @@ impl Cli {
 
     fn testflight(args: DeploymentArgs) -> Result<()> {
         if args.screenshots_only {
-            return Err(PistonError::Generic(
-                "TestFlight does not use App Store screenshots.\n\n\
-                 To update the store gallery, run:\n\
-                   cargo piston deploy app-store --screenshots-only".into()
-            ));
+            return Err(Error::ScreenshotsDestination.into());
         }
         let mut application = ios::Cli::application(args.application, true)?;
         application.store_release()?;

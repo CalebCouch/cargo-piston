@@ -1,11 +1,115 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use crate::{host, PistonError, Result};
+use crate::{cli, Result};
+use crate::host;
 use crate::dev::DevelopmentArgs;
 use crate::devices::AndroidDevice;
 use crate::project::Project;
 use super::{AndroidBuilder, AndroidDevelopment};
 use super::AndroidRunner;
+
+#[derive(Debug)]
+pub enum Error {
+    AndroidArgumentsUnsupported,
+    AndroidBridgeMissing,
+    AndroidDeviceUnavailable { serial: String, state: String },
+    AndroidDevicesAmbiguous { serials: Vec<String> },
+    AndroidTargetIncompatible { serial: String, target: Option<String>, abis: Vec<String> },
+    AndroidToolMissing { path: PathBuf },
+    AndroidBuildToolsMissing { path: PathBuf },
+    AndroidHostToolchainMissing { path: PathBuf },
+    AndroidManifestMissing { path: PathBuf },
+    AndroidSdkManagerMissing { path: PathBuf },
+    AndroidEmulatorNotFound { selector: String, available: Vec<String> },
+    AndroidEmulatorPortsUnavailable,
+    AndroidEmulatorClosed { log: PathBuf },
+    AndroidBootTimeout,
+    AndroidInterrupted,
+    AndroidAppExited,
+    AndroidLaunchFailed { output: Vec<u8> },
+    AndroidEmulatorControl(std::io::Error),
+    AndroidSignalHandler(ctrlc::Error),
+    ParseManifestError(String),
+    WriteManifestError(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AndroidArgumentsUnsupported => write!(
+                f, "Android NativeActivity does not accept desktop command-line arguments.",
+            ),
+            Self::AndroidBridgeMissing => write!(
+                f, "The selected Maverick dependency needs its android/ Gradle bridge. \
+                    Use maverick_os 3.0.3 or later.",
+            ),
+            Self::AndroidDeviceUnavailable { serial, state } => write!(
+                f, "Android device {serial} is {state}. Unlock it, enable USB debugging and \
+                    accept this computer's debugging prompt.",
+            ),
+            Self::AndroidDevicesAmbiguous { serials } => write!(
+                f, "Multiple Android devices: {}. Select one with --device <serial>.",
+                serials.join(", "),
+            ),
+            Self::AndroidTargetIncompatible { serial, target, abis } => write!(
+                f, "Rust target {} cannot run on {serial}. Device ABIs: {}.",
+                target.as_deref().unwrap_or("selected automatically"), abis.join(", "),
+            ),
+            Self::AndroidToolMissing { path } => {
+                write!(f, "Required Android tool was not found at {}", path.display())
+            }
+            Self::AndroidBuildToolsMissing { path } => {
+                write!(f, "No Android build tools are installed at {}", path.display())
+            }
+            Self::AndroidHostToolchainMissing { path } => {
+                write!(f, "No Android NDK host toolchain is installed at {}", path.display())
+            }
+            Self::AndroidManifestMissing { path } => {
+                write!(f, "AAPT2 did not produce a linked Android manifest at {}", path.display())
+            }
+            Self::AndroidSdkManagerMissing { path } => write!(
+                f, "Android SDK command-line tools are missing from {}. \
+                    Install them in Android Studio's SDK Manager.", path.display(),
+            ),
+            Self::AndroidEmulatorNotFound { selector, available } => write!(
+                f, "No Android device or AVD matches {selector}. Available AVDs: {}",
+                available.join(", "),
+            ),
+            Self::AndroidEmulatorPortsUnavailable => {
+                write!(f, "No free Android emulator console ports.")
+            }
+            Self::AndroidEmulatorClosed { log } => {
+                write!(f, "Android emulator closed before booting. See {}", log.display())
+            }
+            Self::AndroidBootTimeout => {
+                write!(f, "Android did not finish booting within three minutes.")
+            }
+            Self::AndroidInterrupted => write!(f, "Android development interrupted."),
+            Self::AndroidAppExited => write!(f, "Android app exited before log streaming began."),
+            Self::AndroidLaunchFailed { output } => f.write_str(&String::from_utf8_lossy(output)),
+            Self::AndroidEmulatorControl(source) => {
+                write!(f, "Cannot stop or wait for the Android emulator: {source}")
+            }
+            Self::AndroidSignalHandler(source) => write!(f, "Cannot watch Android shutdown: {source}"),
+            Self::ParseManifestError(err) => {
+                write!(f, "Failed to parse package.metadata.android value: {}", err)
+            }
+            Self::WriteManifestError(err) => {
+                write!(f, "Failed to write AndroidManifest.xml contents: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::AndroidEmulatorControl(source) => Some(source),
+            Self::AndroidSignalHandler(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
@@ -15,8 +119,9 @@ impl Cli {
         let mut session = loop {
             match AndroidDevelopment::new(&args) {
                 Ok(session) => break session,
-                Err(error @ PistonError::InvalidBundleId { .. })
-                    if args.application.bundle_id.is_none() =>
+                Err(error) if args.application.bundle_id.is_none()
+                    && matches!(error.downcast_ref::<cli::Error>(),
+                        Some(cli::Error::InvalidBundleId { .. })) =>
                 {
                     eprintln!("{error}");
                     let value = loop {

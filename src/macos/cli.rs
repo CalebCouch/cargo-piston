@@ -1,13 +1,50 @@
 use toml_edit::{Item, Value};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use crate::Result;
 use crate::apple::{notifications, xcode, NotificationSetup, PushBuild, PushPlatform, PushSigning};
 use crate::dev::DevelopmentArgs;
 use crate::host::{self, Host};
 use crate::manifest::Manifest;
 use crate::project::Project;
-use crate::Result;
 use super::{MacDevelopment, MacOSBuilder};
+
+#[derive(Debug)]
+pub enum Error {
+    MacResourcesInvalid,
+    MacResourceInvalid { path: PathBuf },
+    LipoError { first_binary: PathBuf, second_binary: PathBuf, source: String },
+    MacOSIconError { input_path: PathBuf, output_path: PathBuf, source: std::io::Error },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MacResourcesInvalid => write!(f, "macos.resources must contain paths."),
+            Self::MacResourceInvalid { path } => {
+                write!(f, "Invalid macOS resource path: {}", path.display())
+            }
+            Self::LipoError { first_binary, second_binary, source } => write!(
+                f,
+                "Error making universal binary with Lipo first binary: {:?}, \
+                 second binary: {:?}, source: {}",
+                first_binary, second_binary, source
+            ),
+            Self::MacOSIconError { input_path, output_path, .. } => {
+                write!(f, "Failed to format icon {:?} to {:?}", input_path, output_path)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::MacOSIconError { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 

@@ -4,7 +4,8 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
-use crate::PistonError;
+use crate::apple::app_store;
+use crate::Result;
 use super::artwork::{ScreenshotFamily, StoreScreenshot};
 use super::{AppStoreConnect, AscApiKey};
 
@@ -23,7 +24,7 @@ pub struct AppStoreRelease {
 }
 
 impl AppStoreRelease {
-    pub fn new(key: &AscApiKey, bundle_id: &str, version: &str) -> Result<Self, PistonError> {
+    pub fn new(key: &AscApiKey, bundle_id: &str, version: &str) -> Result<Self> {
         let mut release = Self {
             client: AppStoreConnect::new(key)?,
             app_id: String::new(),
@@ -38,7 +39,7 @@ impl AppStoreRelease {
             "/v1/apps",
             &[("filter[bundleId]", bundle_id), ("fields[apps]", "name,bundleId,primaryLocale")],
         )?;
-        let app = apps.first().ok_or_else(|| PistonError::StoreAppMissing {
+        let app = apps.first().ok_or_else(|| app_store::cli::Error::StoreAppMissing {
             bundle_id: bundle_id.into(), testflight: false,
         })?;
         release.app_id = Self::string(app, "id")?;
@@ -67,7 +68,7 @@ impl AppStoreRelease {
             .client
             .list("/v1/appAssetLibraryRefData", &[("filter[features]", "APP_STORE_VERSIONS")])?;
         let attributes = catalog.first().map(|entry| &entry["attributes"]).ok_or_else(|| {
-            PistonError::StoreCatalogEmpty
+            cli::Error::StoreCatalogEmpty
         })?;
         release.groups = ScreenshotGroup::read(attributes)?;
         Ok(release)
@@ -84,14 +85,14 @@ impl AppStoreRelease {
         sizes
     }
 
-    pub fn next_build(&self, previous: Option<&str>) -> Result<String, PistonError> {
+    pub fn next_build(&self, previous: Option<&str>) -> Result<String> {
         self.client.next_build(&self.app_id, &self.version, previous)
     }
 
-    pub fn validate(&self, screenshots: &[StoreScreenshot]) -> Result<Vec<String>, PistonError> {
+    pub fn validate(&self, screenshots: &[StoreScreenshot]) -> Result<Vec<String>> {
         let mut preserved_groups = Vec::new();
         if screenshots.is_empty() {
-            return Err(PistonError::StoreScreenshotsMissing);
+            return Err(cli::Error::StoreScreenshotsMissing.into());
         }
         let existing = if let Some(localization) = &self.localization_id {
             self.client.list(
@@ -118,28 +119,28 @@ impl AppStoreRelease {
             }
             preserved_groups.extend(preserved.into_iter().map(str::to_owned));
             if images.len() > group.max_count {
-                return Err(PistonError::StoreScreenshotGroupCount {
+                return Err(cli::Error::StoreScreenshotGroupCount {
                     group: group.id.clone(), count: images.len(), maximum: group.max_count,
-                });
+                }.into());
             }
             for image in images {
                 let size = fs::metadata(image.path())
                     .map_err(|error| {
-                        PistonError::ReadFile { path: image.path().into(), source: error }
+                        crate::cli::Error::ReadFile { path: image.path().into(), source: error }
                     })?
                     .len();
                 let spec = group.specs.iter().find(|spec| spec.accepts(image)).unwrap();
                 if size == 0 || size > spec.max_file_size {
-                    return Err(PistonError::StoreScreenshotFileSize {
+                    return Err(cli::Error::StoreScreenshotFileSize {
                         path: image.source().into(), size, maximum: spec.max_file_size,
-                    });
+                    }.into());
                 }
             }
         }
         Ok(preserved_groups)
     }
 
-    fn commit(&self, staged: &[(String, Vec<String>)]) -> Result<(), PistonError> {
+    fn commit(&self, staged: &[(String, Vec<String>)]) -> Result<()> {
         let mut originals = Vec::new();
         for (group, _) in staged { originals.push((group.clone(), self.placements(group)?)); }
         for (index, (group, images)) in staged.iter().enumerate() {
@@ -155,15 +156,15 @@ impl AppStoreRelease {
                         .and_then(|current| self.sync_group(group, &images, &current, original));
                     if let Err(error) = restored { recovery.push((group.clone(), error)); }
                 }
-                return Err(PistonError::StoreScreenshotSync {
-                    source: Box::new(error), recovery,
-                });
+                return Err(cli::Error::StoreScreenshotSync {
+                    source: error, recovery,
+                }.into());
             }
         }
         Ok(())
     }
 
-    fn group(&self, family: ScreenshotFamily, images: &[&StoreScreenshot]) -> Result<&ScreenshotGroup, PistonError> {
+    fn group(&self, family: ScreenshotFamily, images: &[&StoreScreenshot]) -> Result<&ScreenshotGroup> {
         self.groups
             .iter()
             .filter(|group| group.family == family)
@@ -171,14 +172,14 @@ impl AppStoreRelease {
                 images.iter().all(|image| group.specs.iter().any(|spec| spec.accepts(image)))
             })
             .max_by(|left, right| left.display_size.total_cmp(&right.display_size))
-            .ok_or_else(|| PistonError::StoreScreenshotGroupMismatch {
+            .ok_or_else(|| cli::Error::StoreScreenshotGroupMismatch {
                 images: images.iter().map(|image| {
                     (image.source().into(), image.width(), image.height())
                 }).collect(),
-            })
+            }.into())
     }
 
-    fn check_editable(version: &Value) -> Result<(), PistonError> {
+    fn check_editable(version: &Value) -> Result<()> {
         let state = Self::string(&version["attributes"], "appVersionState")?;
         if matches!(
             state.as_str(),
@@ -188,12 +189,12 @@ impl AppStoreRelease {
                 | "METADATA_REJECTED"
                 | "DEVELOPER_REJECTED"
         ) { return Ok(()); }
-        Err(PistonError::StoreVersionNotEditable {
+        Err(cli::Error::StoreVersionNotEditable {
             version: version["attributes"]["versionString"].as_str().unwrap_or("").into(), state,
-        })
+        }.into())
     }
 
-    fn find_localization(&self) -> Result<Option<String>, PistonError> {
+    fn find_localization(&self) -> Result<Option<String>> {
         let Some(version) = &self.version_id else { return Ok(None); };
         let localizations = self.client.list(
             &format!("/v1/appStoreVersions/{version}/appStoreVersionLocalizations"),
@@ -202,7 +203,7 @@ impl AppStoreRelease {
         localizations.first().map(|locale| Self::string(locale, "id")).transpose()
     }
 
-    fn prepare_localization(&mut self) -> Result<(), PistonError> {
+    fn prepare_localization(&mut self) -> Result<()> {
         if let Some(id) = &self.version_id {
             let version =
                 self.client.request("GET", &format!("/v1/appStoreVersions/{id}"), &[], None)?;
@@ -238,9 +239,9 @@ impl AppStoreRelease {
         Ok(())
     }
 
-    fn upload_image(&self, image: &StoreScreenshot, group: &ScreenshotGroup) -> Result<String, PistonError> {
+    fn upload_image(&self, image: &StoreScreenshot, group: &ScreenshotGroup) -> Result<String> {
         let bytes = fs::read(image.path()).map_err(|error| {
-            PistonError::ReadFile { path: image.path().into(), source: error }
+            crate::cli::Error::ReadFile { path: image.path().into(), source: error }
         })?;
         let reference = format!("piston-{:x}", Sha256::digest(&bytes));
         let existing = self.client.list(
@@ -301,10 +302,10 @@ impl AppStoreRelease {
                 asset = self.reserve_image(image, bytes.len(), &reference)?;
             }
         }
-        Err(PistonError::StoreUploadUrlsRejected)
+        Err(cli::Error::StoreUploadUrlsRejected.into())
     }
 
-    fn reserve_image(&self, image: &StoreScreenshot, size: usize, reference: &str) -> Result<Value, PistonError> {
+    fn reserve_image(&self, image: &StoreScreenshot, size: usize, reference: &str) -> Result<Value> {
         self.client.request("POST", "/v1/appAssetLibraryImages", &[], Some(json!({"data": {
             "type": "appAssetLibraryImages", "attributes": {
                 "fileName": image.path().file_name().unwrap().to_string_lossy(),
@@ -313,22 +314,22 @@ impl AppStoreRelease {
         }})))
     }
 
-    fn transfer(&self, operations: &Value, bytes: &[u8], image_id: &str) -> Result<bool, PistonError> {
+    fn transfer(&self, operations: &Value, bytes: &[u8], image_id: &str) -> Result<bool> {
         let operations = operations.as_array().ok_or_else(|| {
-            PistonError::StoreUploadOperationsMissing { image_id: image_id.into() }
+            cli::Error::StoreUploadOperationsMissing { image_id: image_id.into() }
         })?;
         let mut parts = Vec::new();
         for operation in operations {
             let offset = operation["offset"].as_u64();
             let length = operation["length"].as_u64();
             let Some((offset, length)) = offset.zip(length) else {
-                return Err(PistonError::StoreUploadRangeInvalid);
+                return Err(cli::Error::StoreUploadRangeInvalid.into());
             };
             let end = offset
                 .checked_add(length)
                 .filter(|end| *end <= bytes.len() as u64)
                 .ok_or_else(|| {
-                    PistonError::StoreUploadRangeTooLarge
+                    cli::Error::StoreUploadRangeTooLarge
                 })?;
             parts.push((offset as usize, end as usize, operation));
         }
@@ -336,24 +337,24 @@ impl AppStoreRelease {
         let mut expected = 0;
         for (start, end, _) in &parts {
             if *start != expected || end <= start {
-                return Err(PistonError::StoreUploadRangeDiscontinuous);
+                return Err(cli::Error::StoreUploadRangeDiscontinuous.into());
             }
             expected = *end;
         }
         if expected != bytes.len() {
-            return Err(PistonError::StoreUploadRangeIncomplete);
+            return Err(cli::Error::StoreUploadRangeIncomplete.into());
         }
         for (start, end, operation) in parts {
             let method = Self::string(operation, "method")?;
             let url = Self::string(operation, "url")?;
             if !url.starts_with("https://") {
-                return Err(PistonError::StoreUploadInsecureUrl);
+                return Err(cli::Error::StoreUploadInsecureUrl.into());
             }
             let mut request = self.client.http.request(&method, &url);
             for header in operation["requestHeaders"].as_array().into_iter().flatten() {
                 let name = Self::string(header, "name")?;
                 if name.eq_ignore_ascii_case("authorization") {
-                    return Err(PistonError::StoreUploadAuthorization);
+                    return Err(cli::Error::StoreUploadAuthorization.into());
                 }
                 request = request.set(&name, &Self::string(header, "value")?);
             }
@@ -365,16 +366,16 @@ impl AppStoreRelease {
                         ureq::Error::Status(status, _) => Some(status),
                         ureq::Error::Transport(_) => None,
                     };
-                    return Err(PistonError::StoreScreenshotUpload {
+                    return Err(cli::Error::StoreScreenshotUpload {
                         image_id: image_id.into(), status,
-                    });
+                    }.into());
                 }
             }
         }
         Ok(true)
     }
 
-    fn wait_image(&self, id: &str, group: &ScreenshotGroup) -> Result<String, PistonError> {
+    fn wait_image(&self, id: &str, group: &ScreenshotGroup) -> Result<String> {
         let deadline = Instant::now() + Duration::from_secs(180);
         loop {
             let image = self.client.request(
@@ -389,9 +390,9 @@ impl AppStoreRelease {
                 "PREPARE_FOR_SUBMISSION" | "APPROVED" => {
                     let spec = Self::string(attributes, "specId")?;
                     if !group.specs.iter().any(|candidate| candidate.id == spec) {
-                        return Err(PistonError::StoreImageSpecificationMismatch {
+                        return Err(cli::Error::StoreImageSpecificationMismatch {
                             image_id: id.into(), group: group.id.clone(), spec,
-                        });
+                        }.into());
                     }
                     return Ok(id.into());
                 }
@@ -399,18 +400,18 @@ impl AppStoreRelease {
                     thread::sleep(Duration::from_secs(2))
                 }
                 "UPLOAD_COMPLETE" => {
-                    return Err(PistonError::StoreImageProcessingTimeout { image_id: id.into() });
+                    return Err(cli::Error::StoreImageProcessingTimeout { image_id: id.into() }.into());
                 }
                 _ => {
-                    return Err(PistonError::StoreImageRejected {
+                    return Err(cli::Error::StoreImageRejected {
                         image_id: id.into(), state, details: attributes["stateDetails"].clone(),
-                    });
+                    }.into());
                 }
             }
         }
     }
 
-    fn placements(&self, group: &str) -> Result<Vec<Placement>, PistonError> {
+    fn placements(&self, group: &str) -> Result<Vec<Placement>> {
         let entries = self.client.list(
             &format!(
                 "/v1/appStoreVersionLocalizations/{}/placements",
@@ -437,7 +438,7 @@ impl AppStoreRelease {
             .collect()
     }
 
-    fn sync_group(&self, group: &str, images: &[String], current: &[Placement], layout: &[Placement]) -> Result<(), PistonError> {
+    fn sync_group(&self, group: &str, images: &[String], current: &[Placement], layout: &[Placement]) -> Result<()> {
         let mut available: Vec<_> =
             current.iter().filter(|placement| placement.image.is_some()).collect();
         let mut retained = Vec::new();
@@ -502,17 +503,17 @@ impl AppStoreRelease {
         if !actual.iter().map(|placement| &placement.id).eq(ordered.iter())
             || !actual.iter().filter_map(|placement| placement.image.as_ref()).eq(images.iter())
         {
-            return Err(PistonError::StoreScreenshotOrder { group: group.into() });
+            return Err(cli::Error::StoreScreenshotOrder { group: group.into() }.into());
         }
         Ok(())
     }
 
-    fn string(value: &Value, key: &str) -> Result<String, PistonError> {
+    fn string(value: &Value, key: &str) -> Result<String> {
         value[key]
             .as_str()
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .ok_or_else(|| PistonError::StoreResponseField { field: key.into() })
+            .ok_or_else(|| app_store::cli::Error::StoreResponseField { field: key.into() }.into())
     }
 }
 
@@ -538,23 +539,23 @@ struct ScreenshotGroup {
 }
 
 impl ScreenshotGroup {
-    fn read(attributes: &Value) -> Result<Vec<Self>, PistonError> {
+    fn read(attributes: &Value) -> Result<Vec<Self>> {
         let feature = attributes["features"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|feature| feature["featureId"] == "APP_STORE_VERSIONS")
-            .ok_or(PistonError::StoreCatalogFeatureMissing)?;
+            .ok_or(cli::Error::StoreCatalogFeatureMissing)?;
         let policy = feature["placementPolicies"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|policy| policy["placementType"] == "APP_SCREENSHOT")
-            .ok_or(PistonError::StoreCatalogPolicyMissing)?;
+            .ok_or(cli::Error::StoreCatalogPolicyMissing)?;
         let mut limits = BTreeMap::new();
         for limit in policy["groupLimits"].as_array().into_iter().flatten() {
             let count = limit["maxCount"].as_u64().ok_or_else(|| {
-                PistonError::StoreResponseField {
+                app_store::cli::Error::StoreResponseField {
                     field: "placementPolicies.groupLimits.maxCount".into(),
                 }
             })?;
@@ -567,14 +568,14 @@ impl ScreenshotGroup {
             .into_iter()
             .flatten()
             .find(|placement| placement["placementTypeId"] == "APP_SCREENSHOT")
-            .ok_or(PistonError::StoreCatalogSpecificationsMissing)?;
+            .ok_or(cli::Error::StoreCatalogSpecificationsMissing)?;
         if !placement["acceptsAssetCategories"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|category| category == "APP_SCREENSHOTS_AND_PREVIEWS")
         {
-            return Err(PistonError::StoreCatalogCategoryRejected);
+            return Err(cli::Error::StoreCatalogCategoryRejected.into());
         }
         let mut groups = Vec::new();
         for group in attributes["placementProfileGroups"].as_array().into_iter().flatten() {
@@ -628,10 +629,10 @@ impl ScreenshotGroup {
                 let Some((width, height)) =
                     width.zip(height).filter(|(width, height)| *width > 0 && *height > 0)
                 else {
-                    return Err(PistonError::StoreCatalogDimensionsInvalid);
+                    return Err(cli::Error::StoreCatalogDimensionsInvalid.into());
                 };
                 let max_file_size = spec["maxFileSize"].as_u64().ok_or_else(|| {
-                    PistonError::StoreResponseField { field: "imageSpecs.maxFileSize".into() }
+                    app_store::cli::Error::StoreResponseField { field: "imageSpecs.maxFileSize".into() }
                 })?;
                 specs.push(ScreenshotSpec {
                     id: AppStoreRelease::string(spec, "specId")?,
@@ -652,7 +653,7 @@ impl ScreenshotGroup {
             groups.push(Self { id, family, display_size, max_count: *count, specs });
         }
         if groups.is_empty() {
-            return Err(PistonError::StoreCatalogSpecificationsUnavailable);
+            return Err(cli::Error::StoreCatalogSpecificationsUnavailable.into());
         }
         Ok(groups)
     }

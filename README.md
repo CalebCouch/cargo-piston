@@ -35,10 +35,13 @@ such as `host.rs`, with child modules in the matching directory.
 Start tracing a command in `src/cli.rs`. CLI files own argument parsing, prompts,
 terminal messages, setup and recovery links, and the sequence of operations. Service
 structures in the neighboring files perform builds, signing, device operations,
-network requests, and persistence. Services propagate structured `PistonError`
-values and recovery actions from `error.rs`. The error formatter in `cli.rs`
-chooses the user-facing wording; the distribution CLI handles its Xcode log
-guidance. Services do not prompt or call back into CLI flows. Native tool and app
+network requests, and persistence. Flow-specific `Error` types and their user-facing
+wording live in the owning CLI files. Shared command, file, and project errors live in the root
+`cli.rs`; Apple signing and App Store Connect have their own shared CLI errors.
+Services propagate these concrete errors through the shared boxed `Result` without
+merging them into a global error enum. Recovery inspects the relevant local error
+type, and setup links remain available through nested error sources. Services do not prompt
+or call back into CLI flows. Native tool and app
 output can still stream directly to the terminal. Every CLI structure is named
 `Cli` and is referenced through its owner, such as `ios::Cli`,
 `ios::deployment::Cli`, or `host::macos::Cli`.
@@ -56,6 +59,7 @@ The shared `host::Cli::link` method formats terminal links using OSC 8 when enab
 | App Store and TestFlight deployment | `ios/deployment/cli.rs` |
 | Compile, archive, export, and upload an iOS store build | `ios/distribution/cli.rs` |
 | App Store account setup and screenshots | `apple/app_store/setup/cli.rs`, `apple/app_store/release/cli.rs` |
+| Shared Apple signing and App Store Connect errors | `apple/cli.rs`, `apple/app_store/cli.rs` |
 | TestFlight status monitoring and compliance actions | `apple/app_store/testflight/cli.rs` |
 | Signing-team selection and notification setup | `apple/xcode/cli.rs`, `apple/notifications/cli.rs` |
 | Xcode selection, download, and component setup on macOS | `host/macos/apple/cli.rs` |
@@ -110,6 +114,10 @@ terminal. `--simulator` explicitly selects an iOS Simulator or Android emulator;
 emulator is reused when it matches the request. Only the selected platform starts.
 An Android emulator started by the command closes when the session ends, fails, or
 is interrupted with Ctrl-C. A previously running emulator stays open.
+
+When multiple iOS devices match, an interactive terminal shows a numbered list of
+names and UDIDs. Enter a number to select the device, or `q` to cancel. Scripts
+should use `--device <name-or-UDID>` to select one without a prompt.
 
 ### macOS
 

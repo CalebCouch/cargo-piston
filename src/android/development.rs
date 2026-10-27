@@ -5,11 +5,12 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
+use crate::{cli, Result};
 use crate::dev::DevelopmentArgs;
 use crate::host::Host;
 use crate::manifest::Manifest;
 use crate::project::Project;
-use crate::{PistonError, Result};
+use super::cli::Error;
 
 pub struct AndroidDevelopment {
     project: Project,
@@ -27,20 +28,22 @@ pub struct AndroidDevelopment {
 impl AndroidDevelopment {
     pub(crate) fn new(args: &DevelopmentArgs) -> Result<Self> {
         if !args.app_args.is_empty() {
-            return Err(PistonError::AndroidArgumentsUnsupported);
+            return Err(Error::AndroidArgumentsUnsupported.into());
         }
         let project = Project::new(args.application.clone(), "android", true)?;
         let metadata = project.dependencies()?;
         let bridge = metadata.packages.iter().find(|package| package.name.as_str() == "maverick_os")
             .map(|package| package.manifest_path.parent().unwrap().as_std_path().join("android"))
             .filter(|path| path.join("bridge/build.gradle").is_file() && path.join("gradlew").is_file())
-            .ok_or(PistonError::AndroidBridgeMissing)?;
+            .ok_or(Error::AndroidBridgeMissing)?;
         let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
         let settings = manifest.settings(&["android"])?;
         let package_id = match project.args.bundle_id.clone().or(settings.get("bundle_id").cloned()) {
             Some(value) => value,
             None => match manifest.setting(&["android", "bundle_id"])? {
-                Some(value) => return Err(PistonError::InvalidBundleId { value: value.to_string() }),
+                Some(value) => {
+                    return Err(cli::Error::InvalidBundleId { value: value.to_string() }.into());
+                }
                 None => format!("dev.piston.{}", project.package.name.replace('-', "_")),
             },
         };
@@ -67,7 +70,7 @@ impl AndroidDevelopment {
         ])?;
         let (cancel, interrupted) = std::sync::mpsc::sync_channel(1);
         ctrlc::set_handler(move || { let _ = cancel.try_send(()); })
-            .map_err(PistonError::AndroidSignalHandler)?;
+            .map_err(Error::AndroidSignalHandler)?;
         Ok(Self {
             project,
             sdk,
@@ -88,7 +91,7 @@ impl AndroidDevelopment {
                 || !part.chars().all(|character| {
                     character.is_ascii_alphanumeric() || character == '_'
                 })
-        }) { return Err(PistonError::InvalidBundleId { value: value.into() }); }
+        }) { return Err(cli::Error::InvalidBundleId { value: value.into() }.into()); }
         Ok(())
     }
 
@@ -130,8 +133,7 @@ impl AndroidDevelopment {
                     let output = self
                         .adb()
                         .args(["-s", serial, "shell", "getprop", "ro.boot.qemu.avd_name"])
-                        .output()
-                        .map_err(|error| PistonError::Generic(error.to_string()))?;
+                        .output()?;
                     if !output.status.success()
                         || String::from_utf8_lossy(&output.stdout).lines().next()
                             != Some(selector.as_str())
@@ -139,9 +141,9 @@ impl AndroidDevelopment {
                 }
             }
             if fields[1] != "device" {
-                return Err(PistonError::AndroidDeviceUnavailable {
+                return Err(Error::AndroidDeviceUnavailable {
                     serial: serial.into(), state: fields[1].into(),
-                });
+                }.into());
             }
             devices.push(serial.to_owned());
         }
@@ -149,7 +151,7 @@ impl AndroidDevelopment {
             devices.retain(|serial| !serial.starts_with("emulator-"));
         }
         if devices.len() > 1 {
-            return Err(PistonError::AndroidDevicesAmbiguous { serials: devices });
+            return Err(Error::AndroidDevicesAmbiguous { serials: devices }.into());
         }
         if let Some(serial) = devices.pop() { self.serial = serial; return Ok(true); }
         Ok(false)
@@ -180,7 +182,7 @@ impl AndroidDevelopment {
                         .is_none_or(|requested| requested == *target)
             })
             .ok_or_else(|| {
-                PistonError::AndroidTargetIncompatible {
+                Error::AndroidTargetIncompatible {
                     serial: self.serial.clone(), target: self.project.args.cargo.target.clone(),
                     abis: supported.iter().map(|abi| (*abi).into()).collect(),
                 }
@@ -210,10 +212,10 @@ impl AndroidDevelopment {
             .unwrap();
         let library = output.join(&self.abi).join(format!("lib{}.so", target.name));
         if !library.is_file() {
-            return Err(PistonError::ArtifactNotProduced {
+            return Err(cli::Error::ArtifactNotProduced {
                 package: self.project.package.name.to_string(),
                 target: self.project.args.cargo.target.clone(),
-            });
+            }.into());
         }
         Ok(library)
     }
@@ -223,11 +225,11 @@ impl AndroidDevelopment {
         let source = gradle.join("app/src/main");
         let libraries = source.join("jniLibs").join(&self.abi);
         fs::create_dir_all(&libraries)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         fs::copy(library, libraries.join(library.file_name().unwrap()))
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         let prebuilt = Self::ndk_toolchain(&self.ndk)
-            .ok_or_else(|| PistonError::AndroidHostToolchainMissing {
+            .ok_or_else(|| Error::AndroidHostToolchainMissing {
                 path: self.ndk.join("toolchains/llvm/prebuilt"),
             })?;
         Project::run(
@@ -242,7 +244,7 @@ impl AndroidDevelopment {
             prebuilt.join("sysroot/usr/lib").join(cxx_target).join("libc++_shared.so"),
             libraries.join("libc++_shared.so"),
         )
-        .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+        .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         let version = self.project.package.version.to_string();
         let lib = library.file_stem().unwrap().to_string_lossy();
         let lib = lib.strip_prefix("lib").unwrap_or(&lib);
@@ -269,17 +271,16 @@ impl AndroidDevelopment {
         )?;
         if let Some(icon) = crate::project::Project::find_icon(self.project.root()) {
             let image = image::open(&icon)
-                .map_err(|source| PistonError::OpenImageError { path: icon, source })?;
+                .map_err(|source| cli::Error::OpenImageError { path: icon, source })?;
             let path = source.join("res/drawable/icon.png");
             fs::create_dir_all(path.parent().unwrap())
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
             image
                 .resize_exact(192, 192, image::imageops::FilterType::Lanczos3)
                 .save(&path)
-                .map_err(PistonError::WriteImageError)?;
+                .map_err(cli::Error::WriteImageError)?;
             let path = source.join("AndroidManifest.xml");
-            let contents = fs::read_to_string(&path)
-                .map_err(|error| PistonError::Generic(error.to_string()))?;
+            let contents = fs::read_to_string(&path)?;
             Project::write(
                 &path,
                 contents.replace("<application ", "<application android:icon=\"@drawable/icon\" "),
@@ -298,7 +299,7 @@ project(':bridge').projectDir = file({})
             ),
         )?;
         let mut root_gradle = fs::read_to_string(self.bridge.join("build.gradle"))
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         root_gradle.push_str(&format!(
             "\nproject(':bridge') {{ layout.buildDirectory.set(file({})) }}\n",
             json!(gradle.join("bridge-build"))
@@ -365,15 +366,14 @@ dependencies {{ implementation project(':bridge') }}
             ]),
         )?;
         if String::from_utf8_lossy(&output).contains("Error:") {
-            return Err(PistonError::Generic(String::from_utf8_lossy(&output).into_owned()));
+            return Err(Error::AndroidLaunchFailed { output }.into());
         }
         let mut pid = String::new();
         for _ in 0..20 {
             let output = self
                 .device_command()
                 .args(["shell", "pidof", "-s", &self.package_id])
-                .output()
-                .map_err(|error| PistonError::Generic(error.to_string()))?;
+                .output()?;
             pid = String::from_utf8_lossy(&output.stdout).trim().into();
             if !pid.is_empty() { break; }
             std::thread::sleep(Duration::from_millis(250));
@@ -382,33 +382,29 @@ dependencies {{ implementation project(':bridge') }}
             Project::run(
                 self.device_command().args(["logcat", "-b", "crash", "-d", "-t", "100"]),
             )?;
-            return Err(PistonError::AndroidAppExited);
+            return Err(Error::AndroidAppExited.into());
         }
         let mut logs = self
             .device_command()
             .args(["logcat", "--pid", &pid, "-v", "brief"])
-            .spawn()
-            .map_err(|error| PistonError::Generic(error.to_string()))?;
+            .spawn()?;
         let result = (|| {
             loop {
                 if self.interrupted.try_recv().is_ok() { return Ok(()); }
                 std::thread::sleep(Duration::from_secs(1));
-                if let Some(status) =
-                    logs.try_wait().map_err(|error| PistonError::Generic(error.to_string()))?
-                {
+                if let Some(status) = logs.try_wait()? {
                     return if status.success() {
                         Ok(())
                     } else {
-                        Err(PistonError::CommandStatus {
+                        Err(cli::Error::CommandStatus {
                             program: self.sdk.join("platform-tools/adb").into_os_string(), status,
-                        })
+                        }.into())
                     };
                 }
                 let output = self
                     .device_command()
                     .args(["shell", "pidof", "-s", &self.package_id])
-                    .output()
-                    .map_err(|error| PistonError::Generic(error.to_string()))?;
+                    .output()?;
                 if String::from_utf8_lossy(&output.stdout).trim() != pid { return Ok(()); }
             }
         })();
@@ -431,9 +427,9 @@ dependencies {{ implementation project(':bridge') }}
         let name = match selector {
             Some(name) if names.iter().any(|value| value == name) => name.to_owned(),
             Some(name) => {
-                return Err(PistonError::AndroidEmulatorNotFound {
+                return Err(Error::AndroidEmulatorNotFound {
                     selector: name.into(), available: names,
-                });
+                }.into());
             }
             None if !names.is_empty() => names[0].clone(),
             None => {
@@ -451,19 +447,13 @@ dependencies {{ implementation project(':bridge') }}
                     .env("JAVA_HOME", &self.java)
                     .env("ANDROID_HOME", &self.sdk)
                     .stdin(Stdio::piped())
-                    .spawn()
-                    .map_err(|error| PistonError::Generic(error.to_string()))?;
-                child
-                    .stdin
-                    .take()
-                    .unwrap()
-                    .write_all(b"no\n")
-                    .map_err(|error| PistonError::Generic(error.to_string()))?;
-                let status = child.wait().map_err(|error| PistonError::Generic(error.to_string()))?;
+                    .spawn()?;
+                child.stdin.take().unwrap().write_all(b"no\n")?;
+                let status = child.wait()?;
                 if !status.success() {
-                    return Err(PistonError::CommandStatus {
+                    return Err(cli::Error::CommandStatus {
                         program: avdmanager.into_os_string(), status,
-                    });
+                    }.into());
                 }
                 "piston".into()
             }
@@ -474,16 +464,15 @@ dependencies {{ implementation project(':bridge') }}
                 std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok()
                     && std::net::TcpListener::bind(("127.0.0.1", *port + 1)).is_ok()
             })
-            .ok_or(PistonError::AndroidEmulatorPortsUnavailable)?;
+            .ok_or(Error::AndroidEmulatorPortsUnavailable)?;
         let log = fs::File::create(self.project.work.join("emulator.log"))
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         self.emulator = Some(
             Command::new(emulator)
                 .args(["-avd", &name, "-port", &port.to_string()])
-                .stdout(log.try_clone().map_err(|error| PistonError::Generic(error.to_string()))?)
+                .stdout(log.try_clone()?)
                 .stderr(log)
-                .spawn()
-                .map_err(|error| PistonError::Generic(error.to_string()))?,
+                .spawn()?,
         );
         self.serial = format!("emulator-{port}");
         Ok(())
@@ -493,30 +482,25 @@ dependencies {{ implementation project(':bridge') }}
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(180) {
             if self.interrupted.try_recv().is_ok() {
-                return Err(PistonError::AndroidInterrupted);
+                return Err(Error::AndroidInterrupted.into());
             }
             if let Some(child) = &mut self.emulator {
-                if child
-                    .try_wait()
-                    .map_err(|error| PistonError::Generic(error.to_string()))?
-                    .is_some()
-                {
-                    return Err(PistonError::AndroidEmulatorClosed {
+                if child.try_wait()?.is_some() {
+                    return Err(Error::AndroidEmulatorClosed {
                         log: self.project.work.join("emulator.log"),
-                    });
+                    }.into());
                 }
             }
             let output = self
                 .device_command()
                 .args(["shell", "getprop", "sys.boot_completed"])
-                .output()
-                .map_err(|error| PistonError::Generic(error.to_string()))?;
+                .output()?;
             if output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1" {
                 return Ok(());
             }
             std::thread::sleep(Duration::from_secs(1));
         }
-        Err(PistonError::AndroidBootTimeout)
+        Err(Error::AndroidBootTimeout.into())
     }
     pub fn project(&self) -> &Project { &self.project }
     pub fn serial(&self) -> &str { &self.serial }
@@ -524,10 +508,10 @@ dependencies {{ implementation project(':bridge') }}
 
     pub fn stop(&mut self) -> Result<()> {
         if let Some(emulator) = &mut self.emulator {
-            if emulator.try_wait().map_err(PistonError::AndroidEmulatorControl)?.is_none() {
-                emulator.kill().map_err(PistonError::AndroidEmulatorControl)?;
+            if emulator.try_wait().map_err(Error::AndroidEmulatorControl)?.is_none() {
+                emulator.kill().map_err(Error::AndroidEmulatorControl)?;
             }
-            emulator.wait().map_err(PistonError::AndroidEmulatorControl)?;
+            emulator.wait().map_err(Error::AndroidEmulatorControl)?;
             self.emulator = None;
         }
         Ok(())
@@ -551,11 +535,11 @@ impl AndroidDevelopment {
     fn sdkmanager_path(sdk: &Path) -> Result<PathBuf> {
         let root = sdk.join("cmdline-tools");
         fs::read_dir(&root)
-            .map_err(|source| PistonError::ReadDirError { path: root.clone(), source })?
+            .map_err(|source| cli::Error::ReadDirError { path: root.clone(), source })?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().join("bin/sdkmanager"))
             .find(|path| path.is_file())
-            .ok_or(PistonError::AndroidSdkManagerMissing { path: root })
+            .ok_or_else(|| Error::AndroidSdkManagerMissing { path: root }.into())
     }
 
     fn ndk_toolchain(ndk: &Path) -> Option<PathBuf> {

@@ -2,10 +2,11 @@ use plist::{Dictionary, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use crate::{cli, Result};
 use crate::apple::{NotificationSetup, PushBuild, PushPlatform, PushSigning, XcodeSigning};
 use crate::manifest::Manifest;
 use crate::project::Project;
-use crate::{PistonError, Result};
+use super::cli::Error;
 
 pub struct MacDevelopment {
     project: Project,
@@ -19,7 +20,7 @@ impl MacDevelopment {
     pub(crate) fn new(mut project: Project, app_args: Vec<String>, developer: PathBuf) -> Result<Self> {
         let target = project.args.cargo.target.clone().unwrap_or(Project::host_target()?);
         if !matches!(target.as_str(), "aarch64-apple-darwin" | "x86_64-apple-darwin") {
-            return Err(PistonError::UnsupportedTargetError(target));
+            return Err(cli::Error::UnsupportedTargetError(target).into());
         }
         project.args.cargo.target = Some(target.clone());
         Project::rust_target(&target)?;
@@ -38,7 +39,7 @@ impl MacDevelopment {
             || !bundle_id
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || ".-".contains(character))
-        { return Err(PistonError::InvalidBundleId { value: bundle_id }); }
+        { return Err(cli::Error::InvalidBundleId { value: bundle_id }.into()); }
         Ok(Self { project, developer, bundle_id, notifications: None, app_args })
     }
 
@@ -97,28 +98,27 @@ impl MacDevelopment {
         let bundle = project.work.join(format!("{name}.app"));
         if bundle.exists() {
             fs::remove_dir_all(&bundle)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         }
         let contents = bundle.join("Contents");
         let binary = contents.join("MacOS").join(name);
         fs::create_dir_all(binary.parent().unwrap())
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         fs::copy(executable, &binary)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
         let config = manifest.settings(&["macos"])?;
         let source = project.args.info_plist.clone()
             .or_else(|| config.get("info_plist").map(PathBuf::from));
         let source = source.map(|path| project.root().join(path));
         let mut info = if let Some(source) = &source {
-            Value::from_file(source)
-                .map_err(|error| PistonError::Generic(error.to_string()))?
+            Value::from_file(source)?
         } else {
             Value::Dictionary(Dictionary::new())
         };
         let dict = info
             .as_dictionary_mut()
-            .ok_or_else(|| PistonError::PlistNotDictionary { path: source.unwrap() })?;
+            .ok_or_else(|| crate::apple::cli::Error::PlistNotDictionary { path: source.unwrap() })?;
         for (key, value) in [
             ("CFBundleIdentifier", self.bundle_id.clone()),
             ("CFBundleExecutable", name.into()),
@@ -153,9 +153,9 @@ impl MacDevelopment {
             let iconset = project.work.join("AppIcon.iconset");
             fs::create_dir_all(&resource)
                 .and_then(|_| fs::create_dir_all(&iconset))
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
             let image = image::open(&icon)
-                .map_err(|source| PistonError::OpenImageError { path: icon, source })?;
+                .map_err(|source| cli::Error::OpenImageError { path: icon, source })?;
             for size in [16, 32, 128, 256, 512] {
                 for scale in [1, 2] {
                     let suffix = if scale == 2 { "@2x" } else { "" };
@@ -166,7 +166,7 @@ impl MacDevelopment {
                             image::imageops::FilterType::Lanczos3,
                         )
                         .save(iconset.join(format!("icon_{size}x{size}{suffix}.png")))
-                        .map_err(PistonError::WriteImageError)?;
+                        .map_err(cli::Error::WriteImageError)?;
                 }
             }
             Project::output(
@@ -182,18 +182,18 @@ impl MacDevelopment {
             .as_ref().and_then(toml_edit::Item::as_array)
         {
             for resource in resources {
-                let resource = resource.as_str().ok_or(PistonError::MacResourcesInvalid)?;
+                let resource = resource.as_str().ok_or(Error::MacResourcesInvalid)?;
                 let path = project.root().join(resource);
                 let name = path
                     .file_name()
-                    .ok_or_else(|| PistonError::MacResourceInvalid { path: path.clone() })?;
+                    .ok_or_else(|| Error::MacResourceInvalid { path: path.clone() })?;
                 Project::output(
                     Command::new("ditto").arg(&path).arg(contents.join("Resources").join(name)),
                 )?;
             }
         }
         info.to_file_xml(contents.join("Info.plist"))
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         let entitlements = project
             .args
             .entitlements

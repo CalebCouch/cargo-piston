@@ -1,12 +1,29 @@
 use clap::{Parser, ValueEnum};
+use std::fmt;
 use std::path::PathBuf;
+use crate::Result;
 use crate::{android, developer, host, ios, linux};
 use crate::project::Project;
 use crate::cli::ApplicationArgs;
-use crate::{PistonError, Result};
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub enum Platform { Macos, Ios, Android, Linux, }
+
+#[derive(Debug)]
+pub enum Error { NotificationSetupPlatform, DevicePlatform, VirtualMachinePlatform }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::NotificationSetupPlatform =>
+                "Notification --setup requires macOS or a physical iOS device.",
+            Self::DevicePlatform => "Use --device or --simulator with dev ios or dev android.",
+            Self::VirtualMachinePlatform => "Use --vm, --lima, and --lima-home with dev linux.",
+        })
+    }
+}
+
+impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, Parser)]
 pub struct DevelopmentArgs {
@@ -45,23 +62,17 @@ impl Cli {
         if args.setup && (args.simulator
             || matches!(args.platform, Some(Platform::Android | Platform::Linux)))
         {
-            return Err(PistonError::Generic(
-                "Notification --setup requires macOS or a physical iOS device.".into(),
-            ));
+            return Err(Error::NotificationSetupPlatform.into());
         }
         if (args.device.is_some() || args.simulator)
             && !matches!(args.platform, Some(Platform::Ios | Platform::Android))
         {
-            return Err(PistonError::Generic(
-                "Use --device or --simulator with dev ios or dev android.".into(),
-            ));
+            return Err(Error::DevicePlatform.into());
         }
         if (args.vm.is_some() || args.lima.is_some() || args.lima_home.is_some())
             && !matches!(args.platform, Some(Platform::Linux))
         {
-            return Err(PistonError::Generic(
-                "Use --vm, --lima, and --lima-home with dev linux.".into(),
-            ));
+            return Err(Error::VirtualMachinePlatform.into());
         }
         let manifest = Project::manifest(&args.application.cargo)?;
         let (_, team) = developer::Cli::credentials(&manifest, args.application.team.as_deref(), false)?;

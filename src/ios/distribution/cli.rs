@@ -1,11 +1,34 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
+use crate::Result;
 use crate::apple::xcode;
 use crate::host;
 use crate::ios;
-use crate::Result;
 use super::IOSStore;
+
+#[derive(Debug)]
+pub enum Error {
+    IosArchiveMissing { path: PathBuf, log: PathBuf },
+    IosExportMissing { path: PathBuf, log: PathBuf },
+    IosDistributionFailed { log: PathBuf, output: String, status: ExitStatus },
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::IosArchiveMissing { path, log } => write!(f,
+                "Xcode did not produce an application archive at {}. See {}.",
+                path.display(), log.display()),
+            Self::IosExportMissing { path, log } => write!(f,
+                "Xcode did not export {}. See {}.", path.display(), log.display()),
+            Self::IosDistributionFailed { log, output, status } =>
+                Cli::failure(f, log, output, status),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub struct Cli;
 

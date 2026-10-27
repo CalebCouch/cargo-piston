@@ -3,10 +3,11 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use crate::apple::app_store;
 use crate::developer::Credentials;
 use crate::host::Host;
 use crate::manifest::Manifest;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::{AppStoreConnect, AscApiKey};
 
 pub mod cli;
@@ -24,10 +25,9 @@ pub struct AccountSetup {
 impl AccountSetup {
     pub(crate) fn new(root: &Path, team: String, store: Credentials) -> Result<Self> {
         let root = fs::canonicalize(root)
-            .map_err(|source| PistonError::ReadFile { path: root.into(), source })?;
+            .map_err(|source| crate::cli::Error::ReadFile { path: root.into(), source })?;
         let manifest = Manifest::new(&root.join("Cargo.toml"))?;
-        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()
-            .map_err(|error| PistonError::Generic(error.to_string()))?;
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
         let settings = ["ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_PATH"].into_iter()
             .filter_map(|name| env::var(name).ok().map(|value| (name.to_ascii_lowercase(), value)))
             .collect();
@@ -37,9 +37,9 @@ impl AccountSetup {
     fn load(&mut self, replace: bool) -> Result<Option<AscApiKey>> {
         self.runtime.block_on(self.store.load(&self.team))?;
         if replace { return Ok(None); }
-        self.store.get(&self.team, "app-store-connect")
-            .map(|bytes| serde_json::from_slice(bytes).map_err(PistonError::StoreCredentialsInvalid))
-            .transpose()
+        Ok(self.store.get(&self.team, "app-store-connect")
+            .map(|bytes| serde_json::from_slice(bytes).map_err(cli::Error::StoreCredentialsInvalid))
+            .transpose()?)
     }
 
     fn save(&mut self, key: &AscApiKey) -> Result<()> {
@@ -54,7 +54,7 @@ impl AccountSetup {
 }
 
 impl AscApiKey {
-    fn configured(root: &Path, settings: &HashMap<String, String>, report: &mut dyn FnMut(PistonError)) -> Result<Self> {
+    fn configured(root: &Path, settings: &HashMap<String, String>, report: &mut dyn FnMut(Box<dyn std::error::Error>)) -> Result<Self> {
         let path = settings
             .get("asc_key_path")
             .filter(|path| !path.is_empty())
@@ -68,7 +68,7 @@ impl AscApiKey {
             .unwrap_or("")
             .to_owned();
         if !Self::valid_id(&key_id) {
-            return Err(PistonError::StoreKeyIdInvalid);
+            return Err(cli::Error::StoreKeyIdInvalid.into());
         }
         let issuer = settings.get("asc_issuer_id").map(String::as_str).unwrap_or("");
         let parts: Vec<_> = issuer.split('-').collect();
@@ -77,7 +77,7 @@ impl AscApiKey {
                 part.len() == length && part.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
         {
-            return Err(PistonError::StoreIssuerInvalid);
+            return Err(cli::Error::StoreIssuerInvalid.into());
         }
         let path = match path {
             Some(path) => path,
@@ -86,16 +86,16 @@ impl AscApiKey {
                 match paths.as_slice() {
                     [path] => path.clone(),
                     [] => {
-                        return Err(PistonError::StoreKeyMissing { key_id });
+                        return Err(cli::Error::StoreKeyMissing { key_id }.into());
                     }
                     _ => {
-                        return Err(PistonError::StoreKeyAmbiguous { key_id, paths });
+                        return Err(cli::Error::StoreKeyAmbiguous { key_id, paths }.into());
                     }
                 }
             }
         };
         let path = fs::canonicalize(&path).map_err(|error| {
-            PistonError::StoreKeyUnreadable { path: path.clone(), source: error }
+            app_store::cli::Error::StoreKeyUnreadable { path: path.clone(), source: error }
         })?;
         let mut settings = settings.clone();
         settings.insert("asc_key_id".into(), key_id.into());
@@ -119,7 +119,7 @@ impl AscApiKey {
         if let Some(relative) = value.strip_prefix("~/") {
             Ok(PathBuf::from(
                 env::var_os("HOME")
-                    .ok_or_else(|| PistonError::MissingEnvironment { name: "HOME" })?,
+                    .ok_or_else(|| crate::cli::Error::MissingEnvironment { name: "HOME" })?,
             )
             .join(relative))
         } else {
@@ -127,7 +127,7 @@ impl AscApiKey {
         }
     }
 
-    fn find_key_paths(root: &Path, key_id: &str, report: &mut dyn FnMut(PistonError)) -> Result<Vec<PathBuf>> {
+    fn find_key_paths(root: &Path, key_id: &str, report: &mut dyn FnMut(Box<dyn std::error::Error>)) -> Result<Vec<PathBuf>> {
         let mut folders = vec![root.join("private_keys")];
         if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
             folders.extend(
@@ -140,7 +140,7 @@ impl AscApiKey {
         let mut candidates: Vec<_> = folders.into_iter().map(|folder| folder.join(&name)).collect();
         match Host::find_files(&name) {
             Ok(paths) => candidates.extend(paths),
-            Err(error) => report(PistonError::StoreKeySearchFallback(Box::new(error))),
+            Err(error) => report(cli::Error::StoreKeySearchFallback(error).into()),
         }
         let mut paths = Vec::new();
         for path in candidates {
@@ -148,11 +148,13 @@ impl AscApiKey {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    report(PistonError::StoreKeySearchDenied { path: path.parent().unwrap().into() });
+                    report(cli::Error::StoreKeySearchDenied {
+                        path: path.parent().unwrap().into(),
+                    }.into());
                     continue;
                 }
                 Err(error) => {
-                    return Err(PistonError::ReadFile { path, source: error });
+                    return Err(crate::cli::Error::ReadFile { path, source: error }.into());
                 }
             };
             if path.is_file() && !paths.contains(&path) { paths.push(path); }

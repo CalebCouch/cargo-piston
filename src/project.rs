@@ -7,8 +7,9 @@ use std::fs::{self, File, copy, create_dir_all, read_dir, remove_dir_all, remove
 use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use crate::{PistonError, Result};
-use crate::cli::ApplicationArgs;
+use crate::Result;
+use crate::cli::{ApplicationArgs, Error};
+use crate::host;
 use crate::manifest::Manifest;
 
 pub struct Project {
@@ -22,22 +23,22 @@ pub struct Project {
 impl Project {
     pub fn manifest(args: &cargo_subcommand::Args) -> Result<Manifest> {
         if args.workspace || args.package.len() > 1 || !args.exclude.is_empty() {
-            return Err(PistonError::AppSelectionInvalid);
+            return Err(Error::AppSelectionInvalid.into());
         }
         if let Some(name) = args.package.first() {
             let mut metadata = MetadataCommand::new();
             metadata.no_deps().other_options(vec!["--offline".into()]);
             if let Some(path) = &args.manifest_path {
-                let path = fs::canonicalize(path).map_err(|source| PistonError::ReadFile {
+                let path = fs::canonicalize(path).map_err(|source| Error::ReadFile {
                     path: path.clone(), source,
                 })?;
                 metadata.manifest_path(&path).current_dir(path.parent().unwrap());
             }
             let metadata = metadata.exec()
-                .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
+                .map_err(|error| Error::CargoParseError(error.to_string()))?;
             let package = metadata.packages.iter()
                 .find(|package| package.name.as_str() == name)
-                .ok_or(PistonError::AppPackageMissing)?;
+                .ok_or(Error::AppPackageMissing)?;
             return Manifest::new(package.manifest_path.as_std_path());
         }
         let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
@@ -58,13 +59,13 @@ impl Project {
             || (library && !args.cargo.bin.is_empty())
             || (!library && args.cargo.lib)
         {
-            return Err(PistonError::AppSelectionInvalid);
+            return Err(Error::AppSelectionInvalid.into());
         }
         let mut metadata = MetadataCommand::new();
         metadata.no_deps();
         if let Some(path) = &args.cargo.manifest_path {
             let path = fs::canonicalize(path)
-                .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
+                .map_err(|error| Error::CargoParseError(error.to_string()))?;
             metadata.manifest_path(&path).current_dir(path.parent().unwrap());
             args.cargo.manifest_path = Some(path);
         }
@@ -74,13 +75,13 @@ impl Project {
         let metadata = metadata
             .other_options(options)
             .exec()
-            .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
+            .map_err(|error| Error::CargoParseError(error.to_string()))?;
         let mut locate = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         locate.args(["locate-project", "--message-format", "plain"]);
         if let Some(path) = &args.cargo.manifest_path { locate.arg("--manifest-path").arg(path); }
         let manifest = Self::output(&mut locate)?;
         let manifest = fs::canonicalize(String::from_utf8_lossy(&manifest).trim())
-            .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
+            .map_err(|error| Error::CargoParseError(error.to_string()))?;
         let package = metadata
             .packages
             .iter()
@@ -92,12 +93,12 @@ impl Project {
                 }
             })
             .cloned()
-            .ok_or(PistonError::AppPackageMissing)?;
+            .ok_or(Error::AppPackageMissing)?;
         args.cargo.package = vec![package.name.to_string()];
         args.cargo.manifest_path = Some(package.manifest_path.clone().into_std_path_buf());
         if library {
             if !package.targets.iter().any(|target| target.kind.contains(&TargetKind::CDyLib)) {
-                return Err(PistonError::AppLibraryMissing);
+                return Err(Error::AppLibraryMissing.into());
             }
             args.cargo.lib = true;
         } else {
@@ -114,18 +115,16 @@ impl Project {
             } else {
                 None
             };
-            let binary = binary.ok_or(PistonError::AppBinaryMissing)?;
+            let binary = binary.ok_or(Error::AppBinaryMissing)?;
             args.cargo.bin = vec![binary.name.clone()];
         }
         let target_dir =
             args.cargo.target_dir.clone().unwrap_or(metadata.target_directory.into_std_path_buf());
-        let target_dir = env::current_dir()
-            .map_err(|error| PistonError::Generic(error.to_string()))?
-            .join(target_dir);
+        let target_dir = env::current_dir()?.join(target_dir);
         args.cargo.target_dir = Some(target_dir.clone());
         let work = target_dir.join("piston").join(platform).join(package.name.as_str());
         fs::create_dir_all(&work)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFileError(error.to_string()))?;
         Ok(Self {
             args,
             package,
@@ -154,7 +153,7 @@ impl Project {
         command
             .other_options(options)
             .exec()
-            .map_err(|error| PistonError::CargoParseError(error.to_string()))
+            .map_err(|error| Error::CargoParseError(error.to_string()).into())
     }
 
     pub fn build_command(&self) -> Command {
@@ -177,7 +176,7 @@ impl Project {
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|source| PistonError::CommandSpawn { program: program.clone(), source })?;
+            .map_err(|source| Error::CommandSpawn { program: program.clone(), source })?;
         let mut artifact = None;
         for message in Message::parse_stream(BufReader::new(child.stdout.take().unwrap())) {
             match message {
@@ -201,15 +200,15 @@ impl Project {
                 _ => {}
             }
         }
-        let status = child.wait().map_err(|source| PistonError::CommandWait {
+        let status = child.wait().map_err(|source| Error::CommandWait {
             program: program.clone(), source,
         })?;
         if !status.success() {
-            return Err(PistonError::CommandStatus { program, status });
+            return Err(Error::CommandStatus { program, status }.into());
         }
-        artifact.ok_or_else(|| PistonError::ArtifactNotProduced {
+        artifact.ok_or_else(|| Error::ArtifactNotProduced {
             package: self.package.name.to_string(), target: self.args.cargo.target.clone(),
-        })
+        }.into())
     }
 
     pub fn launch(&self, executable: &Path, arguments: &[String]) -> Result<()> {
@@ -235,7 +234,7 @@ impl Project {
                 } else if host.contains("x86_64") {
                     "x86_64"
                 } else {
-                    return Err(PistonError::HostArchitectureUnsupported { target: host });
+                    return Err(host::cli::Error::HostArchitectureUnsupported { target: host }.into());
                 };
                 let suffix = match target {
                     "ios" => "apple-ios",
@@ -256,32 +255,32 @@ impl Project {
             .lines()
             .find_map(|line| line.strip_prefix("host: "))
             .map(str::to_owned)
-            .ok_or(PistonError::RustHostMissing)
+            .ok_or_else(|| host::cli::Error::RustHostMissing.into())
     }
 
     pub fn run(command: &mut Command) -> Result<()> {
         let program = command.get_program().to_os_string();
-        let status = command.status().map_err(|source| PistonError::CommandSpawn {
+        let status = command.status().map_err(|source| Error::CommandSpawn {
             program: program.clone(), source,
         })?;
-        if status.success() { Ok(()) } else { Err(PistonError::CommandStatus { program, status }) }
+        if status.success() { Ok(()) } else { Err(Error::CommandStatus { program, status }.into()) }
     }
 
     pub fn output(command: &mut Command) -> Result<Vec<u8>> {
         let program = command.get_program().to_os_string();
-        let output = command.output().map_err(|source| PistonError::CommandSpawn {
+        let output = command.output().map_err(|source| Error::CommandSpawn {
             program: program.clone(), source,
         })?;
         if output.status.success() { return Ok(output.stdout); }
-        Err(PistonError::CommandFailed { program, output })
+        Err(Error::CommandFailed { program, output }.into())
     }
 
     pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFileError(error.to_string()))?;
         }
-        fs::write(path, contents).map_err(|error| PistonError::WriteFileError(error.to_string()))
+        fs::write(path, contents).map_err(|error| Error::WriteFileError(error.to_string()).into())
     }
 }
 
@@ -289,9 +288,9 @@ impl Project {
     pub fn empty_directory(tgt_path: &Path, preserve: &[&str]) -> Result<()> {
         if !tgt_path.exists() || !tgt_path.is_dir() { return Ok(()); }
         for entry in read_dir(tgt_path)
-            .map_err(|e| PistonError::ReadDirError { path: tgt_path.to_path_buf(), source: e })?
+            .map_err(|e| Error::ReadDirError { path: tgt_path.to_path_buf(), source: e })?
         {
-            let entry = entry.map_err(|e| PistonError::ReadDirError {
+            let entry = entry.map_err(|e| Error::ReadDirError {
                 path: tgt_path.to_path_buf(),
                 source: e,
             })?;
@@ -300,10 +299,10 @@ impl Project {
             if entry_path.is_dir() && preserve.contains(&name.as_str()) { continue; }
             if entry_path.is_dir() {
                 remove_dir_all(&entry_path)
-                    .map_err(|e| PistonError::RemoveSubdirError { path: entry_path, source: e })?;
+                    .map_err(|e| Error::RemoveSubdirError { path: entry_path, source: e })?;
             } else {
                 remove_file(&entry_path)
-                    .map_err(|e| PistonError::RemoveFileError { path: entry_path, source: e })?;
+                    .map_err(|e| Error::RemoveFileError { path: entry_path, source: e })?;
             }
         }
         Ok(())
@@ -312,7 +311,7 @@ impl Project {
     pub fn sync_assets(src: &Path, tgt: &Path) -> Result<()> {
         if !src.exists() {
             if tgt.exists() {
-                remove_dir_all(tgt).map_err(|e| PistonError::RemoveSubdirError {
+                remove_dir_all(tgt).map_err(|e| Error::RemoveSubdirError {
                     path: tgt.to_path_buf(),
                     source: e,
                 })?;
@@ -320,7 +319,7 @@ impl Project {
             return Ok(());
         }
         create_dir_all(tgt)
-            .map_err(|e| PistonError::CreateDirAllError { path: tgt.to_path_buf(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: tgt.to_path_buf(), source: e })?;
         Self::copy_updated_files(src, tgt)?;
         Self::remove_stale_files(src, tgt)?;
         Ok(())
@@ -348,25 +347,25 @@ impl Project {
     }
 
     pub fn resize_png(input_name: &str, target_name: &str, width: u32, height: u32) -> Result<()> {
-        let img = image::open(input_name).map_err(|e| PistonError::OpenImageError {
+        let img = image::open(input_name).map_err(|e| Error::OpenImageError {
             path: PathBuf::from(input_name),
             source: e,
         })?;
         if Path::new(target_name).exists() {
-            fs::remove_file(target_name).map_err(|source| PistonError::RemoveFileError {
+            fs::remove_file(target_name).map_err(|source| Error::RemoveFileError {
                 path: PathBuf::from(target_name),
                 source,
             })?;
         }
         let resized_img = imageops::resize(&img, width, height, imageops::FilterType::Lanczos3);
-        resized_img.save(target_name).map_err(|source| PistonError::SaveImage {
+        resized_img.save(target_name).map_err(|source| Error::SaveImage {
             path: PathBuf::from(target_name), source,
         })?;
         Ok(())
     }
 
     pub fn get_lib_name(metadata: &Metadata) -> Result<String> {
-        let root_package = metadata.root_package().ok_or(PistonError::AppPackageMissing)?;
+        let root_package = metadata.root_package().ok_or(Error::AppPackageMissing)?;
         let target_type: TargetKind = "cdylib".into();
         Ok(root_package
             .targets
@@ -407,11 +406,13 @@ impl Project {
     }
 
     pub fn get_app_name(metadata: &Metadata) -> Result<String> {
-        metadata.root_package().map(|pkg| pkg.name.to_string()).ok_or(PistonError::AppPackageMissing)
+        metadata.root_package().map(|pkg| pkg.name.to_string())
+            .ok_or_else(|| Error::AppPackageMissing.into())
     }
 
     pub fn get_app_version(metadata: &Metadata) -> Result<String> {
-        metadata.root_package().map(|pkg| pkg.version.to_string()).ok_or(PistonError::AppPackageMissing)
+        metadata.root_package().map(|pkg| pkg.version.to_string())
+            .ok_or_else(|| Error::AppPackageMissing.into())
     }
 
     pub fn get_bundle_id(metadata: &Metadata, app_name: &str) -> String {
@@ -436,33 +437,33 @@ impl Project {
 
     fn copy_updated_files(src: &Path, dst: &Path) -> Result<()> {
         for entry in read_dir(src)
-            .map_err(|e| PistonError::ReadDirError { path: src.to_path_buf(), source: e })?
+            .map_err(|e| Error::ReadDirError { path: src.to_path_buf(), source: e })?
         {
             let entry = entry
-                .map_err(|e| PistonError::ReadDirError { path: src.to_path_buf(), source: e })?;
+                .map_err(|e| Error::ReadDirError { path: src.to_path_buf(), source: e })?;
             let src_path = entry.path();
             let dst_path = dst.join(entry.file_name());
             if src_path.is_dir() {
-                create_dir_all(&dst_path).map_err(|source| PistonError::CreateDirAllError {
+                create_dir_all(&dst_path).map_err(|source| Error::CreateDirAllError {
                     path: dst_path.clone(), source,
                 })?;
                 Self::copy_updated_files(&src_path, &dst_path)?;
             } else {
                 let needs_copy = match (src_path.metadata(), dst_path.metadata()) {
                     (Ok(src_meta), Ok(dst_meta)) => {
-                        src_meta.modified().map_err(|source| PistonError::FileMetadata {
+                        src_meta.modified().map_err(|source| Error::FileMetadata {
                             path: src_path.clone(), source,
-                        })? > dst_meta.modified().map_err(|source| PistonError::FileMetadata {
+                        })? > dst_meta.modified().map_err(|source| Error::FileMetadata {
                             path: dst_path.clone(), source,
                         })?
                     }
                     (Ok(_), Err(_)) => true,
                     (Err(e), _) => {
-                        return Err(PistonError::FileMetadata { path: src_path, source: e });
+                        return Err(Error::FileMetadata { path: src_path, source: e }.into());
                     }
                 };
                 if needs_copy {
-                    copy(&src_path, &dst_path).map_err(|source| PistonError::CopyFileError {
+                    copy(&src_path, &dst_path).map_err(|source| Error::CopyFileError {
                         input_path: src_path.clone(), output_path: dst_path.clone(), source,
                     })?;
                 }
@@ -473,15 +474,15 @@ impl Project {
 
     fn remove_stale_files(src: &Path, dst: &Path) -> Result<()> {
         for entry in read_dir(dst)
-            .map_err(|e| PistonError::ReadDirError { path: dst.to_path_buf(), source: e })?
+            .map_err(|e| Error::ReadDirError { path: dst.to_path_buf(), source: e })?
         {
             let entry = entry
-                .map_err(|e| PistonError::ReadDirError { path: dst.to_path_buf(), source: e })?;
+                .map_err(|e| Error::ReadDirError { path: dst.to_path_buf(), source: e })?;
             let dst_path = entry.path();
             let corresponding_src = src.join(entry.file_name());
             if dst_path.is_dir() {
                 if !corresponding_src.exists() {
-                    remove_dir_all(&dst_path).map_err(|e| PistonError::RemoveSubdirError {
+                    remove_dir_all(&dst_path).map_err(|e| Error::RemoveSubdirError {
                         path: dst_path,
                         source: e,
                     })?;
@@ -490,7 +491,7 @@ impl Project {
                 }
             } else if !corresponding_src.exists() {
                 remove_file(&dst_path)
-                    .map_err(|e| PistonError::RemoveFileError { path: dst_path, source: e })?;
+                    .map_err(|e| Error::RemoveFileError { path: dst_path, source: e })?;
             }
         }
         Ok(())

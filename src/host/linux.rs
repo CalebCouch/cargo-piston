@@ -3,13 +3,16 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::host::cli::Error as HostError;
+use crate::cli::Error as SharedError;
 use crate::project::Project;
 use crate::devices::IOSDevice;
-use crate::{PistonError, Result};
+use crate::Result;
 
 pub use super::Cli;
 
 pub mod cli;
+use cli::Error;
 
 pub struct Host;
 
@@ -22,7 +25,7 @@ impl Host {
                 PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Android/Sdk")
             });
         if root.join("cmdline-tools").is_dir() { return Ok(root); }
-        Err(PistonError::HostAndroidSdkMissing { path: root })
+        Err(Error::HostAndroidSdkMissing { path: root }.into())
     }
 
     pub fn android_java() -> Result<PathBuf> {
@@ -30,15 +33,15 @@ impl Host {
         let output = Project::output(Command::new("sh").args(["-c", "command -v java"]))?;
         let path = PathBuf::from(String::from_utf8_lossy(&output).trim());
         let java = fs::canonicalize(&path)
-            .map_err(|source| PistonError::HostJavaMissing { path, source })?;
+            .map_err(|source| Error::HostJavaMissing { path, source })?;
         Ok(java.parent().unwrap().parent().unwrap().to_path_buf())
     }
 
-    pub fn check_build() -> Result<()> { Err(PistonError::HostBuildUnsupported) }
+    pub fn check_build() -> Result<()> { Err(Error::HostBuildUnsupported.into()) }
 
     pub fn default_target() -> &'static str { "linux" }
     pub fn require_apple_tools(target: &str) -> Result<()> {
-        Err(PistonError::UnsupportedOSError { os: "linux".into(), target: target.into() })
+        Err(Error::UnsupportedOSError { os: "linux".into(), target: target.into() }.into())
     }
 
     pub fn find_files(_name: &str) -> Result<Vec<PathBuf>> { Ok(Vec::new()) }
@@ -55,14 +58,14 @@ impl Host {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|source| PistonError::CommandSpawn { program: "bash".into(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: "bash".into(), source })?;
         Ok(())
     }
 
     pub fn android_keystore(release: bool) -> Result<String> {
         let output = Project::output(&mut Command::new("whoami"))?;
         let user = String::from_utf8_lossy(&output).trim().to_string();
-        if user.is_empty() { return Err(PistonError::HostUsernameMissing); }
+        if user.is_empty() { return Err(HostError::HostUsernameMissing.into()); }
 
         Ok(if release {
             format!("/Users/{}/.android/release.keystore", user)
@@ -73,12 +76,12 @@ impl Host {
 
     pub fn make_executable(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .map_err(|source| PistonError::SetPermissions { path: path.into(), source })
+            .map_err(|source| SharedError::SetPermissions { path: path.into(), source }.into())
     }
 
     pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }))
-            .map_err(|source| PistonError::SetPermissions { path: path.into(), source })
+            .map_err(|source| SharedError::SetPermissions { path: path.into(), source }.into())
     }
 }
 

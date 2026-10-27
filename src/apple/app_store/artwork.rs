@@ -4,7 +4,8 @@ use image::{DynamicImage, ImageDecoder, ImageEncoder, ImageFormat, ImageReader};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
-use crate::{PistonError, Result};
+use crate::Result;
+use super::cli;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ScreenshotFamily { Iphone, Ipad, }
@@ -42,25 +43,25 @@ impl IOSArtwork {
         for family in [ScreenshotFamily::Iphone, ScreenshotFamily::Ipad] {
             let directory = package_root.join("store/apple").join(family.directory());
             let directory = fs::canonicalize(&directory).map_err(|source| {
-                PistonError::StoreScreenshotFolder { path: directory.clone(), source }
+                cli::Error::StoreScreenshotFolder { path: directory.clone(), source }
             })?;
             let entries = fs::read_dir(&directory).map_err(|source| {
-                PistonError::ReadDirError { path: directory.clone(), source }
+                crate::cli::Error::ReadDirError { path: directory.clone(), source }
             })?;
             let mut paths = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|source| {
-                    PistonError::MapDirError { path: directory.clone(), source }
+                    crate::cli::Error::MapDirError { path: directory.clone(), source }
                 })?;
                 if entry.file_name() == ".DS_Store" { continue; }
                 let path = entry.path();
                 let kind = entry.file_type().map_err(|error| {
-                    PistonError::ReadFile { path: path.clone(), source: error }
+                    crate::cli::Error::ReadFile { path: path.clone(), source: error }
                 })?;
                 if !kind.is_file() {
-                    return Err(PistonError::StoreScreenshotNotFile {
+                    return Err(cli::Error::StoreScreenshotNotFile {
                         path, directory: directory.clone(),
-                    });
+                    }.into());
                 }
                 let extension = path
                     .extension()
@@ -68,15 +69,15 @@ impl IOSArtwork {
                     .unwrap_or("")
                     .to_ascii_lowercase();
                 if !matches!(extension.as_str(), "png" | "jpg" | "jpeg") {
-                    return Err(PistonError::StoreScreenshotFormat { path });
+                    return Err(cli::Error::StoreScreenshotFormat { path }.into());
                 }
                 paths.push(path);
             }
             paths.sort();
             if !(1..=10).contains(&paths.len()) {
-                return Err(PistonError::StoreScreenshotCount {
+                return Err(cli::Error::StoreScreenshotCount {
                     path: directory, count: paths.len(),
-                });
+                }.into());
             }
             inputs.extend(paths.into_iter().map(|path| (family, path)));
         }
@@ -94,19 +95,19 @@ impl IOSArtwork {
             accepted.sort_unstable();
             accepted.dedup();
             if accepted.is_empty() {
-                return Err(PistonError::StoreScreenshotSizesMissing {
+                return Err(cli::Error::StoreScreenshotSizesMissing {
                     family: family.directory().into(),
-                });
+                }.into());
             }
             let directory = output.join(family.directory());
             fs::create_dir_all(&directory).map_err(|source| {
-                PistonError::CreateDirAllError { path: directory.clone(), source }
+                crate::cli::Error::CreateDirAllError { path: directory.clone(), source }
             })?;
             let directory = fs::canonicalize(&directory).map_err(|source| {
-                PistonError::ReadFile { path: directory.clone(), source }
+                crate::cli::Error::ReadFile { path: directory.clone(), source }
             })?;
             if self.inputs.iter().any(|(_, path)| directory.starts_with(path.parent().unwrap())) {
-                return Err(PistonError::StoreScreenshotOutputOverlap { path: directory });
+                return Err(cli::Error::StoreScreenshotOutputOverlap { path: directory }.into());
             }
             for (index, (_, source)) in
                 self.inputs.iter().filter(|(kind, _)| *kind == family).enumerate()
@@ -123,25 +124,25 @@ impl IOSArtwork {
     fn prepare_file(family: ScreenshotFamily, source: &Path, path: PathBuf, accepted: &[(u32, u32)]) -> Result<StoreScreenshot> {
         let reader = ImageReader::open(source)
             .and_then(|reader| reader.with_guessed_format())
-            .map_err(|error| PistonError::ReadFile { path: source.into(), source: error })?;
+            .map_err(|error| crate::cli::Error::ReadFile { path: source.into(), source: error })?;
         if !matches!(reader.format(), Some(ImageFormat::Png | ImageFormat::Jpeg)) {
-            return Err(PistonError::StoreScreenshotFormat { path: source.into() });
+            return Err(cli::Error::StoreScreenshotFormat { path: source.into() }.into());
         }
         let mut decoder = reader.into_decoder().map_err(|error| {
-            PistonError::StoreScreenshotDecode { path: source.into(), source: error }
+            cli::Error::StoreScreenshotDecode { path: source.into(), source: error }
         })?;
         let orientation = decoder.orientation().map_err(|error| {
-            PistonError::StoreScreenshotOrientation { path: source.into(), source: error }
+            cli::Error::StoreScreenshotOrientation { path: source.into(), source: error }
         })?;
         let profile = decoder.icc_profile().map_err(|error| {
-            PistonError::StoreScreenshotColorProfile { path: source.into(), source: error }
+            cli::Error::StoreScreenshotColorProfile { path: source.into(), source: error }
         })?;
         let mut image = DynamicImage::from_decoder(decoder).map_err(|error| {
-            PistonError::StoreScreenshotDecode { path: source.into(), source: error }
+            cli::Error::StoreScreenshotDecode { path: source.into(), source: error }
         })?;
         image.apply_orientation(orientation);
         if image.has_alpha() && image.to_rgba16().pixels().any(|pixel| pixel[3] != u16::MAX) {
-            return Err(PistonError::StoreScreenshotTransparent { path: source.into() });
+            return Err(cli::Error::StoreScreenshotTransparent { path: source.into() }.into());
         }
         let original = (image.width(), image.height());
         let dimensions = if accepted.contains(&original) { Some(original) } else {
@@ -150,7 +151,7 @@ impl IOSArtwork {
                     && u64::from(width) * u64::from(original.1)
                         == u64::from(height) * u64::from(original.0)
             }).max_by_key(|&(width, height)| u64::from(width) * u64::from(height))
-        }.ok_or_else(|| PistonError::StoreScreenshotDimensions {
+        }.ok_or_else(|| cli::Error::StoreScreenshotDimensions {
             path: source.into(), original, accepted: accepted.to_vec(),
         })?;
         let image = DynamicImage::ImageRgb8(image.into_rgb8());
@@ -161,26 +162,26 @@ impl IOSArtwork {
         };
         if path.symlink_metadata().is_ok() {
             fs::remove_file(&path).map_err(|source| {
-                PistonError::RemoveFileError { path: path.clone(), source }
+                crate::cli::Error::RemoveFileError { path: path.clone(), source }
             })?;
         }
         let file = File::create_new(&path).map_err(|source| {
-            PistonError::CreateFileError { path: path.clone(), source }
+            crate::cli::Error::CreateFileError { path: path.clone(), source }
         })?;
         let mut writer = BufWriter::new(file);
         let mut encoder = PngEncoder::new(&mut writer);
         if let Some(profile) = profile.filter(|data| data.get(16..20) == Some(b"RGB ")) {
             encoder.set_icc_profile(profile).map_err(|error| {
-                PistonError::StoreScreenshotColorProfile {
+                cli::Error::StoreScreenshotColorProfile {
                     path: source.into(), source: image::ImageError::Unsupported(error),
                 }
             })?;
         }
         image.write_with_encoder(encoder).map_err(|source| {
-            PistonError::StoreScreenshotWrite { path: path.clone(), source }
+            cli::Error::StoreScreenshotWrite { path: path.clone(), source }
         })?;
         writer.flush().map_err(|source| {
-            PistonError::StoreScreenshotFlush { path: path.clone(), source }
+            cli::Error::StoreScreenshotFlush { path: path.clone(), source }
         })?;
         Ok(StoreScreenshot {
             family,

@@ -6,12 +6,14 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use crate::cli::{Error as SharedError, SetupPage};
 use crate::host::Host;
 use crate::project::Project;
-use crate::{PistonError, Result};
+use crate::Result;
 
 pub mod cli;
 pub use cli::Cli;
+use cli::Error;
 
 pub struct Xcode {
     system: [u32; 3],
@@ -24,7 +26,7 @@ impl Xcode {
         let output = Project::output(Command::new("sw_vers").arg("-productVersion"))?;
         let value = String::from_utf8_lossy(&output);
         let system = Self::version(value.trim()).ok_or_else(|| {
-            PistonError::XcodeSystemVersionInvalid { value: value.into_owned() }
+            Error::XcodeSystemVersionInvalid { value: value.into_owned() }
         })?;
         let silicon =
             Command::new("sysctl").args(["-n", "hw.optional.arm64"]).output().is_ok_and(|output| {
@@ -36,23 +38,23 @@ impl Xcode {
             let output = Command::new("uname")
                 .arg("-m")
                 .output()
-                .map_err(|source| PistonError::CommandSpawn { program: "uname".into(), source })?;
+                .map_err(|source| SharedError::CommandSpawn { program: "uname".into(), source })?;
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         if !matches!(architecture.as_str(), "arm64" | "x86_64") {
-            return Err(PistonError::XcodeArchitectureUnsupported { architecture });
+            return Err(Error::XcodeArchitectureUnsupported { architecture }.into());
         }
         let home = env::var_os("HOME")
             .map(PathBuf::from)
-            .ok_or(PistonError::MissingEnvironment { name: "HOME" })?;
+            .ok_or(SharedError::MissingEnvironment { name: "HOME" })?;
         Ok(Self { system, architecture, home })
     }
 
-    fn selected(&self, minimum: u32, report: &mut dyn FnMut(PistonError)) -> Result<Option<PathBuf>> {
+    fn selected(&self, minimum: u32, report: &mut dyn FnMut(Box<dyn std::error::Error>)) -> Result<Option<PathBuf>> {
         let developer = if let Some(path) = env::var_os("DEVELOPER_DIR") {
             let (version, path) = self.inspect(&PathBuf::from(path))?;
             if version[0] < minimum {
-                return Err(PistonError::XcodeSelectedTooOld { version, minimum });
+                return Err(Error::XcodeSelectedTooOld { version, minimum }.into());
             }
             path
         } else {
@@ -66,14 +68,14 @@ impl Xcode {
             .env("DEVELOPER_DIR", &developer)
             .args(["--sdk", sdk, "--show-sdk-version"])
             .output()
-            .map_err(|source| PistonError::CommandSpawn { program: "xcrun".into(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: "xcrun".into(), source })?;
         let version = String::from_utf8_lossy(&output.stdout);
         if !output.status.success()
             || Self::version(version.trim()).is_none_or(|version| version[0] < minimum)
         {
-            return Err(PistonError::XcodeSdkUnavailable {
+            return Err(Error::XcodeSdkUnavailable {
                 developer: developer.into(), sdk: sdk.into(), minimum, output,
-            });
+            }.into());
         }
         Ok(())
     }
@@ -102,7 +104,7 @@ impl Xcode {
         let output = Project::output(Command::new("plutil")
             .args(["-convert", "json", "-o", "-"]).arg(path))?;
         serde_json::from_slice(&output)
-            .map_err(|error| PistonError::IntoJSONError(error.to_string()))
+            .map_err(|error| SharedError::IntoJSONError(error.to_string()).into())
     }
 
     fn inspect(&self, path: &Path) -> Result<([u32; 3], PathBuf)> {
@@ -112,9 +114,9 @@ impl Xcode {
             path.to_path_buf()
         };
         let developer = fs::canonicalize(&path)
-            .map_err(|source| PistonError::ReadFile { path, source })?;
+            .map_err(|source| SharedError::ReadFile { path, source })?;
         if !developer.join("usr/bin/xcodebuild").is_file() {
-            return Err(PistonError::XcodeIncomplete { developer });
+            return Err(Error::XcodeIncomplete { developer }.into());
         }
         let contents = developer.parent().unwrap();
         let info = Self::plist(&contents.join("Info.plist"))?;
@@ -127,12 +129,12 @@ impl Xcode {
             || version.is_none()
             || required.is_none_or(|required| required > self.system)
         {
-            return Err(PistonError::XcodeIncompatible { developer });
+            return Err(Error::XcodeIncompatible { developer }.into());
         }
         Ok((version.unwrap(), developer))
     }
 
-    fn installed(&self, minimum: u32, report: &mut dyn FnMut(PistonError)) -> Result<Option<PathBuf>> {
+    fn installed(&self, minimum: u32, report: &mut dyn FnMut(Box<dyn std::error::Error>)) -> Result<Option<PathBuf>> {
         let mut paths = Vec::new();
         let selected = Command::new("xcode-select")
             .arg("-p")
@@ -146,7 +148,7 @@ impl Xcode {
                 Ok(entries) => {
                     for entry in entries {
                         let entry = entry
-                            .map_err(|source| PistonError::MapDirError { path: root.clone(), source })?;
+                            .map_err(|source| SharedError::MapDirError { path: root.clone(), source })?;
                         let path = entry.path();
                         if path.join("Contents/Developer/usr/bin/xcodebuild").is_file() {
                             paths.push(path);
@@ -154,7 +156,7 @@ impl Xcode {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => report(PistonError::ReadDirError { path: root, source }),
+                Err(source) => report(SharedError::ReadDirError { path: root, source }.into()),
             }
         }
         let spotlight = Command::new("mdfind")
@@ -170,15 +172,15 @@ impl Xcode {
                         .map(|path| PathBuf::from(std::ffi::OsStr::from_bytes(path))),
                 );
             }
-            Ok(output) => report(PistonError::CommandFailed { program: "mdfind".into(), output }),
-            Err(source) => report(PistonError::CommandSpawn { program: "mdfind".into(), source }),
+            Ok(output) => report(SharedError::CommandFailed { program: "mdfind".into(), output }.into()),
+            Err(source) => report(SharedError::CommandSpawn { program: "mdfind".into(), source }.into()),
         }
         let mut candidates = Vec::new();
         for path in paths {
             match self.inspect(&path) {
                 Ok(candidate) if candidate.0[0] >= minimum => candidates.push(candidate),
                 Ok(_) => {}
-                Err(error) => report(PistonError::XcodeDiscovery { path, error: Box::new(error) }),
+                Err(error) => report(Error::XcodeDiscovery { path, error }.into()),
             }
         }
         candidates.sort_by(|left, right| {
@@ -201,20 +203,20 @@ impl Xcode {
                 Ok(output) => {
                     let error = String::from_utf8_lossy(&output.stderr);
                     if error.to_lowercase().contains("license") { return Ok(Some(developer)); }
-                    report(PistonError::XcodeDiscovery {
+                    report(Error::XcodeDiscovery {
                         path: developer.clone(),
-                        error: Box::new(PistonError::CommandFailed {
+                        error: Box::new(SharedError::CommandFailed {
                             program: developer.join("usr/bin/xcodebuild").into(), output,
                         }),
-                    });
+                    }.into());
                 }
                 Err(error) => {
-                    report(PistonError::XcodeDiscovery {
+                    report(Error::XcodeDiscovery {
                         path: developer.clone(),
-                        error: Box::new(PistonError::CommandSpawn {
+                        error: Box::new(SharedError::CommandSpawn {
                             program: developer.join("usr/bin/xcodebuild").into(), source: error,
                         }),
-                    })
+                    }.into())
                 }
             }
         }
@@ -224,8 +226,8 @@ impl Xcode {
     fn latest(&self, sdk: &str, minimum: u32) -> Result<Release> {
         let releases: Vec<Value> = ureq::AgentBuilder::new().timeout(Duration::from_secs(15))
             .build().get("https://xcodereleases.com/data.json").call()
-            .map_err(|source| PistonError::XcodeCatalogUnavailable { source: Box::new(source) })?
-            .into_json().map_err(|error| PistonError::IntoJSONError(error.to_string()))?;
+            .map_err(|source| Error::XcodeCatalogUnavailable { source: Box::new(source) })?
+            .into_json().map_err(|error| SharedError::IntoJSONError(error.to_string()))?;
         let mut candidates = Vec::new();
         for release in releases {
             if release.pointer("/version/release/release").and_then(Value::as_bool) != Some(true) {
@@ -284,21 +286,23 @@ impl Xcode {
         });
         if let Some(release) = candidates.into_iter().next() { return Ok(release); }
         if let Some(required) = minimum_os {
-            return Err(PistonError::XcodeSystemTooOld { sdk: sdk.into(), minimum: required }
-                .setup(crate::error::SetupPage::Url(
+            return Err(SharedError::SetupRequired {
+                error: Error::XcodeSystemTooOld { sdk: sdk.into(), minimum: required }.into(),
+                page: SetupPage::Url(
                     "x-apple.systempreferences:com.apple.Software-Update-Settings.extension".into(),
-                )));
+                ),
+            }.into());
         }
-        Err(PistonError::XcodeReleaseUnavailable {
+        Err(Error::XcodeReleaseUnavailable {
             architecture: self.architecture.clone(), sdk: sdk.into(),
-        })
+        }.into())
     }
 
-    fn archive(&self, release: &Release, report: &mut dyn FnMut(PistonError)) -> Result<Option<PathBuf>> {
+    fn archive(&self, release: &Release, report: &mut dyn FnMut(Box<dyn std::error::Error>)) -> Result<Option<PathBuf>> {
         if let Some(path) = env::var_os("PISTON_XCODE_ARCHIVE") {
             let path = PathBuf::from(path);
             return fs::canonicalize(&path).map(Some)
-                .map_err(|source| PistonError::ReadFile { path, source });
+                .map_err(|source| SharedError::ReadFile { path, source }.into());
         }
         let filename = release.url.rsplit('/').next().unwrap();
         let mut files = vec![self.home.join("Downloads").join(filename)];
@@ -314,7 +318,7 @@ impl Xcode {
             {
                 return fs::canonicalize(&path)
                     .map(Some)
-                    .map_err(|source| PistonError::ReadFile { path, source });
+                    .map_err(|source| SharedError::ReadFile { path, source }.into());
             }
         }
         Ok(None)
@@ -323,16 +327,16 @@ impl Xcode {
     fn install(&self, release: &Release, archive: &Path) -> Result<PathBuf> {
         let applications = self.home.join("Applications");
         fs::create_dir_all(&applications)
-            .map_err(|source| PistonError::CreateDirAllError { path: applications.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAllError { path: applications.clone(), source })?;
         let destination =
             applications.join(format!("Xcode-{}-{}.app", release.name, release.build));
         if destination.exists() {
-            return Err(PistonError::XcodeDestinationExists { path: destination });
+            return Err(Error::XcodeDestinationExists { path: destination }.into());
         }
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let staging = applications.join(format!(".piston-xcode-{}-{stamp}", std::process::id()));
         fs::create_dir(&staging)
-            .map_err(|source| PistonError::CreateDirAllError { path: staging.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAllError { path: staging.clone(), source })?;
         Self::run(
             Command::new("xip").arg("--expand").arg(&archive).current_dir(&staging),
             "extract",
@@ -347,11 +351,11 @@ impl Xcode {
         let (version, developer) = self.inspect(&app)?;
         let info = Self::plist(&developer.parent().unwrap().join("version.plist"))?;
         if version != release.version || info["ProductBuildVersion"] != release.build {
-            return Err(PistonError::XcodeArchiveMismatch {
+            return Err(Error::XcodeArchiveMismatch {
                 version: release.name.clone(), build: release.build.clone(), staging,
-            });
+            }.into());
         }
-        fs::rename(&app, &destination).map_err(|source| PistonError::XcodeInstallMove {
+        fs::rename(&app, &destination).map_err(|source| Error::XcodeInstallMove {
             destination: destination.clone(), staging, source,
         })?;
         Ok(destination.join("Contents/Developer"))
@@ -362,7 +366,7 @@ impl Xcode {
             .args(["-license", "check"])
             .env("DEVELOPER_DIR", developer)
             .output()
-            .map_err(|source| PistonError::CommandSpawn {
+            .map_err(|source| SharedError::CommandSpawn {
                 program: developer.join("usr/bin/xcodebuild").into(), source,
             })?;
         Ok(output.status.success())
@@ -378,9 +382,9 @@ impl Xcode {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .status()
-            .map_err(|source| PistonError::CommandSpawn { program: "sudo".into(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: "sudo".into(), source })?;
         if !status.success() || !self.license_accepted(developer)? {
-            return Err(PistonError::XcodeLicenseIncomplete);
+            return Err(Error::XcodeLicenseIncomplete.into());
         }
         Ok(())
     }
@@ -390,7 +394,7 @@ impl Xcode {
             .arg("-checkFirstLaunchStatus")
             .env("DEVELOPER_DIR", developer)
             .output()
-            .map_err(|source| PistonError::CommandSpawn {
+            .map_err(|source| SharedError::CommandSpawn {
                 program: developer.join("usr/bin/xcodebuild").into(), source,
             })?;
         Ok(output.status.success())
@@ -399,15 +403,15 @@ impl Xcode {
     fn install_components(&self, developer: &Path, elevated: bool) -> Result<()> {
         let logs = self.home.join("Library/Logs/Piston/Xcode");
         fs::create_dir_all(&logs)
-            .map_err(|source| PistonError::CreateDirAllError { path: logs.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAllError { path: logs.clone(), source })?;
         let binary = developer.join("usr/bin/xcodebuild");
         if elevated {
             let status = Command::new("sudo")
                 .arg("-v")
                 .status()
-                .map_err(|source| PistonError::CommandSpawn { program: "sudo".into(), source })?;
+                .map_err(|source| SharedError::CommandSpawn { program: "sudo".into(), source })?;
             if !status.success() {
-                return Err(PistonError::XcodeAdministratorApprovalIncomplete);
+                return Err(Error::XcodeAdministratorApprovalIncomplete.into());
             }
             Self::run(
                 Command::new("sudo")
@@ -437,16 +441,16 @@ impl Xcode {
     fn run(command: &mut Command, stage: &str, directory: &Path) -> Result<()> {
         let log = directory.join(format!("{stage}.log"));
         let file = fs::File::create(&log)
-            .map_err(|source| PistonError::CreateFileError { path: log.clone(), source })?;
+            .map_err(|source| SharedError::CreateFileError { path: log.clone(), source })?;
         let errors = file.try_clone()
-            .map_err(|source| PistonError::ReadFile { path: log.clone(), source })?;
+            .map_err(|source| SharedError::ReadFile { path: log.clone(), source })?;
         let program = command.get_program().to_owned();
         let status = command.stdout(Stdio::from(file)).stderr(Stdio::from(errors)).status()
-            .map_err(|source| PistonError::CommandSpawn { program: program.clone(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: program.clone(), source })?;
         if status.success() { return Ok(()); }
-        Err(PistonError::CommandLogged {
+        Err(SharedError::CommandLogged {
             diagnostics: fs::read_to_string(&log).unwrap_or_default(), log,
-            error: Box::new(PistonError::CommandStatus { program, status }),
-        })
+            error: Box::new(SharedError::CommandStatus { program, status }),
+        }.into())
     }
 }

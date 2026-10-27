@@ -6,9 +6,11 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::host::cli::Error as HostError;
+use crate::cli::Error as SharedError;
 use crate::devices::IOSDevice;
 use crate::project::Project;
-use crate::{PistonError, Result};
+use crate::Result;
 
 pub use super::Cli;
 
@@ -36,7 +38,7 @@ impl Host {
         if let Some(path) = env::var_os("ANDROID_HOME").or_else(|| env::var_os("ANDROID_SDK_ROOT"))
         { return Ok(PathBuf::from(path)); }
         let root = PathBuf::from(
-            env::var_os("HOME").ok_or_else(|| PistonError::MissingEnvironment { name: "HOME" })?,
+            env::var_os("HOME").ok_or_else(|| SharedError::MissingEnvironment { name: "HOME" })?,
         )
         .join("Library/Android/sdk");
         if root.join("cmdline-tools").is_dir() { return Ok(root); }
@@ -80,9 +82,9 @@ impl Host {
             .args(["xctrace", "list", "devices"])
             .stdout(Stdio::piped())
             .output()
-            .map_err(|source| PistonError::CommandSpawn { program: "xcrun".into(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: "xcrun".into(), source })?;
         let stdout = str::from_utf8(&output.stdout)
-            .map_err(|e| PistonError::ParseUTF8Error(e.to_string()))?;
+            .map_err(|e| SharedError::ParseUTF8Error(e.to_string()))?;
         let mut in_devices_section = false;
         let mut devices = Vec::new();
         for line in stdout.lines() {
@@ -117,14 +119,14 @@ impl Host {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|source| PistonError::CommandSpawn { program: "bash".into(), source })?;
+            .map_err(|source| SharedError::CommandSpawn { program: "bash".into(), source })?;
         Ok(())
     }
 
     pub fn android_keystore(release: bool) -> Result<String> {
         let output = Project::output(&mut Command::new("whoami"))?;
         let user = String::from_utf8_lossy(&output).trim().to_string();
-        if user.is_empty() { return Err(PistonError::HostUsernameMissing); }
+        if user.is_empty() { return Err(HostError::HostUsernameMissing.into()); }
 
         Ok(if release {
             format!("/Users/{}/.android/release.keystore", user)
@@ -135,12 +137,12 @@ impl Host {
 
     pub fn make_executable(path: &Path) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .map_err(|source| PistonError::SetPermissions { path: path.into(), source })
+            .map_err(|source| SharedError::SetPermissions { path: path.into(), source }.into())
     }
 
     pub fn private_permissions(path: &Path, directory: bool) -> Result<()> {
         fs::set_permissions(path, fs::Permissions::from_mode(if directory { 0o700 } else { 0o600 }))
-            .map_err(|source| PistonError::SetPermissions { path: path.into(), source })
+            .map_err(|source| SharedError::SetPermissions { path: path.into(), source }.into())
     }
 }
 
@@ -151,10 +153,10 @@ pub struct LinuxToolchain {
 impl LinuxToolchain {
     pub fn new(env_vars: &HashMap<String, String>) -> Result<Self> {
         let zigbuild_path = env_vars.get("zigbuild_path").cloned().ok_or_else(|| {
-            PistonError::MissingSetting { key: "zigbuild_path".into() }
+            SharedError::MissingSetting { key: "zigbuild_path".into() }
         })?;
         let homebrew_path = env_vars.get("homebrew_path").cloned().ok_or_else(|| {
-            PistonError::MissingSetting { key: "homebrew_path".into() }
+            SharedError::MissingSetting { key: "homebrew_path".into() }
         })?;
         Ok(Self { zigbuild_path, homebrew_path })
     }

@@ -6,9 +6,10 @@ use std::fs::{read_dir, File, copy, create_dir_all, remove_file, rename};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::Result;
+use crate::cli::Error;
 use crate::project::Project;
 use crate::host::Host;
-use crate::PistonError;
 
 mod development;
 pub use development::AndroidDevelopment;
@@ -37,7 +38,7 @@ pub struct AndroidBuilder {
 }
 
 impl AndroidBuilder {
-    fn new(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<Self, PistonError> {
+    fn new(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<Self> {
         let ndk_path: &String = AndroidBuilder::get_or_err(&env_vars, "ndk_path")?;
         let sdk_path: &String = AndroidBuilder::get_or_err(&env_vars, "sdk_path")?;
         let java_path: &String = AndroidBuilder::get_or_err(&env_vars, "java_path")?;
@@ -47,7 +48,7 @@ impl AndroidBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| PistonError::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParseError(e.to_string()))?;
 
         let lib_name = Project::get_lib_name(&metadata)?;
         let icon_path = Project::get_icon_path(&metadata, &cwd);
@@ -62,7 +63,7 @@ impl AndroidBuilder {
             .join("androidbuilder");
         Project::empty_directory(build_path.as_path(), &["assets"])?;
         create_dir_all(&build_path)
-            .map_err(|e| PistonError::CreateDirAllError { path: build_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: build_path.clone(), source: e })?;
         let manifest_path: PathBuf = build_path.join("AndroidManifest.xml");
         let resources_path: PathBuf = build_path.join("app").join("src").join("main").join("res");
         manifest.write_to(&manifest_path)?;
@@ -90,10 +91,10 @@ impl AndroidBuilder {
         })
     }
 
-    fn pre_build(&self) -> Result<(), PistonError> {
+    fn pre_build(&self) -> Result<()> {
         let path = self.resources.as_path();
         Project::empty_directory(path, &[])?;
-        create_dir_all(&self.resources).map_err(|e| PistonError::CreateDirAllError {
+        create_dir_all(&self.resources).map_err(|e| Error::CreateDirAllError {
             path: self.resources.clone(),
             source: e,
         })?;
@@ -103,14 +104,14 @@ impl AndroidBuilder {
         let xxhdpi_path: PathBuf = self.resources.join("mipmap-xxhdpi");
         let xxxhdpi_path: PathBuf = self.resources.join("mipmap-xxxhdpi");
         create_dir_all(&hdpi_path)
-            .map_err(|e| PistonError::CreateDirAllError { path: hdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: hdpi_path.clone(), source: e })?;
         create_dir_all(&mdpi_path)
-            .map_err(|e| PistonError::CreateDirAllError { path: mdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: mdpi_path.clone(), source: e })?;
         create_dir_all(&xhdpi_path)
-            .map_err(|e| PistonError::CreateDirAllError { path: xhdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: xhdpi_path.clone(), source: e })?;
         create_dir_all(&xxhdpi_path)
-            .map_err(|e| PistonError::CreateDirAllError { path: xxhdpi_path.clone(), source: e })?;
-        create_dir_all(&xxxhdpi_path).map_err(|e| PistonError::CreateDirAllError {
+            .map_err(|e| Error::CreateDirAllError { path: xxhdpi_path.clone(), source: e })?;
+        create_dir_all(&xxxhdpi_path).map_err(|e| Error::CreateDirAllError {
             path: xxxhdpi_path.clone(),
             source: e,
         })?;
@@ -137,13 +138,13 @@ impl AndroidBuilder {
         Ok(())
     }
 
-    fn build(&self) -> Result<PathBuf, PistonError> {
+    fn build(&self) -> Result<PathBuf> {
         self.build_so()?;
         let resources = self.compile_resources()?;
         let base_dir = self.build_path.join("base");
         Project::empty_directory(&base_dir, &["assets"])?;
         create_dir_all(&base_dir)
-            .map_err(|e| PistonError::CreateDirAllError { path: base_dir.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: base_dir.clone(), source: e })?;
         self.link_manifest_and_resources(&resources, &base_dir)?;
         let assets_src = Path::new(&self.assets);
         let assets_base = &base_dir.join("assets");
@@ -159,7 +160,7 @@ impl AndroidBuilder {
         Ok(aab_path)
     }
 
-    fn post_build(&self, aab_path: PathBuf) -> Result<(), PistonError> {
+    fn post_build(&self, aab_path: PathBuf) -> Result<()> {
         let key_path_exists = Path::new(&self.key_set.key_path).exists();
         let key_alias_exists = self.verify_key_alias()?;
 
@@ -167,7 +168,7 @@ impl AndroidBuilder {
         self.sign_aab(aab_path)
     }
 
-    fn build_so(&self) -> Result<(), PistonError> {
+    fn build_so(&self) -> Result<()> {
         let host_platform = AndroidBuilder::get_host_platform(self.ndk_path.as_ref())?;
         let api_level = self.manifest.min_sdk_version.to_string();
         let linker_name = if self.target == "armv7-linux-androideabi" {
@@ -187,10 +188,10 @@ impl AndroidBuilder {
             .join("bin")
             .join("llvm-ar");
         if !linker_path.exists() {
-            return Err(PistonError::AndroidToolMissing { path: linker_path });
+            return Err(cli::Error::AndroidToolMissing { path: linker_path }.into());
         }
         if !ar_path.exists() {
-            return Err(PistonError::AndroidToolMissing { path: ar_path });
+            return Err(cli::Error::AndroidToolMissing { path: ar_path }.into());
         }
 
         // handle cc crate linker for rusqlite
@@ -209,7 +210,7 @@ impl AndroidBuilder {
             .join(cxx_name);
 
         if !cxx_path.exists() {
-            return Err(PistonError::AndroidToolMissing { path: cxx_path });
+            return Err(cli::Error::AndroidToolMissing { path: cxx_path }.into());
         }
 
         let cc_env_key = format!("CC_{}", target_underscored);
@@ -236,17 +237,17 @@ impl AndroidBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         if !builder.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
+            return Err(Error::CommandFailed { program: "bash".into(), output: builder }.into());
         }
         Ok(())
     }
 
-    fn compile_resources(&self) -> Result<PathBuf, PistonError> {
+    fn compile_resources(&self) -> Result<PathBuf> {
         let compiled_res = self.build_path.join("compiled_resources.zip");
         if compiled_res.exists() {
-            remove_file(&compiled_res).map_err(|e| PistonError::RemoveFileError {
+            remove_file(&compiled_res).map_err(|e| Error::RemoveFileError {
                 path: compiled_res.to_path_buf(),
                 source: e,
             })?;
@@ -269,11 +270,11 @@ impl AndroidBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         Ok(compiled_res)
     }
 
-    fn link_manifest_and_resources(&self, compiled_res: &Path, base_dir: &Path) -> Result<(), PistonError> {
+    fn link_manifest_and_resources(&self, compiled_res: &Path, base_dir: &Path) -> Result<()> {
         let aapt2_path: PathBuf = PathBuf::from(&self.sdk_path)
             .join(format!("build-tools/{}/aapt2", self.build_tools_version));
         let android_jar: PathBuf = PathBuf::from(&self.sdk_path)
@@ -301,36 +302,36 @@ impl AndroidBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
 
         let proto_manifest_root = base_dir.join("AndroidManifest.xml");
         if proto_manifest_root.exists() {
             let manifest_dir = base_dir.join("manifest");
             Project::empty_directory(&manifest_dir, &[])?;
-            create_dir_all(&manifest_dir).map_err(|e| PistonError::CreateDirAllError {
+            create_dir_all(&manifest_dir).map_err(|e| Error::CreateDirAllError {
                 path: manifest_dir.clone(),
                 source: e,
             })?;
             rename(&proto_manifest_root, manifest_dir.join("AndroidManifest.xml")).map_err(
-                |e| PistonError::RenameFileError { path: proto_manifest_root.clone(), source: e },
+                |e| Error::RenameFileError { path: proto_manifest_root.clone(), source: e },
             )?;
         } else {
-            return Err(PistonError::AndroidManifestMissing { path: proto_manifest_root });
+            return Err(cli::Error::AndroidManifestMissing { path: proto_manifest_root }.into());
         }
         Ok(())
     }
 
-    fn add_lib(&self, base_dir: &Path, target: &str) -> Result<(), PistonError> {
+    fn add_lib(&self, base_dir: &Path, target: &str) -> Result<()> {
         let abi = match target {
             "aarch64-linux-android" => "arm64-v8a",
             _ => {
-                return Err(PistonError::UnsupportedTargetError(target.into()));
+                return Err(Error::UnsupportedTargetError(target.into()).into());
             }
         };
         let lib_dir = base_dir.join("lib").join(abi);
         Project::empty_directory(&lib_dir, &[])?;
         create_dir_all(&lib_dir)
-            .map_err(|e| PistonError::CreateDirAllError { path: lib_dir.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAllError { path: lib_dir.clone(), source: e })?;
 
         let lib_file = format!("lib{}.so", self.lib_name);
         let so_path = self
@@ -340,7 +341,7 @@ impl AndroidBuilder {
             .join(if self.release { "release" } else { "debug" })
             .join(&lib_file);
         copy(&so_path, lib_dir.join(&lib_file))
-            .map_err(|e| PistonError::CopyFileError {
+            .map_err(|e| Error::CopyFileError {
                 input_path: so_path.clone(), output_path: lib_dir.join(&lib_file), source: e,
             })?;
 
@@ -348,26 +349,26 @@ impl AndroidBuilder {
     }
 
     /* Retained until the photo picker moves into Maverick's Android integration.
-    fn add_activity_dex(&self, base_dir: &Path) -> Result<(), PistonError> {
+    fn add_activity_dex(&self, base_dir: &Path) -> Result<()> {
         let dex_dir = base_dir.join("dex");
-        create_dir_all(&dex_dir).map_err(|e| PistonError::CreateDirAllError {
+        create_dir_all(&dex_dir).map_err(|e| Error::CreateDirAllError {
             path: dex_dir.clone(), source: e,
         })?;
 
         let dex_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/android_activity/classes.dex");
         copy(&dex_path, dex_dir.join("classes.dex")).map_err(|e| {
-            PistonError::BuildError(e.to_string())
+            Error::BuildError(e.to_string())
         })?;
 
         Ok(())
     }
     */
 
-    fn zip_base(&self, base_dir: &Path) -> Result<(), PistonError> {
+    fn zip_base(&self, base_dir: &Path) -> Result<()> {
         let zip_path = self.build_path.join("base.zip");
         if zip_path.exists() {
-            remove_file(&zip_path).map_err(|e| PistonError::RemoveFileError {
+            remove_file(&zip_path).map_err(|e| Error::RemoveFileError {
                 path: zip_path.to_path_buf(),
                 source: e,
             })?;
@@ -381,14 +382,14 @@ impl AndroidBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
 
         Ok(())
     }
 
-    fn build_bundle(&self, base_zip: &Path, aab_path: &Path) -> Result<(), PistonError> {
+    fn build_bundle(&self, base_zip: &Path, aab_path: &Path) -> Result<()> {
         if aab_path.exists() {
-            remove_file(&aab_path).map_err(|e| PistonError::RemoveFileError {
+            remove_file(&aab_path).map_err(|e| Error::RemoveFileError {
                 path: aab_path.to_path_buf(),
                 source: e,
             })?;
@@ -408,11 +409,11 @@ impl AndroidBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         Ok(())
     }
 
-    fn create_signing_key(&self) -> Result<(), PistonError> {
+    fn create_signing_key(&self) -> Result<()> {
         let keystore_path = &self.key_set.key_path;
         let pass = &self.key_set.key_pass;
         let alias = &self.key_set.key_alias;
@@ -427,7 +428,7 @@ impl AndroidBuilder {
         );
 
         if let Some(parent) = Path::new(&keystore_path).parent() {
-            create_dir_all(parent).map_err(|e| PistonError::CreateDirAllError {
+            create_dir_all(parent).map_err(|e| Error::CreateDirAllError {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
@@ -455,16 +456,16 @@ impl AndroidBuilder {
             .arg("-dname")
             .arg(&dname)
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: keytool.clone().into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: keytool.clone().into(), source: e })?;
 
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: keytool.into(), output });
+            return Err(Error::CommandFailed { program: keytool.into(), output }.into());
         }
 
         Ok(())
     }
 
-    fn verify_key_alias(&self) -> Result<bool, PistonError> {
+    fn verify_key_alias(&self) -> Result<bool> {
         let keytool = format!("{}/bin/keytool", self.java_path);
         let output = Command::new(&keytool)
             .arg("-list")
@@ -474,7 +475,7 @@ impl AndroidBuilder {
             .arg("-storepass")
             .arg(&self.key_set.key_pass)
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: keytool.into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: keytool.into(), source: e })?;
 
         if !output.status.success() { return Ok(false); }
 
@@ -488,7 +489,7 @@ impl AndroidBuilder {
         Ok(false)
     }
 
-    fn sign_aab(&self, aab_path: PathBuf) -> Result<(), PistonError> {
+    fn sign_aab(&self, aab_path: PathBuf) -> Result<()> {
         let sdk = PathBuf::from(&self.sdk_path);
         let apksigner_path =
             sdk.join(format!("build-tools/{}/apksigner", self.build_tools_version));
@@ -509,12 +510,12 @@ impl AndroidBuilder {
             .arg(&api_level)
             .arg(&aab_path)
             .output()
-            .map_err(|source| PistonError::CommandSpawn {
+            .map_err(|source| Error::CommandSpawn {
                 program: apksigner_path.clone().into(), source,
             })?;
 
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: apksigner_path.into(), output });
+            return Err(Error::CommandFailed { program: apksigner_path.into(), output }.into());
         }
 
         Ok(())
@@ -522,38 +523,38 @@ impl AndroidBuilder {
 }
 
 impl AndroidBuilder {
-    pub fn get_or_err<'a>(map: &'a HashMap<String, String>, key: &str) -> Result<&'a String, PistonError> {
-        map.get(key).ok_or_else(|| PistonError::MissingSetting { key: key.into() })
+    pub fn get_or_err<'a>(map: &'a HashMap<String, String>, key: &str) -> Result<&'a String> {
+        map.get(key).ok_or_else(|| Error::MissingSetting { key: key.into() }.into())
     }
 
-    pub fn get_host_platform(ndk_path: &str) -> Result<String, PistonError> {
+    pub fn get_host_platform(ndk_path: &str) -> Result<String> {
         let prebuilt_path = PathBuf::from(ndk_path).join("toolchains/llvm/prebuilt");
         let host_dirs = Self::directory_names(&prebuilt_path)?;
         if host_dirs.is_empty() {
-            return Err(PistonError::AndroidHostToolchainMissing { path: prebuilt_path });
+            return Err(cli::Error::AndroidHostToolchainMissing { path: prebuilt_path }.into());
         }
         Ok(host_dirs.into_iter().next().unwrap())
     }
 
-    pub fn get_build_tools_version(sdk_path: &str) -> Result<String, PistonError> {
+    pub fn get_build_tools_version(sdk_path: &str) -> Result<String> {
         let prebuilt_path = PathBuf::from(sdk_path).join("build-tools");
         let host_dirs = Self::directory_names(&prebuilt_path)?;
         if host_dirs.is_empty() {
-            return Err(PistonError::AndroidBuildToolsMissing { path: prebuilt_path });
+            return Err(cli::Error::AndroidBuildToolsMissing { path: prebuilt_path }.into());
         }
         Ok(host_dirs.into_iter().next().unwrap())
     }
 
-    fn directory_names(path: &Path) -> Result<Vec<String>, PistonError> {
+    fn directory_names(path: &Path) -> Result<Vec<String>> {
         let entries = read_dir(path)
-            .map_err(|e| PistonError::ReadDirError { path: path.into(), source: e })?;
+            .map_err(|e| Error::ReadDirError { path: path.into(), source: e })?;
         let mut names = Vec::new();
         for entry in entries {
             let entry =
-                entry.map_err(|e| PistonError::MapDirError { path: path.into(), source: e })?;
+                entry.map_err(|e| Error::MapDirError { path: path.into(), source: e })?;
             let file_type = entry
                 .file_type()
-                .map_err(|e| PistonError::MapDirError { path: entry.path(), source: e })?;
+                .map_err(|e| Error::MapDirError { path: entry.path(), source: e })?;
             if file_type.is_dir() {
                 if let Some(name) = entry.file_name().to_str() { names.push(name.to_string()); }
             }
@@ -568,7 +569,7 @@ impl AndroidRunner {
     fn deploy_usb(
         device_id: &str, output_path: PathBuf, app_name: String, cwd: PathBuf, package: String,
         env_vars: HashMap<String, String>,
-    ) -> Result<(), PistonError> {
+    ) -> Result<()> {
         let aab_path = output_path.join(format!("{}.aab", app_name));
         let bundletool_path: &String = AndroidBuilder::get_or_err(&env_vars, "bundletool_path")?;
         let java_path: &String = AndroidBuilder::get_or_err(&env_vars, "java_path")?;
@@ -590,9 +591,9 @@ impl AndroidRunner {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output });
+            return Err(Error::CommandFailed { program: "bash".into(), output }.into());
         }
         let bundle_cmd = format!(
             "java -jar {} install-apks --apks={} --device-id={} --adb {}",
@@ -609,9 +610,9 @@ impl AndroidRunner {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output });
+            return Err(Error::CommandFailed { program: "bash".into(), output }.into());
         }
         let launch = format!("{}/android.app.NativeActivity", package);
         let adb_cmd = format!("{} shell am start -n {}", &adb_path, &launch,);
@@ -622,9 +623,9 @@ impl AndroidRunner {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output });
+            return Err(Error::CommandFailed { program: "bash".into(), output }.into());
         }
 
         Ok(())
@@ -662,14 +663,14 @@ struct AndroidManifest {
 }
 
 impl AndroidManifest {
-    fn build(metadata: &Metadata, app_name: &str, version: &str) -> Result<Self, PistonError> {
-        let package = metadata.root_package().ok_or(PistonError::AppPackageMissing)?;
+    fn build(metadata: &Metadata, app_name: &str, version: &str) -> Result<Self> {
+        let package = metadata.root_package().ok_or(Error::AppPackageMissing)?;
         let crate_name = &package.name;
         let android_meta_value: Value =
             package.metadata.get("android").cloned().unwrap_or(Value::Object(Default::default()));
         let android_meta: AndroidMetadata =
             serde_json::from_value(android_meta_value).map_err(|e| {
-                PistonError::ParseManifestError(e.to_string())
+                cli::Error::ParseManifestError(e.to_string())
             })?;
         Ok(Self {
             package: android_meta.package.unwrap_or(format!("com.example.{}", crate_name)),
@@ -726,14 +727,14 @@ impl AndroidManifest {
         )
     }
 
-    fn write_to(&self, dir: &Path) -> Result<(), PistonError> {
+    fn write_to(&self, dir: &Path) -> Result<()> {
         let file = File::create(dir).map_err(|e| {
-            PistonError::CreateFileError { path: dir.into(), source: e }
+            Error::CreateFileError { path: dir.into(), source: e }
         })?;
 
         let mut writer = BufWriter::new(file);
         writer.write_all(self.to_xml().as_bytes()).map_err(|e| {
-            PistonError::WriteManifestError(e.to_string())
+            cli::Error::WriteManifestError(e.to_string())
         })?;
 
         Ok(())
@@ -761,7 +762,7 @@ struct KeySet {
 }
 
 impl KeySet {
-    fn new(release: bool, env_vars: &HashMap<String, String>) -> Result<KeySet, PistonError> {
+    fn new(release: bool, env_vars: &HashMap<String, String>) -> Result<KeySet> {
         let default_path = Host::android_keystore(release)?;
 
         let (default_pass, default_alias, default_cn, default_org) = if release {

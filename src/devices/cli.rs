@@ -1,11 +1,29 @@
 use std::collections::HashMap;
-use crate::PistonError;
+use std::fmt;
+use crate::Result;
 use super::Devices;
+
+#[derive(Debug)]
+pub enum Error {
+    ADBDevicesError(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ADBDevicesError(err) => {
+                write!(f, "Error Running 'ADB Devices', check installation and .env path: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub struct Cli;
 
 impl Cli {
-    pub fn list(env_vars: HashMap<String, String>, silent: bool) -> Result<Devices, PistonError> {
+    pub fn list(env_vars: HashMap<String, String>, silent: bool) -> Result<Devices> {
         let devices = Devices::discover(env_vars)?;
         if !devices.android_available { println!("Android installation not found"); }
         if !silent { Self::print_devices(&devices); }

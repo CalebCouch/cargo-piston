@@ -1,9 +1,97 @@
+use std::fmt;
 use std::path::PathBuf;
 use std::thread;
 use std::time::Duration;
 use crate::host;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::{Release, Xcode};
+
+#[derive(Debug)]
+pub enum Error {
+    XcodeSystemVersionInvalid { value: String },
+    XcodeArchitectureUnsupported { architecture: String },
+    XcodeSelectedTooOld { version: [u32; 3], minimum: u32 },
+    XcodeSdkUnavailable { developer: PathBuf, sdk: String, minimum: u32, output: std::process::Output },
+    XcodeIncomplete { developer: PathBuf },
+    XcodeIncompatible { developer: PathBuf },
+    XcodeDiscovery { path: PathBuf, error: Box<dyn std::error::Error> },
+    XcodeCatalogUnavailable { source: Box<ureq::Error> },
+    XcodeSystemTooOld { sdk: String, minimum: [u32; 3] },
+    XcodeReleaseUnavailable { architecture: String, sdk: String },
+    XcodeDestinationExists { path: PathBuf },
+    XcodeArchiveMismatch { version: String, build: String, staging: PathBuf },
+    XcodeInstallMove { destination: PathBuf, staging: PathBuf, source: std::io::Error },
+    XcodeLicenseIncomplete,
+    XcodeAdministratorApprovalIncomplete,
+    XcodeInstallError(String),
+    XcodeBuildError(String),
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::XcodeSystemVersionInvalid { value } => {
+                write!(f, "Cannot read the macOS version: {value:?}.")
+            }
+            Self::XcodeArchitectureUnsupported { architecture } => {
+                write!(f, "Cannot select an Xcode installer for architecture {architecture:?}.")
+            }
+            Self::XcodeSelectedTooOld { version, minimum } => write!(f,
+                "DEVELOPER_DIR explicitly selects Xcode {}.{}.{}; this build requires Xcode \
+                 {minimum} or later. Unset DEVELOPER_DIR for automatic selection.",
+                version[0], version[1], version[2]),
+            Self::XcodeSdkUnavailable { developer, sdk, minimum, output } => write!(f,
+                "Xcode at {} does not provide the required {sdk} SDK (minimum major version {minimum}). \
+                 Install the full Xcode application, or unset DEVELOPER_DIR if it selects an incomplete \
+                 installation.\n{}", developer.display(), String::from_utf8_lossy(&output.stderr)),
+            Self::XcodeIncomplete { developer } => {
+                write!(f, "{} is not a full Xcode installation.", developer.display())
+            }
+            Self::XcodeIncompatible { developer } => {
+                write!(f, "{} is not an Xcode compatible with this macOS.", developer.display())
+            }
+            Self::XcodeDiscovery { path, error } => {
+                write!(f, "Skipping Xcode at {}: {error}", path.display())
+            }
+            Self::XcodeCatalogUnavailable { source } => write!(f,
+                "Cannot load the Xcode Releases catalog: {source}. Existing installations can be \
+                 selected with DEVELOPER_DIR; retry setup when the catalog is available."),
+            Self::XcodeSystemTooOld { sdk, minimum } => write!(f,
+                "No compatible release provides the required {sdk} SDK on this Mac. Update macOS \
+                 to at least {}.{}.{} and rerun this command.", minimum[0], minimum[1], minimum[2]),
+            Self::XcodeReleaseUnavailable { architecture, sdk } => write!(f,
+                "The release catalog has no supported Xcode installer for {architecture} and the \
+                 required {sdk} SDK.\n\n{}",
+                host::Cli::link("Xcode requirements", "https://developer.apple.com/xcode/system-requirements/")),
+            Self::XcodeDestinationExists { path } => write!(f,
+                "{} already exists but was not usable. Move it aside or repair it, then rerun. \
+                 Piston will not replace an existing installation.", path.display()),
+            Self::XcodeArchiveMismatch { version, build, staging } => write!(f,
+                "The archive contains a different Xcode than {version} ({build}). Extracted files \
+                 remain at {}.", staging.display()),
+            Self::XcodeInstallMove { destination, staging, source } => write!(f,
+                "Cannot install Xcode at {}: {source}. Extracted files remain at {}.",
+                destination.display(), staging.display()),
+            Self::XcodeLicenseIncomplete => write!(f, "Xcode license acceptance was not completed."),
+            Self::XcodeAdministratorApprovalIncomplete => {
+                write!(f, "Administrator approval was not completed.")
+            }
+            Self::XcodeInstallError(err) => write!(f, "Xcode Installation not Found: {}", err),
+            Self::XcodeBuildError(err) => write!(f, "Xcode could not complete the operation: {err}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::XcodeInstallMove { source, .. } => Some(source),
+            Self::XcodeCatalogUnavailable { source } => Some(source.as_ref()),
+            Self::XcodeDiscovery { error, .. } => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
@@ -25,13 +113,13 @@ impl Cli {
         eprintln!("Using Xcode at {}", developer.display());
         if !xcode.license_accepted(&developer)? {
             if !host::Cli::interactive() {
-                return Err(PistonError::XcodeBuildError(format!(
+                return Err(Error::XcodeBuildError(format!(
                     "Xcode's license needs your review.\n\n\
                      1. Run this in an interactive terminal:\n\
                           sudo '{}' -license\n\n\
                      2. Review the license, accept it if you agree, then rerun Piston.",
                     developer.join("usr/bin/xcodebuild").display(),
-                )));
+                )).into());
             }
             eprintln!(
                 "\nXcode's license needs your review.\n\n\
@@ -66,14 +154,14 @@ impl Cli {
                 return Ok(path);
             }
             if !host::Cli::interactive() {
-                return Err(PistonError::XcodeInstallError(format!(
+                return Err(Error::XcodeInstallError(format!(
                     "Xcode {} is required.\n\n\
                      1. Download the archive:\n   {}\n\n\
                      2. Set PISTON_XCODE_ARCHIVE=/absolute/path/{filename}\n\
                         and rerun this command.\n\n\
                      Piston will extract the archive and install Xcode.",
                     release.name, host::Cli::link("Download Xcode", &release.url),
-                )));
+                )).into());
             }
             if !instructions_shown {
                 eprintln!(

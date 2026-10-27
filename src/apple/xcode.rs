@@ -3,7 +3,8 @@ use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use crate::PistonError;
+use crate::apple;
+use crate::Result;
 
 pub mod cli;
 pub use cli::Cli;
@@ -17,15 +18,15 @@ impl XcodeSigning {
     pub fn new(team: &str, developer: &Path) -> Self {
         Self { team: team.trim().into(), developer: developer.to_path_buf() }
     }
-    pub fn teams() -> Result<Vec<(String, String)>, PistonError> {
+    pub fn teams() -> Result<Vec<(String, String)>> {
         let output = Command::new("defaults")
             .args(["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"])
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "defaults".into(), source: e })?;
+            .map_err(|e| crate::cli::Error::CommandSpawn { program: "defaults".into(), source: e })?;
         if !output.status.success() {
             let reason = String::from_utf8_lossy(&output.stderr);
             if reason.to_lowercase().contains("does not exist") { return Ok(Vec::new()); }
-            return Err(PistonError::CommandFailed { program: "defaults".into(), output });
+            return Err(crate::cli::Error::CommandFailed { program: "defaults".into(), output }.into());
         }
 
         let accounts = Self::plist_json(&output.stdout)?;
@@ -48,14 +49,14 @@ impl XcodeSigning {
 
     pub fn team(&self) -> &str { &self.team }
 
-    pub fn sign_macos(&self, bundle: &Path, work: &Path, entitlements: &Path, release: bool, external: bool) -> Result<PathBuf, PistonError> {
+    pub fn sign_macos(&self, bundle: &Path, work: &Path, entitlements: &Path, release: bool, external: bool) -> Result<PathBuf> {
         let configuration = if release { "Release" } else { "Debug" };
         let project = self.project(bundle, work, Some(entitlements), configuration)?;
         let name = bundle.file_stem().unwrap().to_str().unwrap();
         let archive = work.join(format!("{name}.xcarchive"));
         if release && archive.exists() {
             fs::remove_dir_all(&archive)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         }
         let mut command = Command::new("xcrun");
         command
@@ -90,19 +91,19 @@ impl XcodeSigning {
             "manageAppVersionAndBuildNumber": false,
         });
         fs::write(&options, serde_json::to_vec(&settings).unwrap())
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         let converted = Command::new("plutil")
             .args(["-convert", "xml1"])
             .arg(&options)
             .output()
-            .map_err(|error| PistonError::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
         if !converted.status.success() {
-            return Err(PistonError::CommandFailed { program: "plutil".into(), output: converted });
+            return Err(crate::cli::Error::CommandFailed { program: "plutil".into(), output: converted }.into());
         }
         let exported = work.join("export");
         if exported.exists() {
             fs::remove_dir_all(&exported)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         }
         let mut command = Command::new("xcrun");
         command
@@ -120,21 +121,21 @@ impl XcodeSigning {
         if app.is_dir() { return Ok(app); }
 
         let packages = fs::read_dir(&exported)
-            .map_err(|error| PistonError::CodesignError(error.to_string()))?
+            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| PistonError::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
         let packages: Vec<_> = packages
             .into_iter()
             .filter(|path| path.extension().is_some_and(|ext| ext == "pkg"))
             .collect();
         let [package] = packages.as_slice() else {
-            return Err(PistonError::SigningExportMissing { path: exported });
+            return Err(cli::Error::SigningExportMissing { path: exported }.into());
         };
         let expanded = work.join("expanded-package");
         if expanded.exists() {
             fs::remove_dir_all(&expanded)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         }
         let mut command = Command::new("pkgutil");
         command.arg("--expand-full").arg(package).arg(&expanded);
@@ -143,12 +144,12 @@ impl XcodeSigning {
         let mut apps = Vec::new();
         while let Some(directory) = directories.pop() {
             for entry in fs::read_dir(directory)
-                .map_err(|error| PistonError::CodesignError(error.to_string()))?
+                .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
             {
-                let entry = entry.map_err(|error| PistonError::CodesignError(error.to_string()))?;
+                let entry = entry.map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
                 if !entry
                     .file_type()
-                    .map_err(|error| PistonError::CodesignError(error.to_string()))?
+                    .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
                     .is_dir()
                 { continue; }
                 if entry.file_name() == std::ffi::OsStr::new(&format!("{name}.app")) {
@@ -159,19 +160,19 @@ impl XcodeSigning {
             }
         }
         if apps.len() != 1 {
-            return Err(PistonError::SigningExportAppCount { count: apps.len() });
+            return Err(cli::Error::SigningExportAppCount { count: apps.len() }.into());
         }
         Ok(apps.remove(0))
     }
 
-    pub fn project(&self, bundle: &Path, work: &Path, entitlements: Option<&Path>, configuration: &str) -> Result<PathBuf, PistonError> {
+    pub fn project(&self, bundle: &Path, work: &Path, entitlements: Option<&Path>, configuration: &str) -> Result<PathBuf> {
         let bundle = fs::canonicalize(bundle).map_err(|e| {
-            PistonError::ReadFile { path: bundle.to_path_buf(), source: e }
+            crate::cli::Error::ReadFile { path: bundle.to_path_buf(), source: e }
         })?;
         let macos = bundle.join("Contents/Info.plist").is_file();
         let plist_path = bundle.join(if macos { "Contents/Info.plist" } else { "Info.plist" });
         let plist = Self::plist_json(&fs::read(&plist_path).map_err(|e| {
-            PistonError::ReadFile { path: plist_path.clone(), source: e }
+            crate::cli::Error::ReadFile { path: plist_path.clone(), source: e }
         })?)?;
         let bundle_id = Self::plist_string(&plist, "CFBundleIdentifier")?;
         let executable = Self::plist_string(&plist, "CFBundleExecutable")?;
@@ -181,7 +182,7 @@ impl XcodeSigning {
             Self::plist_string(&plist, "MinimumOSVersion")?
         };
         let name = bundle.file_stem().and_then(|name| name.to_str()).ok_or_else(|| {
-            PistonError::SigningBundleName { path: bundle.clone() }
+            cli::Error::SigningBundleName { path: bundle.clone() }
         })?;
         let executable_path = if macos {
             bundle.join("Contents/MacOS").join(executable)
@@ -189,18 +190,18 @@ impl XcodeSigning {
             bundle.join(executable)
         };
         if !executable_path.is_file() {
-            return Err(PistonError::SigningExecutableMissing { path: executable_path });
+            return Err(cli::Error::SigningExecutableMissing { path: executable_path }.into());
         }
 
         fs::create_dir_all(&work)
-            .map_err(|e| PistonError::CreateDirAllError { path: work.to_path_buf(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateDirAllError { path: work.to_path_buf(), source: e })?;
         let work = fs::canonicalize(&work).map_err(|e| {
-            PistonError::ReadFile { path: work.to_path_buf(), source: e }
+            crate::cli::Error::ReadFile { path: work.to_path_buf(), source: e }
         })?;
         let project = work.join("Piston.xcodeproj");
         let schemes = project.join("xcshareddata/xcschemes");
         fs::create_dir_all(&schemes)
-            .map_err(|e| PistonError::CreateDirAllError { path: schemes.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateDirAllError { path: schemes.clone(), source: e })?;
 
         let mut settings = json!({
             "ALWAYS_SEARCH_USER_PATHS": "NO",
@@ -231,11 +232,11 @@ impl XcodeSigning {
                 .arg("-archs")
                 .arg(&executable_path)
                 .output()
-                .map_err(|error| PistonError::CodesignError(error.to_string()))?;
+                .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
             if !architectures.status.success() {
-                return Err(PistonError::CommandFailed {
+                return Err(crate::cli::Error::CommandFailed {
                     program: "/usr/bin/lipo".into(), output: architectures,
-                });
+                }.into());
             }
             settings["ARCHS"] = json!(String::from_utf8_lossy(&architectures.stdout).trim());
             settings["SDKROOT"] = json!("macosx");
@@ -248,14 +249,14 @@ impl XcodeSigning {
         if let Some(entitlements) = entitlements {
             settings["CODE_SIGN_ENTITLEMENTS"] =
                 json!(fs::canonicalize(entitlements).map_err(|e| {
-                    PistonError::ReadFile { path: entitlements.to_path_buf(), source: e }
+                    crate::cli::Error::ReadFile { path: entitlements.to_path_buf(), source: e }
                 })?);
         }
 
         let push_enabled = entitlements
             .map(plist::Value::from_file)
             .transpose()
-            .map_err(|source| PistonError::ApplePlistRead {
+            .map_err(|source| apple::cli::Error::ApplePlistRead {
                 path: entitlements.unwrap().to_path_buf(), source,
             })?
             .and_then(|value| {
@@ -343,13 +344,13 @@ impl XcodeSigning {
         });
         let project_path = project.join("project.pbxproj");
         fs::write(&project_path, serde_json::to_vec_pretty(&project_data).unwrap())
-            .map_err(|e| PistonError::CreateFileError { path: project_path.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateFileError { path: project_path.clone(), source: e })?;
         let output =
             Command::new("plutil").args(["-convert", "xml1"]).arg(&project_path).output().map_err(
-                |e| PistonError::CommandSpawn { program: "plutil".into(), source: e },
+                |e| crate::cli::Error::CommandSpawn { program: "plutil".into(), source: e },
             )?;
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: "plutil".into(), output });
+            return Err(crate::cli::Error::CommandFailed { program: "plutil".into(), output }.into());
         }
 
         let scheme_name = name
@@ -370,20 +371,20 @@ impl XcodeSigning {
   <LaunchAction buildConfiguration="{configuration}"/>
   <ArchiveAction buildConfiguration="{configuration}" revealArchiveInOrganizer="NO"/>
 </Scheme>
-"#)).map_err(|e| PistonError::CreateFileError { path: schemes.join("Piston.xcscheme"), source: e })?;
+"#)).map_err(|e| crate::cli::Error::CreateFileError { path: schemes.join("Piston.xcscheme"), source: e })?;
 
         Ok(project)
     }
 
-    pub fn sign(&self, bundle: &Path, work: &Path, udid: &str, entitlements: Option<&Path>) -> Result<PathBuf, PistonError> {
+    pub fn sign(&self, bundle: &Path, work: &Path, udid: &str, entitlements: Option<&Path>) -> Result<PathBuf> {
         let project = self.project(bundle, &work.join("signing"), entitlements, "Debug")?;
         let work = project.parent().unwrap();
         let name = bundle.file_stem().unwrap().to_str().unwrap();
         let log_path = work.join("xcodebuild.log");
         let log = File::create(&log_path)
-            .map_err(|e| PistonError::CreateFileError { path: log_path.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateFileError { path: log_path.clone(), source: e })?;
         let stderr = log.try_clone().map_err(|e| {
-            PistonError::CreateFileError { path: log_path.clone(), source: e }
+            crate::cli::Error::CreateFileError { path: log_path.clone(), source: e }
         })?;
         let derived_data = work.join("DerivedData");
         let status = Command::new("xcrun")
@@ -405,14 +406,14 @@ impl XcodeSigning {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .status()
-            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
+            .map_err(|e| crate::cli::Error::CommandSpawn { program: "xcrun".into(), source: e })?;
         if !status.success() {
             let log = fs::read_to_string(&log_path).unwrap_or_default();
             let (error, needs_account) = self.build_error(&log, &log_path);
             if needs_account {
-                return Err(
-                    error.setup(crate::error::SetupPage::XcodeAccounts(self.developer.clone()))
-                );
+                return Err(crate::cli::Error::SetupRequired {
+                    error, page: crate::cli::SetupPage::XcodeAccounts(self.developer.clone()),
+                }.into());
             }
             return Err(error);
         }
@@ -420,49 +421,49 @@ impl XcodeSigning {
         let signed_bundle =
             derived_data.join("Build/Products/Debug-iphoneos").join(format!("{name}.app"));
         if !signed_bundle.join("embedded.mobileprovision").is_file() {
-            return Err(PistonError::SigningProvisionedAppMissing {
+            return Err(cli::Error::SigningProvisionedAppMissing {
                 bundle: signed_bundle, log: log_path,
-            });
+            }.into());
         }
         let verification = Command::new("codesign")
             .args(["--verify", "--strict"])
             .arg(&signed_bundle)
             .output()
-            .map_err(|error| PistonError::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
         if !verification.status.success() {
-            return Err(PistonError::SigningSignatureInvalid { output: verification, log: log_path });
+            return Err(cli::Error::SigningSignatureInvalid { output: verification, log: log_path }.into());
         }
         Ok(signed_bundle)
     }
 }
 
 impl XcodeSigning {
-    fn run(&self, mut command: Command, log_path: &Path) -> Result<(), PistonError> {
+    fn run(&self, mut command: Command, log_path: &Path) -> Result<()> {
         let log = File::create(log_path)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         let stderr =
-            log.try_clone().map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            log.try_clone().map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
         let status = command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .status()
-            .map_err(|source| PistonError::CommandSpawn {
+            .map_err(|source| crate::cli::Error::CommandSpawn {
                 program: command.get_program().into(), source,
             })?;
         if !status.success() {
             let log = fs::read_to_string(log_path).unwrap_or_default();
             let (error, needs_account) = self.build_error(&log, log_path);
             if needs_account {
-                return Err(
-                    error.setup(crate::error::SetupPage::XcodeAccounts(self.developer.clone()))
-                );
+                return Err(crate::cli::Error::SetupRequired {
+                    error, page: crate::cli::SetupPage::XcodeAccounts(self.developer.clone()),
+                }.into());
             }
             return Err(error);
         }
         Ok(())
     }
 
-    fn build_error(&self, log: &str, log_path: &Path) -> (PistonError, bool) {
+    fn build_error(&self, log: &str, log_path: &Path) -> (Box<dyn std::error::Error>, bool) {
         let lower = log.to_lowercase();
         let errors =
             lower.lines().filter(|line| line.contains("error:")).collect::<Vec<_>>().join("\n");
@@ -472,13 +473,13 @@ impl XcodeSigning {
             || errors.contains("your session has expired. please log in")
             || errors.contains("authentication credentials are missing or invalid")
         {
-            Some((true, PistonError::SigningAccountRejected {
+            Some((true, cli::Error::SigningAccountRejected {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if errors.contains("there are no accounts registered with xcode")
             || errors.contains("no accounts: add a new account in accounts settings")
         {
-            Some((true, PistonError::SigningAccountMissing {
+            Some((true, cli::Error::SigningAccountMissing {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("program license agreement")
@@ -488,7 +489,7 @@ impl XcodeSigning {
                 || lower.contains("agreement needs to be updated")
                 || lower.contains("accept the latest program license agreement"))
         {
-            Some((false, PistonError::SigningAgreementRequired {
+            Some((false, cli::Error::SigningAgreementRequired {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("no account for team")
@@ -498,7 +499,7 @@ impl XcodeSigning {
             || (lower.contains("does not have permission to create")
                 && lower.contains("provisioning profile"))
         {
-            Some((false, PistonError::SigningTeamUnavailable {
+            Some((false, cli::Error::SigningTeamUnavailable {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower
@@ -506,31 +507,31 @@ impl XcodeSigning {
             || lower.contains("bundle identifier is already in use")
             || (lower.contains("an app id with identifier") && lower.contains("is not available"))
         {
-            Some((false, PistonError::SigningBundleUnavailable {
+            Some((false, cli::Error::SigningBundleUnavailable {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("maximum app id limit has been reached") {
-            Some((false, PistonError::SigningAppIdLimit {
+            Some((false, cli::Error::SigningAppIdLimit {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower
             .contains("maximum number of apps for free development profiles has been reached")
         {
-            Some((false, PistonError::SigningFreeAppLimit {
+            Some((false, cli::Error::SigningFreeAppLimit {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("device limit has been reached")
             || (lower.contains("reached the maximum number of") && lower.contains("devices"))
             || (lower.contains("maximum number of registered devices") && lower.contains("reached"))
         {
-            Some((false, PistonError::SigningDeviceLimit {
+            Some((false, cli::Error::SigningDeviceLimit {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("keychain is locked")
             || lower.contains("user interaction is not allowed")
             || lower.contains("errsecinteractionnotallowed")
         {
-            Some((false, PistonError::SigningKeychainLocked {
+            Some((false, cli::Error::SigningKeychainLocked {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("no signing certificate")
@@ -540,11 +541,11 @@ impl XcodeSigning {
                     && line.contains("with a private key was found")
             })
         {
-            Some((false, PistonError::SigningCertificateUnavailable {
+            Some((false, cli::Error::SigningCertificateUnavailable {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if lower.contains("push notifications") || lower.contains("aps-environment") {
-            Some((false, PistonError::SigningPushUnavailable {
+            Some((false, cli::Error::SigningPushUnavailable {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else if (lower.contains("no profiles for ") && lower.contains("were found"))
@@ -552,7 +553,7 @@ impl XcodeSigning {
                 .contains("couldn't find any ios app development provisioning profiles matching")
             || lower.contains("no provisioning profiles found")
         {
-            Some((false, PistonError::SigningProfileUnavailable {
+            Some((false, cli::Error::SigningProfileUnavailable {
                 team: self.team.clone(), log: log_path.to_path_buf(),
             }))
         } else {
@@ -561,11 +562,14 @@ impl XcodeSigning {
         if let Some((needs_account, error)) = guidance {
             let error = if lower.contains("push notifications") || lower.contains("aps-environment")
             {
-                error.setup(crate::error::SetupPage::Url(
-                    "https://developer.apple.com/account/resources/identifiers/list".into(),
-                ))
+                crate::cli::Error::SetupRequired {
+                    error: error.into(),
+                    page: crate::cli::SetupPage::Url(
+                        "https://developer.apple.com/account/resources/identifiers/list".into(),
+                    ),
+                }.into()
             } else {
-                error
+                error.into()
             };
             return (error, needs_account);
         }
@@ -586,35 +590,36 @@ impl XcodeSigning {
         }
         details.reverse();
         (
-            PistonError::SigningBuildFailed { log: log_path.to_path_buf(), details },
+            cli::Error::SigningBuildFailed { log: log_path.to_path_buf(), details }.into(),
             false,
         )
     }
 
-    fn plist_json(data: &[u8]) -> Result<Value, PistonError> {
+    fn plist_json(data: &[u8]) -> Result<Value> {
         let mut command = Command::new("plutil")
             .args(["-convert", "json", "-o", "-", "-"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| PistonError::CommandSpawn { program: "plutil".into(), source: e })?;
+            .map_err(|e| crate::cli::Error::CommandSpawn { program: "plutil".into(), source: e })?;
         command
             .stdin
             .take()
             .unwrap()
             .write_all(data)
-            .map_err(PistonError::ApplePlistInput)?;
-        let output = command.wait_with_output().map_err(PistonError::ApplePlistWait)?;
+            .map_err(apple::cli::Error::ApplePlistInput)?;
+        let output = command.wait_with_output().map_err(apple::cli::Error::ApplePlistWait)?;
         if !output.status.success() {
-            return Err(PistonError::CommandFailed { program: "plutil".into(), output });
+            return Err(crate::cli::Error::CommandFailed { program: "plutil".into(), output }.into());
         }
-        serde_json::from_slice(&output.stdout).map_err(PistonError::ApplePlistJson)
+        serde_json::from_slice(&output.stdout)
+            .map_err(|source| apple::cli::Error::ApplePlistJson(source).into())
     }
 
-    fn plist_string<'a>(plist: &'a Value, key: &str) -> Result<&'a str, PistonError> {
+    fn plist_string<'a>(plist: &'a Value, key: &str) -> Result<&'a str> {
         plist.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| {
-            PistonError::ApplePlistField { key: key.into() }
+            apple::cli::Error::ApplePlistField { key: key.into() }.into()
         })
     }
 }

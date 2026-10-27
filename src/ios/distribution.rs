@@ -2,9 +2,10 @@ use serde_json::json;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::Result;
+use crate::cli::Error;
 use crate::apple::AscApiKey;
 use crate::apple::XcodeSigning;
-use crate::{PistonError, Result};
 use super::application::IOSApplication;
 
 pub mod cli;
@@ -40,7 +41,7 @@ impl<'a> IOSStore<'a> {
         let path = work.join(format!("{name}.xcarchive"));
         if path.exists() {
             fs::remove_dir_all(&path)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFileError(error.to_string()))?;
         }
         let archive = IOSArchive { path, work, developer, team: signing.team().into() };
         let mut command = self.command(&archive);
@@ -58,9 +59,9 @@ impl<'a> IOSStore<'a> {
         if !archive.path.join("Info.plist").is_file()
             || !archive.path.join("Products/Applications").join(format!("{name}.app")).is_dir()
         {
-            return Err(PistonError::IosArchiveMissing {
+            return Err(cli::Error::IosArchiveMissing {
                 path: archive.path.clone(), log: archive.work.join("archive.log"),
-            });
+            }.into());
         }
         self.archive = Some(archive);
         Ok(())
@@ -72,7 +73,9 @@ impl<'a> IOSStore<'a> {
         let output = self.export_archive(archive, "export")?;
         let ipa = output.join(format!("{name}.ipa"));
         if !ipa.is_file() {
-            return Err(PistonError::IosExportMissing { path: ipa, log: archive.work.join("export.log") });
+            return Err(cli::Error::IosExportMissing {
+                path: ipa, log: archive.work.join("export.log"),
+            }.into());
         }
         self.application.verify_store_notifications(&ipa)?;
         Ok(ipa)
@@ -116,17 +119,17 @@ impl IOSStore<'_> {
         });
         let options_path = archive.work.join(format!("{destination}-options.plist"));
         fs::write(&options_path, serde_json::to_vec_pretty(&options).unwrap())
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFileError(error.to_string()))?;
         let output = Command::new("plutil")
             .args(["-convert", "xml1"])
             .arg(&options_path)
             .output()
-            .map_err(|error| PistonError::PlutilConvertError(error.to_string()))?;
+            .map_err(|error| crate::apple::cli::Error::PlutilConvertError(error.to_string()))?;
         IOSApplication::check(output, "plutil")?;
         let output = archive.work.join(destination);
         if output.exists() {
             fs::remove_dir_all(&output)
-                .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFileError(error.to_string()))?;
         }
         let mut command = self.command(archive);
         command
@@ -143,23 +146,26 @@ impl IOSStore<'_> {
 
     fn run(mut command: Command, log_path: &Path) -> Result<()> {
         let log = File::create(log_path)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFileError(error.to_string()))?;
         let stderr = log.try_clone()
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFileError(error.to_string()))?;
         let status = command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr)).status()
-            .map_err(|source| PistonError::CommandLogged {
+            .map_err(|source| Error::CommandLogged {
                 log: log_path.to_path_buf(), diagnostics: String::new(),
-                error: Box::new(PistonError::CommandSpawn { program: "xcodebuild".into(), source }),
+                error: Box::new(Error::CommandSpawn { program: "xcodebuild".into(), source }),
             })?;
         if status.success() { return Ok(()); }
         let output = fs::read_to_string(log_path).unwrap_or_default();
         let lower = output.to_lowercase();
         let push = lower.contains("push notifications") || lower.contains("aps-environment");
-        let error = PistonError::IosDistributionFailed { log: log_path.to_path_buf(), output, status };
+        let error = cli::Error::IosDistributionFailed { log: log_path.to_path_buf(), output, status };
         Err(if push {
-            error.setup(crate::error::SetupPage::Url(
-                "https://developer.apple.com/account/resources/identifiers/list".into(),
-            ))
-        } else { error })
+            Error::SetupRequired {
+                error: error.into(),
+                page: crate::cli::SetupPage::Url(
+                    "https://developer.apple.com/account/resources/identifiers/list".into(),
+                ),
+            }.into()
+        } else { error.into() })
     }
 }

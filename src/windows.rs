@@ -5,8 +5,9 @@ use std::fs::{File, copy, create_dir_all, remove_file, write};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use crate::Result;
+use crate::cli::Error;
 use crate::project::Project;
-use crate::error::PistonError;
 
 pub mod cli;
 pub use cli::Cli;
@@ -24,12 +25,12 @@ pub struct WindowsBuilder {
 }
 
 impl WindowsBuilder {
-    fn new(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<Self, PistonError> {
+    fn new(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<Self> {
         let cargo_path: String = env_vars.get("cargo_path").cloned().unwrap_or("cargo".to_string());
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| PistonError::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParseError(e.to_string()))?;
 
         let embed_resources_ok: bool = if let Some(root_pkg) = metadata.root_package() {
             root_pkg
@@ -57,12 +58,12 @@ impl WindowsBuilder {
         })
     }
 
-    fn pre_build(&self) -> Result<(), PistonError> {
+    fn pre_build(&self) -> Result<()> {
         let cwd = &self.cwd;
         let rel_output = self.output_path.strip_prefix(&self.cwd).unwrap();
         let path = self.output_path.as_path();
         Project::empty_directory(path, &["assets"])?;
-        create_dir_all(path).map_err(|e| PistonError::CreateDirAllError {
+        create_dir_all(path).map_err(|e| Error::CreateDirAllError {
             path: self.output_path.clone(),
             source: e,
         })?;
@@ -70,7 +71,7 @@ impl WindowsBuilder {
         let rc_icon: &PathBuf = &rel_output.join("windows_icon.ico");
         let content = format!("IDI_ICON1 ICON \"{}\"", rc_icon.display());
         write(&rc_path, content.as_bytes())
-            .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFileError(e.to_string()))?;
 
         let assets_src = Path::new(&self.assets);
         let assets_tgt = path.join("assets");
@@ -78,13 +79,13 @@ impl WindowsBuilder {
         if self.embed_resources_ok {
             let icon_output: PathBuf = cwd.join(rc_icon);
             let img_path = Path::new(&self.icon_path);
-            let img = image::open(img_path).map_err(|e| PistonError::OpenImageError {
+            let img = image::open(img_path).map_err(|e| Error::OpenImageError {
                 path: img_path.to_path_buf(),
                 source: e,
             })?;
             let resized = imageops::resize(&img, 64, 64, imageops::FilterType::Lanczos3);
             let resized_img = DynamicImage::ImageRgba8(resized);
-            let file = File::create(&icon_output).map_err(|e| PistonError::CreateFileError {
+            let file = File::create(&icon_output).map_err(|e| Error::CreateFileError {
                 path: icon_output.to_path_buf(),
                 source: e,
             })?;
@@ -92,10 +93,10 @@ impl WindowsBuilder {
             let encoder = image::codecs::ico::IcoEncoder::new(&mut writer);
             encoder
                 .write_image(resized_img.as_bytes(), 64, 64, image::ExtendedColorType::Rgba8)
-                .map_err(PistonError::WriteImageError)?;
+                .map_err(Error::WriteImageError)?;
             let build_path: PathBuf = cwd.join("build.rs");
             if build_path.exists() {
-                remove_file(&build_path).map_err(|e| PistonError::RemoveFileError {
+                remove_file(&build_path).map_err(|e| Error::RemoveFileError {
                     path: build_path.to_path_buf(),
                     source: e,
                 })?;
@@ -115,17 +116,17 @@ impl WindowsBuilder {
                 &icon_output.display()
             );
             let mut build_file = File::create(&build_path).map_err(|e| {
-                PistonError::CreateFileError { path: build_path.to_path_buf(), source: e }
+                Error::CreateFileError { path: build_path.to_path_buf(), source: e }
             })?;
             build_file
                 .write_all(build_content.as_bytes())
-                .map_err(|e| PistonError::WriteFileError(e.to_string()))?;
-            build_file.flush().map_err(|e| PistonError::FileFlushError(e.to_string()))?;
+                .map_err(|e| Error::WriteFileError(e.to_string()))?;
+            build_file.flush().map_err(cli::Error::FileFlushError)?;
         }
         Ok(())
     }
 
-    fn build(&self) -> Result<(), PistonError> {
+    fn build(&self) -> Result<()> {
         let cargo_args = format!(
             "build --target {} {}",
             self.target,
@@ -139,15 +140,15 @@ impl WindowsBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
+            .map_err(|e| Error::CommandSpawn { program: "bash".into(), source: e })?;
         if !builder.status.success() {
-            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
+            return Err(Error::CommandFailed { program: "bash".into(), output: builder }.into());
         }
 
         Ok(())
     }
 
-    fn post_build(&self) -> Result<(), PistonError> {
+    fn post_build(&self) -> Result<()> {
         let binary_path = self
             .cwd
             .join("target")
@@ -155,7 +156,7 @@ impl WindowsBuilder {
             .join(if self.release { "release" } else { "debug" })
             .join(format!("{}.exe", self.app_name));
         let bundle_path = self.output_path.join(format!("{}.exe", self.app_name));
-        copy(&binary_path, &bundle_path).map_err(|e| PistonError::CopyFileError {
+        copy(&binary_path, &bundle_path).map_err(|e| Error::CopyFileError {
             input_path: binary_path.to_path_buf(),
             output_path: bundle_path.to_path_buf(),
             source: e,

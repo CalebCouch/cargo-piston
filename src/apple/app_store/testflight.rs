@@ -1,6 +1,7 @@
 use serde_json::Value;
+use crate::apple::app_store;
 use crate::manifest::Manifest;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::{AppStoreConnect, AscApiKey};
 
 pub mod cli;
@@ -27,13 +28,13 @@ impl TestFlight {
             "/v1/apps",
             &[("filter[bundleId]", bundle_id), ("fields[apps]", "name,bundleId")],
         )?;
-        let app = apps.first().ok_or_else(|| PistonError::StoreAppMissing {
+        let app = apps.first().ok_or_else(|| app_store::cli::Error::StoreAppMissing {
             bundle_id: bundle_id.into(), testflight: true,
         })?;
         let app_id = app["id"]
             .as_str()
             .ok_or_else(|| {
-                PistonError::StoreResponseField { field: "apps.id".into() }
+                app_store::cli::Error::StoreResponseField { field: "apps.id".into() }
             })?
             .to_string();
         let upload = manifest.settings(&["testflight"])?;
@@ -92,7 +93,7 @@ impl TestFlight {
         let mut url = self.url();
         let state = if let Some(build) = self.build()? {
             let id = build["id"].as_str().ok_or_else(|| {
-                PistonError::StoreResponseField { field: "builds.id".into() }
+                app_store::cli::Error::StoreResponseField { field: "builds.id".into() }
             })?;
             url = format!("{url}/{id}");
             if build["attributes"]["expired"].as_bool() == Some(true) {
@@ -100,7 +101,7 @@ impl TestFlight {
             } else {
                 let processing =
                     build["attributes"]["processingState"].as_str().ok_or_else(|| {
-                        PistonError::StoreResponseField { field: "builds.processingState".into() }
+                        app_store::cli::Error::StoreResponseField { field: "builds.processingState".into() }
                     })?;
                 if processing == "VALID" {
                     let details = self.client.request(
@@ -112,7 +113,7 @@ impl TestFlight {
                     details["data"]["attributes"]["internalBuildState"]
                         .as_str()
                         .ok_or_else(|| {
-                            PistonError::StoreResponseField {
+                            app_store::cli::Error::StoreResponseField {
                                 field: "buildBetaDetail.internalBuildState".into(),
                             }
                         })?

@@ -2,8 +2,32 @@ use std::thread;
 use std::time::{Duration, Instant};
 use crate::host;
 use crate::manifest::Manifest;
-use crate::{PistonError, Result};
+use crate::Result;
 use super::{FlightStatus, TestFlight};
+
+#[derive(Debug)]
+pub enum Error {
+    BuildRejected { state: String, version: String, build_number: String, url: String },
+    StateUnknown { state: String, url: String },
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BuildRejected { state, version, build_number, url } => write!(f,
+                "Apple reports {state} for version {version} (build {build_number}).\n\n\
+                 1. Check Apple's build details and resolve any reported issue:\n   {}\n\n\
+                 2. Rerun cargo piston deploy testflight.\n\n\
+                 Piston selects a new build number; package.version stays unchanged.",
+                host::Cli::link("TestFlight build", url)),
+            Self::StateUnknown { state, url } => write!(f,
+                "Apple returned TestFlight state {state}.\n\n\
+                 Check the build before retrying:\n{}", host::Cli::link("TestFlight build", url)),
+        }
+    }
+}
+
+impl std::error::Error for Error {}
 
 pub struct Cli;
 
@@ -71,21 +95,14 @@ impl Cli {
                 }
                 "FAILED" | "INVALID" | "PROCESSING_EXCEPTION" | "EXPIRED" => {
                     flight.record_state(manifest, "failed")?;
-                    return Err(PistonError::Generic(format!(
-                        "Apple reports {state} for version {} (build {}).\n\n\
-                         1. Check Apple's build details and resolve any reported issue:\n   {}\n\n\
-                         2. Rerun cargo piston deploy testflight.\n\n\
-                         Piston selects a new build number; package.version stays unchanged.",
-                        flight.version, flight.build_number, host::Cli::link("TestFlight build", &url),
-                    )));
+                    return Err(Error::BuildRejected {
+                        state, version: flight.version.clone(),
+                        build_number: flight.build_number.clone(), url,
+                    }.into());
                 }
                 "NOT_VISIBLE" | "PROCESSING" | "IN_EXPORT_COMPLIANCE_REVIEW" => {}
                 _ => {
-                    return Err(PistonError::Generic(format!(
-                        "Apple returned TestFlight state {state}.\n\n\
-                         Check the build before retrying:\n{}",
-                        host::Cli::link("TestFlight build", &url),
-                    )));
+                    return Err(Error::StateUnknown { state, url }.into());
                 }
             }
             thread::sleep(Duration::from_secs(15));

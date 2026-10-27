@@ -2,6 +2,7 @@ use toml_edit::{Item, Value};
 use std::collections::HashMap;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use crate::Result;
 use crate::apple::{notifications, xcode};
 use crate::dev::DevelopmentArgs;
 use crate::devices::IOSDevice;
@@ -9,11 +10,133 @@ use crate::host::{self, Host};
 use crate::manifest::Manifest;
 use crate::project::Project;
 use crate::cli::ApplicationArgs;
-use crate::{PistonError, Result};
 use super::{IOSApplication, IOSBuilder};
 use super::IOSRunner;
 use super::development::IOSDevelopment;
 use super::simulator::Simulator;
+
+#[derive(Debug)]
+pub enum Error {
+    NotificationSetupDeviceRequired,
+    DeviceTargetRequired,
+    ExtendedAttributesFailed { output: Vec<u8> },
+    IosDevicesAmbiguous { devices: Vec<(String, String)> },
+    IosDeviceUnavailable { name: String },
+    IosDeviceDisappeared { name: String },
+    IosDeviceLocked { name: String },
+    IosLockStateMissing,
+    IosDeveloperModeDisabled { name: String, version: Option<String> },
+    IosConnectionNotReady { name: String },
+    IosDeviceListMissing,
+    IosSimulatorNotFound { selector: String },
+    IosSimulatorRuntimesMissing,
+    IosSimulatorRuntimeUnavailable,
+    IosSimulatorDeviceTypeMissing,
+    IosMinimumVersion { value: String },
+    IosStoreIdentifierMissing,
+    IosStoreTargetInvalid,
+    IosSimulatorTarget { target: String },
+    IosTargetUnsupported { target: String },
+    IosStoreIconMissing,
+    IosStoreIconInvalid { path: PathBuf },
+    IosResourceInvalid { path: PathBuf },
+    IosResourceConflict { path: PathBuf },
+    IosImageAssetCreate { path: PathBuf, source: std::io::Error },
+    XcrunDevicectlError(String),
+    XcrunInstallError(String),
+    XcrunLaunchError(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotificationSetupDeviceRequired => write!(f,
+                "Notification --setup requires a connected iPhone or iPad."),
+            Self::DeviceTargetRequired =>
+                write!(f, "Select a device target for the connected iPhone."),
+            Self::ExtendedAttributesFailed { output } =>
+                f.write_str(&String::from_utf8_lossy(output)),
+            Self::IosDevicesAmbiguous { devices } => {
+                let devices = devices.iter().map(|(name, id)| format!("{name} ({id})"))
+                    .collect::<Vec<_>>().join(", ");
+                write!(f, "Multiple devices match: {devices}. Select one with --device <name-or-UDID>.")
+            }
+            Self::IosDeviceUnavailable { name } => write!(f, "{name} is not connected."),
+            Self::IosDeviceDisappeared { name } => write!(f,
+                "{name} disconnected during setup. Reconnect and unlock it, then rerun."),
+            Self::IosDeviceLocked { name } => write!(f,
+                "{name} is locked. Unlock it and keep the screen awake, then rerun \
+                cargo piston dev ios in an interactive terminal to retry launch when needed."),
+            Self::IosLockStateMissing => write!(f,
+                "Xcode did not report whether the device is locked. Unlock it and retry."),
+            Self::IosDeveloperModeDisabled { name, version } => {
+                write!(f, "Developer Mode is disabled on {name}")?;
+                if let Some(version) = version { write!(f, " (iOS {version})")?; }
+                write!(f, ". Pairing succeeded.\n\n\
+                    1. Reopen Settings on the phone and scroll to the bottom of Privacy & Security.\n\
+                    2. Turn on Developer Mode and accept the restart.\n\
+                    3. Unlock the phone after restart and confirm Turn On.\n\
+                    4. Rerun the same cargo piston dev command.\n\n\
+                    If the setting is missing, reopen Settings after pairing. If it is still missing, \
+                    select the phone in Xcode's device manager and let Xcode prepare it.\n\
+                    Apple requires this confirmation on the phone.")
+            }
+            Self::IosConnectionNotReady { name } => write!(f,
+                "{name} is attached, but Apple's development connection is not ready. \
+                Keep it unlocked, accept Trust This Computer, and enable \
+                Settings > Privacy & Security > Developer Mode, then rerun."),
+            Self::IosDeviceListMissing => write!(f, "devicectl returned no device list."),
+            Self::IosSimulatorNotFound { selector } => write!(f,
+                "No connected iPhone or available Simulator matches {selector}. \
+                Use --simulator without --device to create one."),
+            Self::IosSimulatorRuntimesMissing => write!(f, "Simulator returned no runtimes."),
+            Self::IosSimulatorRuntimeUnavailable => write!(f,
+                "Xcode installed no usable iOS runtime. Open Xcode Settings > Components."),
+            Self::IosSimulatorDeviceTypeMissing =>
+                write!(f, "Xcode returned no iPhone device types."),
+            Self::IosMinimumVersion { value } => write!(f,
+                "minimum_os {value:?} must be an iOS version of 17.0 or newer \
+                 for CoreDevice development."),
+            Self::IosStoreIdentifierMissing => write!(f,
+                "App Store deployment requires --bundle-id or package.metadata.piston.ios.bundle_id."),
+            Self::IosStoreTargetInvalid => write!(f,
+                "App Store builds require --target aarch64-apple-ios and the release profile."),
+            Self::IosSimulatorTarget { target } =>
+                write!(f, "{target} cannot run in the iOS Simulator."),
+            Self::IosTargetUnsupported { target } =>
+                write!(f, "Unsupported iOS device/simulator target: {target}"),
+            Self::IosStoreIconMissing => write!(f,
+                "Add icon.png, icon.jpg or icon.jpeg beside the selected package Cargo.toml \
+                for App Store deployment."),
+            Self::IosStoreIconInvalid { path } => write!(f,
+                "App Store icon {} must be square, at least 1024 by 1024 pixels, and fully opaque.",
+                path.display()),
+            Self::IosResourceInvalid { path } =>
+                write!(f, "Invalid resource path: {}", path.display()),
+            Self::IosResourceConflict { path } =>
+                write!(f, "Resource replaces an app file: {}", path.display()),
+            Self::IosImageAssetCreate { path, source } => write!(f,
+                "Cannot create image asset {}; resource image names must be unique: {source}",
+                path.display()),
+            Self::XcrunDevicectlError(err) => f.write_str(err),
+            Self::XcrunInstallError(err) => {
+                write!(f, "Error installing app bundle to target device via xcrun: {}", err)
+            }
+            Self::XcrunLaunchError(err) => {
+                write!(f, "Error launching app bundle on target device via xcrun: {}", err)
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::IosImageAssetCreate { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
 
 pub struct Cli;
 
@@ -21,12 +144,39 @@ impl Cli {
     pub fn start(args: DevelopmentArgs) -> Result<()> {
         let application = Self::application(args.application.clone(), false)?;
         let developer = host::Cli::prepare_xcode("iphoneos", 0)?;
-        let mut session = IOSDevelopment::new(application, args.device.clone(), developer);
+        let mut session = IOSDevelopment::new(application, developer);
         let simulator = args.simulator
             || args.application.cargo.target.as_deref().is_some_and(|target| {
                 matches!(target, "aarch64-apple-ios-sim" | "x86_64-apple-ios")
             });
-        let device = if simulator { None } else { session.select_device()? };
+        let device = if simulator { None } else {
+            match session.select_device(args.device.as_deref()) {
+                Ok(device) => device,
+                Err(error) => {
+                    if !host::Cli::interactive() { return Err(error); }
+                    let Some(Error::IosDevicesAmbiguous { devices }) = error.downcast_ref()
+                    else { return Err(error); };
+                    eprintln!("\nSelect an iOS device:\n");
+                    for (index, (name, udid)) in devices.iter().enumerate() {
+                        eprintln!("  {}. {name} ({udid})", index + 1);
+                    }
+                    eprintln!();
+                    loop {
+                        let input = host::Cli::prompt("Device number", "")?;
+                        let selected = input.parse::<usize>().ok()
+                            .and_then(|number| number.checked_sub(1))
+                            .and_then(|index| devices.get(index));
+                        let Some((name, udid)) = selected else {
+                            eprintln!("Enter a number from 1 to {}.", devices.len());
+                            continue;
+                        };
+                        let device = session.select_device(Some(udid))?
+                            .ok_or_else(|| Error::IosDeviceDisappeared { name: name.clone() })?;
+                        break Some(device);
+                    }
+                }
+            }
+        };
         if let Some(mut device) = device {
             if !device.paired {
                 println!(
@@ -38,9 +188,7 @@ impl Cli {
             println!("Connecting to {}", device.name);
             let device = session.connect(&device)?;
             if session.application.sdk() != "iphoneos" {
-                return Err(PistonError::UnsupportedTargetError(
-                    "Select a device target for the connected iPhone.".into(),
-                ));
+                return Err(Error::DeviceTargetRequired.into());
             }
             session.developer = Self::prepare(&session.application, false)?;
             let signing = xcode::Cli::development(session.application.team(), &session.developer)?;
@@ -69,16 +217,17 @@ impl Cli {
             loop {
                 println!("Launching {identifier}. App output follows; press Ctrl-C to stop.");
                 match session.launch(&identifier, &device, &args.app_args) {
-                    Err(PistonError::IosDeviceLocked { name }) if host::Cli::interactive() => {
-                        eprintln!("\n{name} is locked. Unlock it and keep the screen awake.");
+                    Err(error) if host::Cli::interactive()
+                        && matches!(error.downcast_ref::<Error>(),
+                            Some(Error::IosDeviceLocked { .. })) =>
+                    {
+                        eprintln!("\n{} is locked. Unlock it and keep the screen awake.", device.name);
                         eprintln!("The app is installed; Piston will retry launching it.\n");
                         loop {
                             eprint!("Press Enter after unlocking, or q to cancel: ");
-                            io::stderr().flush()
-                                .map_err(|error| PistonError::Generic(error.to_string()))?;
+                            io::stderr().flush()?;
                             let mut input = String::new();
-                            let count = io::stdin().read_line(&mut input)
-                                .map_err(|error| PistonError::Generic(error.to_string()))?;
+                            let count = io::stdin().read_line(&mut input)?;
                             if count == 0 || input.trim().eq_ignore_ascii_case("q") {
                                 println!("Launch cancelled. The app is still installed.");
                                 return Ok(());
@@ -92,9 +241,7 @@ impl Cli {
             }
         } else {
             if args.setup {
-                return Err(PistonError::Generic(
-                    "Notification --setup requires a connected iPhone or iPad.".into(),
-                ));
+                return Err(Error::NotificationSetupDeviceRequired.into());
             }
             println!("Using the iOS Simulator.");
             session.application.simulator_target()?;

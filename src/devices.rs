@@ -1,11 +1,13 @@
 use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
-use crate::error::PistonError;
+use crate::cli::Error as SharedError;
 use crate::host::Host;
+use crate::Result;
 
 pub mod cli;
 pub use cli::Cli;
+use cli::Error;
 
 #[derive(Debug, Clone)]
 pub struct IOSDevice {
@@ -26,7 +28,7 @@ pub struct Devices {
 }
 
 impl Devices {
-    pub fn discover(env_vars: HashMap<String, String>) -> Result<Self, PistonError> {
+    pub fn discover(env_vars: HashMap<String, String>) -> Result<Self> {
         let sdk_path = env_vars.get("sdk_path").map(String::as_str).unwrap_or_default();
         let adb_path = format!("{sdk_path}/platform-tools/adb");
         let android_available = Path::new(&adb_path).exists();
@@ -37,13 +39,13 @@ impl Devices {
         Ok(devices)
     }
 
-    fn android_devices(adb_path: &str) -> Result<Vec<AndroidDevice>, PistonError> {
+    fn android_devices(adb_path: &str) -> Result<Vec<AndroidDevice>> {
         let output = Command::new(adb_path)
             .arg("devices")
             .output()
-            .map_err(|e| PistonError::ADBDevicesError(e.to_string()))?;
+            .map_err(|e| Error::ADBDevicesError(e.to_string()))?;
         let stdout = str::from_utf8(&output.stdout)
-            .map_err(|e| PistonError::ParseUTF8Error(e.to_string()))?;
+            .map_err(|e| SharedError::ParseUTF8Error(e.to_string()))?;
         Ok(stdout
             .lines()
             .skip(1)

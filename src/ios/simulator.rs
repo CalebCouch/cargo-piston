@@ -1,8 +1,9 @@
 use serde_json::Value;
 use std::path::Path;
 use std::process::Command;
+use crate::{cli, Result};
 use crate::project::Project;
-use crate::{PistonError, Result};
+use super::cli::Error;
 use super::application::IOSApplication;
 
 pub struct Simulator {
@@ -61,11 +62,11 @@ impl Simulator {
         });
         if let Some((_, device)) = devices.pop() { return Ok(device); }
         if let Some(selector) = selector {
-            return Err(PistonError::IosSimulatorNotFound { selector: selector.into() });
+            return Err(Error::IosSimulatorNotFound { selector: selector.into() }.into());
         }
         let runtimes = listing["runtimes"]
             .as_array()
-            .ok_or(PistonError::IosSimulatorRuntimesMissing)?;
+            .ok_or(Error::IosSimulatorRuntimesMissing)?;
         let runtime = runtimes
             .iter()
             .filter(|runtime| {
@@ -81,7 +82,7 @@ impl Simulator {
                     .collect::<Vec<_>>()
             })
             .and_then(|runtime| runtime["identifier"].as_str())
-            .ok_or(PistonError::IosSimulatorRuntimeUnavailable)?;
+            .ok_or(Error::IosSimulatorRuntimeUnavailable)?;
         let device_type = listing["devicetypes"]
             .as_array()
             .into_iter()
@@ -89,7 +90,7 @@ impl Simulator {
             .rev()
             .find(|value| value["productFamily"] == "iPhone")
             .and_then(|value| value["identifier"].as_str())
-            .ok_or(PistonError::IosSimulatorDeviceTypeMissing)?;
+            .ok_or(Error::IosSimulatorDeviceTypeMissing)?;
         let output = Project::output(
             IOSApplication::command(developer, "simctl").args([
                 "create",
@@ -155,6 +156,6 @@ impl Simulator {
             IOSApplication::command(developer, "simctl").args(["list", "--json"]),
         )?;
         serde_json::from_slice(&output)
-            .map_err(|error| PistonError::IntoJSONError(error.to_string()))
+            .map_err(|error| cli::Error::IntoJSONError(error.to_string()).into())
     }
 }

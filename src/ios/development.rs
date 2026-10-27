@@ -2,7 +2,8 @@ use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use crate::{PistonError, Result};
+use crate::{cli, Result};
+use super::cli::Error;
 use super::application::IOSApplication;
 
 pub struct IOSDevice {
@@ -47,13 +48,12 @@ impl IOSDevice {
 
 pub struct IOSDevelopment {
     pub application: IOSApplication,
-    device: Option<String>,
     pub developer: PathBuf,
 }
 
 impl IOSDevelopment {
-    pub fn new(application: IOSApplication, device: Option<String>, developer: PathBuf) -> Self {
-        Self { application, device, developer }
+    pub fn new(application: IOSApplication, developer: PathBuf) -> Self {
+        Self { application, developer }
     }
 
     pub fn install(&self, bundle: &std::path::Path, device: &IOSDevice) -> Result<()> {
@@ -63,14 +63,14 @@ impl IOSDevelopment {
             .arg(bundle)
             .arg("--quiet")
             .output()
-            .map_err(|error| PistonError::XcrunInstallError(error.to_string()))?;
+            .map_err(|error| Error::XcrunInstallError(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         Ok(())
     }
 
     pub fn launch(&self, identifier: &str, device: &IOSDevice, arguments: &[String]) -> Result<()> {
         let diagnostics = tempfile::tempdir()
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
         let lock_state = diagnostics.path().join("lock-state.json");
         let output = self.command("devicectl")
             .args([
@@ -78,15 +78,15 @@ impl IOSDevelopment {
                 "--quiet", "--timeout", "10", "--json-output",
             ])
             .arg(&lock_state).output()
-            .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         let contents = fs::read(&lock_state)
-            .map_err(|source| PistonError::ReadFile { path: lock_state, source })?;
+            .map_err(|source| cli::Error::ReadFile { path: lock_state, source })?;
         let document: Value = serde_json::from_slice(&contents)
-            .map_err(|error| PistonError::IntoJSONError(error.to_string()))?;
+            .map_err(|error| cli::Error::IntoJSONError(error.to_string()))?;
         let locked = document.pointer("/result/passcodeRequired").and_then(Value::as_bool)
-            .ok_or(PistonError::IosLockStateMissing)?;
-        if locked { return Err(PistonError::IosDeviceLocked { name: device.name.clone() }); }
+            .ok_or(Error::IosLockStateMissing)?;
+        if locked { return Err(Error::IosDeviceLocked { name: device.name.clone() }.into()); }
 
         let launch_result = diagnostics.path().join("launch.json");
         let status = self
@@ -96,7 +96,7 @@ impl IOSDevelopment {
                 "--terminate-existing", "--console", "--json-output",
             ])
             .arg(&launch_result).arg(identifier).arg("--").args(arguments).status()
-            .map_err(|error| PistonError::XcrunLaunchError(error.to_string()))?;
+            .map_err(|error| Error::XcrunLaunchError(error.to_string()))?;
         if status.success() { return Ok(()); }
         if status.code() == Some(1) {
             let document = fs::read(&launch_result).ok()
@@ -107,23 +107,19 @@ impl IOSDevelopment {
                     == Some("FBSOpenApplicationErrorDomain")
                     && cause.get("code").and_then(Value::as_u64) == Some(7)
                 {
-                    return Err(PistonError::IosDeviceLocked { name: device.name.clone() });
+                    return Err(Error::IosDeviceLocked { name: device.name.clone() }.into());
                 }
                 error = cause.pointer("/userInfo/NSUnderlyingError/error");
             }
         }
-        Err(PistonError::CommandStatus { program: "devicectl".into(), status })
+        Err(cli::Error::CommandStatus { program: "devicectl".into(), status }.into())
     }
-}
 
-impl IOSDevelopment {
-    fn command(&self, tool: &str) -> Command { IOSApplication::command(&self.developer, tool) }
-
-    pub fn select_device(&self) -> Result<Option<IOSDevice>> {
+    pub fn select_device(&self, selector: Option<&str>) -> Result<Option<IOSDevice>> {
         let mut devices = self.devices()?;
-        if let Some(selector) = &self.device {
+        if let Some(selector) = selector {
             devices.retain(|device| {
-                &device.id == selector || &device.udid == selector || &device.name == selector
+                device.id == selector || device.udid == selector || device.name == selector
             });
         } else {
             devices.retain(|device| device.available);
@@ -132,11 +128,11 @@ impl IOSDevelopment {
         if devices.is_empty() { return Ok(None); }
         if devices.len() > 1 {
             let devices = devices.into_iter().map(|device| (device.name, device.udid)).collect();
-            return Err(PistonError::IosDevicesAmbiguous { devices });
+            return Err(Error::IosDevicesAmbiguous { devices }.into());
         }
         let device = devices.remove(0);
         if !device.available {
-            return Err(PistonError::IosDeviceUnavailable { name: device.name });
+            return Err(Error::IosDeviceUnavailable { name: device.name }.into());
         }
         Ok(Some(device))
     }
@@ -147,10 +143,10 @@ impl IOSDevelopment {
             .args(["manage", "pair", "--device", &device.id, "--timeout", "60", "--json-output"])
             .arg(self.application.work().join("pairing.json"))
             .output()
-            .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         let device = self.devices()?.into_iter().find(|current| current.udid == device.udid)
-            .ok_or_else(|| PistonError::IosDeviceDisappeared { name: device.name.clone() })?;
+            .ok_or_else(|| Error::IosDeviceDisappeared { name: device.name.clone() })?;
         Ok(device)
     }
 
@@ -169,28 +165,33 @@ impl IOSDevelopment {
             ])
             .arg(self.application.work().join("selected-device.json"))
             .output()
-            .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         for attempt in 0..5 {
             let current = self
                 .devices()?
                 .into_iter()
                 .find(|current| current.udid == device.udid)
-                .ok_or_else(|| PistonError::IosDeviceDisappeared { name: device.name.clone() })?;
+                .ok_or_else(|| Error::IosDeviceDisappeared { name: device.name.clone() })?;
             if current.developer_mode.as_deref() == Some("disabled") {
-                return Err(PistonError::IosDeveloperModeDisabled {
+                return Err(Error::IosDeveloperModeDisabled {
                     name: current.name, version: current.os_version,
-                });
+                }.into());
             }
             if current.paired && current.connected { return Ok(current); }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             } else {
-                return Err(PistonError::IosConnectionNotReady { name: current.name });
+                return Err(Error::IosConnectionNotReady { name: current.name }.into());
             }
         }
         unreachable!()
     }
+
+}
+
+impl IOSDevelopment {
+    fn command(&self, tool: &str) -> Command { IOSApplication::command(&self.developer, tool) }
 
     fn devices(&self) -> Result<Vec<IOSDevice>> {
         let path = self.application.work().join("devices.json");
@@ -199,13 +200,13 @@ impl IOSDevelopment {
             .args(["list", "devices", "--timeout", "20", "--json-output"])
             .arg(&path)
             .output()
-            .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
-        let contents = fs::read(&path).map_err(|error| PistonError::Generic(error.to_string()))?;
+        let contents = fs::read(&path)?;
         let document: Value = serde_json::from_slice(&contents)
-            .map_err(|error| PistonError::IntoJSONError(error.to_string()))?;
+            .map_err(|error| cli::Error::IntoJSONError(error.to_string()))?;
         let values = document.pointer("/result/devices").and_then(Value::as_array)
-            .ok_or(PistonError::IosDeviceListMissing)?;
+            .ok_or(Error::IosDeviceListMissing)?;
         Ok(values.iter().filter_map(IOSDevice::read).collect())
     }
 }
