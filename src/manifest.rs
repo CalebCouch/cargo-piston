@@ -13,8 +13,8 @@ pub struct Manifest {
 
 impl Manifest {
     pub fn new(path: &Path) -> Result<Self> {
-        let path = fs::canonicalize(path).map_err(|error| {
-            PistonError::CargoParseError(format!("Cannot open {}: {error}", path.display(),))
+        let path = fs::canonicalize(path).map_err(|source| PistonError::ReadFile {
+            path: path.to_path_buf(), source,
         })?;
         Ok(Self { path })
     }
@@ -25,13 +25,7 @@ impl Manifest {
         let (_, document) = self.read()?;
         let mut item = document.as_item();
         for name in ["package", "metadata", "piston"].iter().chain(section) {
-            let table = item.as_table_like().ok_or_else(|| {
-                PistonError::CargoParseError(format!(
-                    "Expected a table for package.metadata.piston.{} in {}.",
-                    section.join("."),
-                    self.path.display(),
-                ))
-            })?;
+            let Some(table) = item.as_table_like() else { return Ok(None); };
             let Some(next) = table.get(name) else { return Ok(None); };
             item = next;
         }
@@ -40,52 +34,30 @@ impl Manifest {
 
     pub fn settings(&self, section: &[&str]) -> Result<HashMap<String, String>> {
         let Some(item) = self.setting(section)? else { return Ok(HashMap::new()); };
-        let table = item.as_table_like().ok_or_else(|| {
-            PistonError::CargoParseError(format!(
-                "Expected a table for package.metadata.piston.{} in {}.",
-                section.join("."),
-                self.path.display(),
-            ))
-        })?;
-        table
-            .iter()
-            .map(|(name, item)| {
-                let value = item.as_str().ok_or_else(|| {
-                    PistonError::CargoParseError(format!(
-                        "package.metadata.piston.{}.{name} must be a string in {}.",
-                        section.join("."),
-                        self.path.display(),
-                    ))
-                })?;
-                Ok((name.into(), value.into()))
-            })
-            .collect()
+        let Some(table) = item.as_table_like() else { return Ok(HashMap::new()); };
+        Ok(table.iter().filter_map(|(name, item)| {
+            item.as_str().map(|value| (name.into(), value.into()))
+        }).collect())
     }
 
     pub fn save<T: Clone + Into<Value>>(&self, section: &[&str], settings: &[(&str, T)]) -> Result<()> {
         let (original, mut document) = self.read()?;
         let mut item = document.as_item_mut();
-        for name in ["package", "metadata", "piston"].iter().chain(section) {
-            let table = item.as_table_like_mut().ok_or_else(|| {
-                PistonError::CargoParseError(format!(
-                    "Expected a table for package.metadata.piston.{} in {}.",
-                    section.join("."),
-                    self.path.display(),
-                ))
+        for (index, name) in ["package", "metadata", "piston"].iter().chain(section).enumerate() {
+            let table = item.as_table_like_mut().ok_or_else(|| PistonError::ManifestTableRequired {
+                path: self.path.clone(), section: section.join("."),
             })?;
-            if !table.contains_key(name) {
+            if !table.contains_key(name)
+                || (index >= 2 && table.get(name).unwrap().as_table_like().is_none())
+            {
                 let mut child = Table::new();
                 child.set_implicit(true);
                 table.insert(name, Item::Table(child));
             }
             item = table.get_mut(name).unwrap();
         }
-        let table = item.as_table_like_mut().ok_or_else(|| {
-            PistonError::CargoParseError(format!(
-                "Expected a table for package.metadata.piston.{} in {}.",
-                section.join("."),
-                self.path.display(),
-            ))
+        let table = item.as_table_like_mut().ok_or_else(|| PistonError::ManifestTableRequired {
+            path: self.path.clone(), section: section.join("."),
         })?;
         for (name, setting) in settings {
             let existing = table.get(name);
@@ -104,51 +76,61 @@ impl Manifest {
             }
             table.insert(name, replacement);
         }
-        let updated = document.to_string();
+        self.write(&original, &document.to_string())
+    }
+
+    pub fn remove(&self, section: &[&str], name: &str) -> Result<()> {
+        let (original, mut document) = self.read()?;
+        let mut item = document.as_item_mut();
+        for name in ["package", "metadata", "piston"].iter().chain(section) {
+            let Some(next) = item.as_table_like_mut().and_then(|table| table.get_mut(name))
+            else { return Ok(()); };
+            item = next;
+        }
+        let Some(table) = item.as_table_like_mut() else { return Ok(()); };
+        if table.remove(name).is_none() { return Ok(()); }
+        self.write(&original, &document.to_string())
+    }
+
+    fn write(&self, original: &str, updated: &str) -> Result<()> {
         if updated == original { return Ok(()); }
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let temporary =
             self.path.with_file_name(format!(".Cargo.toml.piston-{}-{stamp}", std::process::id()));
-        let result = (|| -> std::io::Result<()> {
-            let permissions = fs::metadata(&self.path)?.permissions();
+        let result = (|| -> Result<()> {
+            let permissions = fs::metadata(&self.path).map_err(|source| PistonError::FileMetadata {
+                path: self.path.clone(), source,
+            })?.permissions();
             if permissions.readonly() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::PermissionDenied,
-                    "Cargo.toml is read-only",
-                ));
+                return Err(PistonError::ManifestReadOnly { path: self.path.clone() });
             }
-            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)?;
-            fs::set_permissions(&temporary, permissions)?;
-            file.write_all(updated.as_bytes())?;
-            file.sync_all()?;
-            if fs::read_to_string(&self.path)? != original {
-                return Err(std::io::Error::other(
-                    "Cargo.toml changed during setup; rerun to save settings",
-                ));
+            let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })?;
+            fs::set_permissions(&temporary, permissions)
+                .and_then(|_| file.write_all(updated.as_bytes()))
+                .and_then(|_| file.sync_all())
+                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })?;
+            let current = fs::read_to_string(&self.path)
+                .map_err(|source| PistonError::ReadFile { path: self.path.clone(), source })?;
+            if current != original {
+                return Err(PistonError::ManifestChanged { path: self.path.clone() });
             }
             fs::rename(&temporary, &self.path)
+                .map_err(|source| PistonError::ManifestWrite { path: self.path.clone(), source })
         })();
         if result.is_err() { let _ = fs::remove_file(&temporary); }
-        result.map_err(|error| {
-            PistonError::WriteFileError(format!(
-                "Cannot save Piston settings in {}: {error}",
-                self.path.display(),
-            ))
-        })
+        result
     }
 
     fn read(&self) -> Result<(String, DocumentMut)> {
-        let contents = fs::read_to_string(&self.path).map_err(|error| {
-            PistonError::CargoParseError(format!("Cannot read {}: {error}", self.path.display()))
+        let contents = fs::read_to_string(&self.path).map_err(|source| PistonError::ReadFile {
+            path: self.path.clone(), source,
         })?;
-        let document = contents.parse::<DocumentMut>().map_err(|error| {
-            PistonError::CargoParseError(format!("Invalid {}: {error}", self.path.display()))
+        let document = contents.parse::<DocumentMut>().map_err(|source| PistonError::ManifestParse {
+            path: self.path.clone(), source,
         })?;
         if document.get("package").and_then(Item::as_table_like).is_none() {
-            return Err(PistonError::CargoParseError(format!(
-                "{} has no application package. Select a package with --package.",
-                self.path.display(),
-            )));
+            return Err(PistonError::ManifestPackageMissing { path: self.path.clone() });
         }
         Ok((contents, document))
     }

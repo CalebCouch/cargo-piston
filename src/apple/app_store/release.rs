@@ -9,6 +9,7 @@ use super::artwork::{ScreenshotFamily, StoreScreenshot};
 use super::{AppStoreConnect, AscApiKey};
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct AppStoreRelease {
     client: AppStoreConnect,
@@ -37,13 +38,8 @@ impl AppStoreRelease {
             "/v1/apps",
             &[("filter[bundleId]", bundle_id), ("fields[apps]", "name,bundleId,primaryLocale")],
         )?;
-        let app = apps.first().ok_or_else(|| {
-            PistonError::Generic(format!(
-                "No App Store Connect app is accessible for {bundle_id}. Open \
-             https://appstoreconnect.apple.com/apps, choose + > New App, select this bundle ID, \
-             and set its name, primary language, and SKU. Then rerun cargo piston deploy. \
-             If it already exists, check that the API key belongs to the correct team.",
-            ))
+        let app = apps.first().ok_or_else(|| PistonError::StoreAppMissing {
+            bundle_id: bundle_id.into(), testflight: false,
         })?;
         release.app_id = Self::string(app, "id")?;
         release.locale = Self::string(&app["attributes"], "primaryLocale")?;
@@ -71,7 +67,7 @@ impl AppStoreRelease {
             .client
             .list("/v1/appAssetLibraryRefData", &[("filter[features]", "APP_STORE_VERSIONS")])?;
         let attributes = catalog.first().map(|entry| &entry["attributes"]).ok_or_else(|| {
-            PistonError::Generic("Apple returned an empty asset specification catalog.".into())
+            PistonError::StoreCatalogEmpty
         })?;
         release.groups = ScreenshotGroup::read(attributes)?;
         Ok(release)
@@ -93,11 +89,9 @@ impl AppStoreRelease {
     }
 
     pub fn validate(&self, screenshots: &[StoreScreenshot]) -> Result<Vec<String>, PistonError> {
-        let mut warnings = Vec::new();
+        let mut preserved_groups = Vec::new();
         if screenshots.is_empty() {
-            return Err(PistonError::Generic(
-                "Add at least one iPhone screenshot before deploying.".into(),
-            ));
+            return Err(PistonError::StoreScreenshotsMissing);
         }
         let existing = if let Some(localization) = &self.localization_id {
             self.client.list(
@@ -122,39 +116,27 @@ impl AppStoreRelease {
                     && self.groups.iter().any(|other| other.id == id && other.family == family)
                 { preserved.push(id); }
             }
-            if !preserved.is_empty() {
-                warnings.push(format!("Keeping existing screenshot groups {}. These can override Apple's scaled \
-                    screenshots for those displays; review them in App Store Connect's Media Manager.",
-                    preserved.join(", ")));
-            }
+            preserved_groups.extend(preserved.into_iter().map(str::to_owned));
             if images.len() > group.max_count {
-                return Err(PistonError::Generic(format!(
-                    "{} has {} screenshots; Apple allows at most {}. Remove screenshots and rerun.",
-                    group.id,
-                    images.len(),
-                    group.max_count,
-                )));
+                return Err(PistonError::StoreScreenshotGroupCount {
+                    group: group.id.clone(), count: images.len(), maximum: group.max_count,
+                });
             }
             for image in images {
                 let size = fs::metadata(image.path())
                     .map_err(|error| {
-                        PistonError::Generic(format!(
-                            "Cannot read prepared screenshot {}: {error}",
-                            image.path().display(),
-                        ))
+                        PistonError::ReadFile { path: image.path().into(), source: error }
                     })?
                     .len();
                 let spec = group.specs.iter().find(|spec| spec.accepts(image)).unwrap();
                 if size == 0 || size > spec.max_file_size {
-                    return Err(PistonError::Generic(format!(
-                        "{} is {size} bytes; Apple requires a nonempty image of at most {} bytes.",
-                        image.source().display(),
-                        spec.max_file_size,
-                    )));
+                    return Err(PistonError::StoreScreenshotFileSize {
+                        path: image.source().into(), size, maximum: spec.max_file_size,
+                    });
                 }
             }
         }
-        Ok(warnings)
+        Ok(preserved_groups)
     }
 
     fn commit(&self, staged: &[(String, Vec<String>)]) -> Result<(), PistonError> {
@@ -171,20 +153,11 @@ impl AppStoreRelease {
                     let restored = self
                         .placements(group)
                         .and_then(|current| self.sync_group(group, &images, &current, original));
-                    if let Err(error) = restored { recovery.push(format!("{group}: {error}")); }
+                    if let Err(error) = restored { recovery.push((group.clone(), error)); }
                 }
-                let status = if recovery.is_empty() {
-                    "Previous screenshot placements and order were restored.".into()
-                } else {
-                    format!(
-                        "Could not fully restore previous placements: {}. Open the version's \
-                        Media Manager in App Store Connect and check the order before retrying.",
-                        recovery.join("; ")
-                    )
-                };
-                return Err(PistonError::Generic(format!(
-                    "Screenshot synchronization failed: {error}\n{status}\nOriginal image assets remain in Asset Library.",
-                )));
+                return Err(PistonError::StoreScreenshotSync {
+                    source: Box::new(error), recovery,
+                });
             }
         }
         Ok(())
@@ -198,21 +171,10 @@ impl AppStoreRelease {
                 images.iter().all(|image| group.specs.iter().any(|spec| spec.accepts(image)))
             })
             .max_by(|left, right| left.display_size.total_cmp(&right.display_size))
-            .ok_or_else(|| {
-                PistonError::Generic(format!(
-                    "These screenshots do not fit one Apple device display group: {}. Capture this \
-                 device family's screenshots at the same supported resolution, then rerun.",
-                    images
-                        .iter()
-                        .map(|image| format!(
-                            "{} ({}x{})",
-                            image.source().display(),
-                            image.width(),
-                            image.height()
-                        ))
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                ))
+            .ok_or_else(|| PistonError::StoreScreenshotGroupMismatch {
+                images: images.iter().map(|image| {
+                    (image.source().into(), image.width(), image.height())
+                }).collect(),
             })
     }
 
@@ -226,11 +188,9 @@ impl AppStoreRelease {
                 | "METADATA_REJECTED"
                 | "DEVELOPER_REJECTED"
         ) { return Ok(()); }
-        Err(PistonError::Generic(format!(
-            "App Store version {} is {state}, so Apple does not allow screenshot changes. \
-             Resolve its review state in App Store Connect, or increase package.version in Cargo.toml for a new release.",
-            version["attributes"]["versionString"].as_str().unwrap_or(""),
-        )))
+        Err(PistonError::StoreVersionNotEditable {
+            version: version["attributes"]["versionString"].as_str().unwrap_or("").into(), state,
+        })
     }
 
     fn find_localization(&self) -> Result<Option<String>, PistonError> {
@@ -280,7 +240,7 @@ impl AppStoreRelease {
 
     fn upload_image(&self, image: &StoreScreenshot, group: &ScreenshotGroup) -> Result<String, PistonError> {
         let bytes = fs::read(image.path()).map_err(|error| {
-            PistonError::Generic(format!("Cannot read {}: {error}", image.path().display(),))
+            PistonError::ReadFile { path: image.path().into(), source: error }
         })?;
         let reference = format!("piston-{:x}", Sha256::digest(&bytes));
         let existing = self.client.list(
@@ -341,11 +301,7 @@ impl AppStoreRelease {
                 asset = self.reserve_image(image, bytes.len(), &reference)?;
             }
         }
-        Err(PistonError::Generic(
-            "Apple rejected freshly issued screenshot upload URLs. \
-            Check your network or proxy and retry later. Existing placements are unchanged."
-                .into(),
-        ))
+        Err(PistonError::StoreUploadUrlsRejected)
     }
 
     fn reserve_image(&self, image: &StoreScreenshot, size: usize, reference: &str) -> Result<Value, PistonError> {
@@ -359,26 +315,20 @@ impl AppStoreRelease {
 
     fn transfer(&self, operations: &Value, bytes: &[u8], image_id: &str) -> Result<bool, PistonError> {
         let operations = operations.as_array().ok_or_else(|| {
-            PistonError::Generic(format!(
-                "Apple supplied no upload operations for image {image_id}."
-            ))
+            PistonError::StoreUploadOperationsMissing { image_id: image_id.into() }
         })?;
         let mut parts = Vec::new();
         for operation in operations {
             let offset = operation["offset"].as_u64();
             let length = operation["length"].as_u64();
             let Some((offset, length)) = offset.zip(length) else {
-                return Err(PistonError::Generic(
-                    "Apple returned an invalid upload byte range.".into(),
-                ));
+                return Err(PistonError::StoreUploadRangeInvalid);
             };
             let end = offset
                 .checked_add(length)
                 .filter(|end| *end <= bytes.len() as u64)
                 .ok_or_else(|| {
-                    PistonError::Generic(
-                        "Apple's upload byte range exceeds the screenshot size.".into(),
-                    )
+                    PistonError::StoreUploadRangeTooLarge
                 })?;
             parts.push((offset as usize, end as usize, operation));
         }
@@ -386,32 +336,24 @@ impl AppStoreRelease {
         let mut expected = 0;
         for (start, end, _) in &parts {
             if *start != expected || end <= start {
-                return Err(PistonError::Generic(
-                    "Apple's upload ranges overlap or leave a gap.".into(),
-                ));
+                return Err(PistonError::StoreUploadRangeDiscontinuous);
             }
             expected = *end;
         }
         if expected != bytes.len() {
-            return Err(PistonError::Generic(
-                "Apple's upload ranges do not cover the screenshot.".into(),
-            ));
+            return Err(PistonError::StoreUploadRangeIncomplete);
         }
         for (start, end, operation) in parts {
             let method = Self::string(operation, "method")?;
             let url = Self::string(operation, "url")?;
             if !url.starts_with("https://") {
-                return Err(PistonError::Generic(
-                    "Apple returned an insecure asset upload URL.".into(),
-                ));
+                return Err(PistonError::StoreUploadInsecureUrl);
             }
             let mut request = self.client.http.request(&method, &url);
             for header in operation["requestHeaders"].as_array().into_iter().flatten() {
                 let name = Self::string(header, "name")?;
                 if name.eq_ignore_ascii_case("authorization") {
-                    return Err(PistonError::Generic(
-                        "Unexpected authorization header in asset upload instructions.".into(),
-                    ));
+                    return Err(PistonError::StoreUploadAuthorization);
                 }
                 request = request.set(&name, &Self::string(header, "value")?);
             }
@@ -419,14 +361,13 @@ impl AppStoreRelease {
                 Ok(_) => {}
                 Err(ureq::Error::Status(403, _)) => return Ok(false),
                 Err(error) => {
-                    let reason = match error {
-                        ureq::Error::Status(status, _) => format!("HTTP {status}"),
-                        ureq::Error::Transport(_) => "network connection or timeout".into(),
+                    let status = match error {
+                        ureq::Error::Status(status, _) => Some(status),
+                        ureq::Error::Transport(_) => None,
                     };
-                    return Err(PistonError::Generic(format!(
-                        "Screenshot {image_id} upload failed ({reason}). Check your network and rerun \
-                         cargo piston deploy to resume. Existing screenshot placements are unchanged.",
-                    )));
+                    return Err(PistonError::StoreScreenshotUpload {
+                        image_id: image_id.into(), status,
+                    });
                 }
             }
         }
@@ -448,10 +389,9 @@ impl AppStoreRelease {
                 "PREPARE_FOR_SUBMISSION" | "APPROVED" => {
                     let spec = Self::string(attributes, "specId")?;
                     if !group.specs.iter().any(|candidate| candidate.id == spec) {
-                        return Err(PistonError::Generic(format!(
-                            "Apple processed image {id} as specification {spec}, incompatible with {}.",
-                            group.id,
-                        )));
+                        return Err(PistonError::StoreImageSpecificationMismatch {
+                            image_id: id.into(), group: group.id.clone(), spec,
+                        });
                     }
                     return Ok(id.into());
                 }
@@ -459,16 +399,12 @@ impl AppStoreRelease {
                     thread::sleep(Duration::from_secs(2))
                 }
                 "UPLOAD_COMPLETE" => {
-                    return Err(PistonError::Generic(format!(
-                        "Apple is still processing screenshot {id}. Rerun cargo piston deploy later; \
-                     it will reuse the uploaded image. Existing screenshot placements are unchanged.",
-                    )));
+                    return Err(PistonError::StoreImageProcessingTimeout { image_id: id.into() });
                 }
                 _ => {
-                    return Err(PistonError::Generic(format!(
-                        "Apple image {id} is {state}: {}. Check this image in App Store Connect's Asset Library.",
-                        attributes["stateDetails"],
-                    )));
+                    return Err(PistonError::StoreImageRejected {
+                        image_id: id.into(), state, details: attributes["stateDetails"].clone(),
+                    });
                 }
             }
         }
@@ -566,9 +502,7 @@ impl AppStoreRelease {
         if !actual.iter().map(|placement| &placement.id).eq(ordered.iter())
             || !actual.iter().filter_map(|placement| placement.image.as_ref()).eq(images.iter())
         {
-            return Err(PistonError::Generic(format!(
-                "Apple returned a different screenshot order for {group}."
-            )));
+            return Err(PistonError::StoreScreenshotOrder { group: group.into() });
         }
         Ok(())
     }
@@ -578,7 +512,7 @@ impl AppStoreRelease {
             .as_str()
             .filter(|value| !value.is_empty())
             .map(str::to_owned)
-            .ok_or_else(|| PistonError::Generic(format!("Apple's response is missing {key}.")))
+            .ok_or_else(|| PistonError::StoreResponseField { field: key.into() })
     }
 }
 
@@ -610,23 +544,19 @@ impl ScreenshotGroup {
             .into_iter()
             .flatten()
             .find(|feature| feature["featureId"] == "APP_STORE_VERSIONS")
-            .ok_or_else(|| {
-                PistonError::Generic(
-                    "Apple's asset catalog has no App Store version feature.".into(),
-                )
-            })?;
+            .ok_or(PistonError::StoreCatalogFeatureMissing)?;
         let policy = feature["placementPolicies"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|policy| policy["placementType"] == "APP_SCREENSHOT")
-            .ok_or_else(|| {
-                PistonError::Generic("Apple's asset catalog has no screenshot policy.".into())
-            })?;
+            .ok_or(PistonError::StoreCatalogPolicyMissing)?;
         let mut limits = BTreeMap::new();
         for limit in policy["groupLimits"].as_array().into_iter().flatten() {
             let count = limit["maxCount"].as_u64().ok_or_else(|| {
-                PistonError::Generic("Apple's screenshot policy is missing maxCount.".into())
+                PistonError::StoreResponseField {
+                    field: "placementPolicies.groupLimits.maxCount".into(),
+                }
             })?;
             for group in
                 limit["groupIds"].as_array().into_iter().flatten().filter_map(Value::as_str)
@@ -637,20 +567,14 @@ impl ScreenshotGroup {
             .into_iter()
             .flatten()
             .find(|placement| placement["placementTypeId"] == "APP_SCREENSHOT")
-            .ok_or_else(|| {
-                PistonError::Generic(
-                    "Apple's asset catalog has no screenshot specifications.".into(),
-                )
-            })?;
+            .ok_or(PistonError::StoreCatalogSpecificationsMissing)?;
         if !placement["acceptsAssetCategories"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|category| category == "APP_SCREENSHOTS_AND_PREVIEWS")
         {
-            return Err(PistonError::Generic(
-                "Apple's screenshot catalog rejects screenshot image assets.".into(),
-            ));
+            return Err(PistonError::StoreCatalogCategoryRejected);
         }
         let mut groups = Vec::new();
         for group in attributes["placementProfileGroups"].as_array().into_iter().flatten() {
@@ -704,14 +628,10 @@ impl ScreenshotGroup {
                 let Some((width, height)) =
                     width.zip(height).filter(|(width, height)| *width > 0 && *height > 0)
                 else {
-                    return Err(PistonError::Generic(
-                        "Apple's screenshot specification has invalid dimensions.".into(),
-                    ));
+                    return Err(PistonError::StoreCatalogDimensionsInvalid);
                 };
                 let max_file_size = spec["maxFileSize"].as_u64().ok_or_else(|| {
-                    PistonError::Generic(
-                        "Apple's screenshot specification has no file size limit.".into(),
-                    )
+                    PistonError::StoreResponseField { field: "imageSpecs.maxFileSize".into() }
                 })?;
                 specs.push(ScreenshotSpec {
                     id: AppStoreRelease::string(spec, "specId")?,
@@ -732,9 +652,7 @@ impl ScreenshotGroup {
             groups.push(Self { id, family, display_size, max_count: *count, specs });
         }
         if groups.is_empty() {
-            return Err(PistonError::Generic(
-                "Apple returned no usable iPhone or iPad screenshot specifications.".into(),
-            ));
+            return Err(PistonError::StoreCatalogSpecificationsUnavailable);
         }
         Ok(groups)
     }

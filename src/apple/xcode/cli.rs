@@ -1,11 +1,12 @@
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
+use crate::host;
 use crate::PistonError;
 use super::XcodeSigning;
 
-pub struct SigningCli;
+pub struct Cli;
 
-impl SigningCli {
+impl Cli {
     pub fn development(team: Option<&str>, developer: &Path) -> Result<XcodeSigning, PistonError> {
         Self::select(team, developer, SigningPurpose::Development)
     }
@@ -31,12 +32,12 @@ impl SigningCli {
                 .join("\n");
             if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
                 return Err(PistonError::CodesignError(format!(
-                    "More than one Xcode signing team is available:\n{choices}\n\n\
-                     Run in an interactive terminal to choose from the menu, \
-                     or pass --team <TEAM_ID>."
+                    "Choose an Xcode signing team:\n\n{choices}\n\n\
+                     Rerun in an interactive terminal to use the menu.\n\
+                     Or pass --team <TEAM_ID>."
                 )));
             }
-            eprintln!("Choose a signing team for this app:\n{choices}");
+            eprintln!("Choose a signing team for this app:\n\n{choices}\n");
             loop {
                 eprint!("Team [1-{}, q to cancel]: ", teams.len());
                 io::stderr().flush().map_err(|error| {
@@ -63,18 +64,20 @@ impl SigningCli {
     }
     fn missing_team(developer: &Path, purpose: SigningPurpose) -> PistonError {
         if let SigningPurpose::Store = purpose {
-            return PistonError::CodesignError(
-                "No signing team is selected. Pass --team <TEAM_ID> using the 10-character Team ID \
-                 from Membership details at https://developer.apple.com/account. Select the paid \
-                 Apple Developer Program team associated with your App Store Connect API key.".into()
-            );
+            return PistonError::CodesignError(format!(
+                "No App Store signing team is selected.\n\n\
+                 1. Find the 10-character Team ID in Membership details:\n   {}\n\n\
+                 2. Rerun with --team <TEAM_ID>.\n\n\
+                 Use the paid Developer Program team associated with your App Store Connect key.",
+                host::Cli::link("Apple Developer account", "https://developer.apple.com/account"),
+            ));
         }
         PistonError::CodesignError(
             "No Xcode signing team is configured.\n\n\
-             1. Open Xcode > Settings > Accounts, add or select your Apple Account, \
-             and complete sign-in and any verification. Confirm that a team is listed.\n\
-             2. Rerun your dev command. If Xcode lists several teams, select one with \
-             --team <TEAM_ID>. Cargo will reuse its existing build cache."
+             1. Open Xcode > Settings > Accounts.\n\
+                Add or select your Apple Account and finish sign-in.\n\n\
+             2. Confirm that your team appears, then rerun your dev command.\n\n\
+             If several teams appear, Piston will show a selection menu."
                 .into(),
         )
         .setup(crate::error::SetupPage::XcodeAccounts(developer.to_path_buf()))

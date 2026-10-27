@@ -1,13 +1,73 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use crate::Result;
+use crate::{host, PistonError, Result};
+use crate::dev::DevelopmentArgs;
 use crate::devices::AndroidDevice;
-use super::AndroidBuilder;
+use crate::project::Project;
+use super::{AndroidBuilder, AndroidDevelopment};
 use super::AndroidRunner;
 
-pub struct AndroidCli;
+pub struct Cli;
 
-impl AndroidCli {
+impl Cli {
+    pub fn start(args: DevelopmentArgs) -> Result<()> {
+        let manifest = Project::manifest(&args.application.cargo)?;
+        let mut session = loop {
+            match AndroidDevelopment::new(&args) {
+                Ok(session) => break session,
+                Err(error @ PistonError::InvalidBundleId { .. })
+                    if args.application.bundle_id.is_none() =>
+                {
+                    eprintln!("{error}");
+                    let value = loop {
+                        let value = host::Cli::prompt("Android application ID", "")?;
+                        match AndroidDevelopment::validate_bundle_id(&value) {
+                            Ok(()) => break value,
+                            Err(error) => eprintln!("{error}"),
+                        }
+                    };
+                    manifest.save(&["android"], &[("bundle_id", value)])?;
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let result = (|| {
+            println!("Preparing Android tools");
+            session.prepare()?;
+            println!("Selecting an Android device or emulator");
+            if !session.select_device(&args)? {
+                println!("Opening an Android emulator");
+                session.start_emulator(args.device.as_deref())?;
+            }
+            println!("Connecting to {}", session.serial());
+            session.wait_for_boot()?;
+            session.select_target()?;
+            println!(
+                "Building {} for {} ({})", session.project().package.name, session.serial(),
+                session.project().args.cargo.target.as_ref().unwrap()
+            );
+            let library = session.compile()?;
+            println!("Packaging Android app with Maverick's activity");
+            let apk = session.package(&library)?;
+            println!("Installing {}", session.package_id());
+            session.install(&apk)?;
+            println!(
+                "Launching {}. App output follows; press Ctrl-C to stop.", session.package_id()
+            );
+            session.launch()
+        })();
+        let cleanup = session.stop();
+        match (result, cleanup) {
+            (Err(error), cleanup) => {
+                if let Err(cleanup) = cleanup {
+                    eprintln!("Android cleanup also failed: {cleanup}");
+                }
+                Err(error)
+            }
+            (Ok(()), cleanup) => cleanup,
+        }
+    }
+
     pub fn build(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<(PathBuf, String, String)> {
         println!("building for android");
         let op = AndroidBuilder::new(release, target, cwd, env_vars)?;

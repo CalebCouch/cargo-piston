@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use crate::PistonError;
-use super::LinuxBuilder;
+use super::{GPGSigner, LinuxBuilder};
 
-pub struct LinuxCli;
+pub struct Cli;
 
-impl LinuxCli {
+impl Cli {
     pub fn build(release: bool, appimage: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<(), PistonError> {
         println!("building for linux");
         let op = LinuxBuilder::new(release, appimage, target, cwd, env_vars)?;
@@ -13,7 +13,18 @@ impl LinuxCli {
         op.pre_build()?;
         println!("Compiling linux application");
         op.build()?;
-        for message in op.post_build()? { println!("{message}"); }
+        println!("Packaging Linux application");
+        let bundle = op.post_build()?;
+        if GPGSigner::gpg_valid(op.key_id.clone(), op.gpg_path.clone()) {
+            println!("Signing Linux application");
+            match GPGSigner::gpg_sign(
+                op.key_id.clone(), op.key_pass.clone(), op.gpg_path.clone(), &bundle,
+            ) {
+                Ok(signature) => println!("Signature available at {}", signature.display()),
+                Err(error) => eprintln!("Signing failed: {error}"),
+            }
+        }
+        println!("Linux app bundle available at {}", bundle.display());
         Ok(())
     }
 }

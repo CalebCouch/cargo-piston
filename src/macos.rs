@@ -13,6 +13,7 @@ use crate::PistonError;
 mod development;
 pub use development::MacDevelopment;
 pub mod cli;
+pub use cli::Cli;
 
 pub struct MacOSBuilder {
     developer: PathBuf,
@@ -196,12 +197,9 @@ impl MacOSBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::BuildError(format!("Cargo build failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
         if !builder.status.success() {
-            return Err(PistonError::BuildError(format!(
-                "Cargo build failed: {}",
-                String::from_utf8_lossy(&builder.stderr)
-            )));
+            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
         }
         if self.release {
             let secondary = if self.target.contains("aarch64") {
@@ -228,14 +226,11 @@ impl MacOSBuilder {
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
                 .output()
-                .map_err(|e| {
-                    PistonError::BuildError(format!("Second Cargo build failed: {}", e))
-                })?;
+                .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
             if !builder_second.status.success() {
-                return Err(PistonError::BuildError(format!(
-                    "Second Cargo build failed: {}",
-                    String::from_utf8_lossy(&builder.stderr)
-                )));
+                return Err(PistonError::CommandFailed {
+                    program: "bash".into(), output: builder_second,
+                });
             }
         }
 
@@ -244,9 +239,7 @@ impl MacOSBuilder {
 
     fn notarize(&self) -> Result<(), PistonError> {
         let working_path = &self.output_path;
-        let parent = working_path.parent().map(PathBuf::from).ok_or_else(|| {
-            PistonError::Generic("Failed to determine zip path via parent method".to_string())
-        })?;
+        let parent = working_path.parent().unwrap();
         let zip_str = format!("{}.zip", &self.app_name);
         let zip_path = parent.join(zip_str);
 
@@ -255,13 +248,10 @@ impl MacOSBuilder {
             .arg(working_path)
             .arg(&zip_path)
             .output()
-            .map_err(|e| PistonError::Generic(format!("Ditto failed to execute: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "ditto".into(), source: e })?;
 
         if !zip.status.success() {
-            return Err(PistonError::Generic(format!(
-                "ditto failed: {}",
-                String::from_utf8_lossy(&zip.stderr)
-            )));
+            return Err(PistonError::CommandFailed { program: "ditto".into(), output: zip });
         }
 
         let submit = Command::new("xcrun")
@@ -270,18 +260,12 @@ impl MacOSBuilder {
             .arg(&zip_path)
             .args(["--keychain-profile", "DeveloperID-Notary", "--wait"])
             .output()
-            .map_err(|e| {
-                PistonError::Generic(format!("notarytool submit failed to execute: {}", e))
-            })?;
+            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
 
         if !submit.status.success()
             || String::from_utf8_lossy(&submit.stdout).contains("status: Invalid")
         {
-            return Err(PistonError::Generic(format!(
-                "notarytool submit failed: {} : {}",
-                String::from_utf8_lossy(&submit.stderr).trim(),
-                String::from_utf8_lossy(&submit.stdout).trim(),
-            )));
+            return Err(PistonError::CommandFailed { program: "xcrun".into(), output: submit });
         }
 
         let staple = Command::new("xcrun")
@@ -289,13 +273,10 @@ impl MacOSBuilder {
             .args(["stapler", "staple"])
             .arg(working_path)
             .output()
-            .map_err(|e| PistonError::Generic(format!("stapler failed to execute: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
 
         if !staple.status.success() {
-            return Err(PistonError::Generic(format!(
-                "stapler failed: {}",
-                String::from_utf8_lossy(&staple.stderr).trim()
-            )));
+            return Err(PistonError::CommandFailed { program: "xcrun".into(), output: staple });
         }
 
         Ok(())
@@ -303,9 +284,7 @@ impl MacOSBuilder {
 }
 
 impl MacOSBuilder {
-    fn post_build(&self) -> Result<Vec<String>, PistonError> {
-        let mut messages = Vec::new();
-        messages.push(format!("post build for macos"));
+    fn post_build(&self) -> Result<(), PistonError> {
         let binary_path = self
             .cwd
             .join("target")
@@ -315,16 +294,12 @@ impl MacOSBuilder {
         let binary_target_path =
             self.output_path.join("Contents").join("MacOS").join(&self.app_name);
         if !self.release {
-            messages.push(format!("copying binary to app bundle"));
             copy(&binary_path, &binary_target_path).map_err(|e| PistonError::CopyFileError {
                 input_path: binary_path.to_path_buf(),
                 output_path: binary_target_path.to_path_buf(),
                 source: e,
             })?;
-            messages
-                .push(format!("MacOS app bundle available at: {}", &binary_target_path.display()));
         } else {
-            messages.push(format!("creating universal binary in the app bundle"));
             let secondary = if self.target.contains("aarch64") {
                 "x86_64-apple-darwin"
             } else {
@@ -353,10 +328,6 @@ impl MacOSBuilder {
                     source: String::from_utf8_lossy(&lipo.stderr).to_string(),
                 });
             }
-            messages.push(format!(
-                "Universal MacOS app bundle available at: {}",
-                &binary_target_path.display()
-            ));
         }
 
         if let Some(notifications) = &self.notifications {
@@ -400,24 +371,15 @@ impl MacOSBuilder {
                 .output()
                 .map_err(|error| PistonError::CodesignError(error.to_string()))?;
             if !copy.status.success() {
-                return Err(PistonError::CodesignError(
-                    "Cannot copy the signed macOS app bundle.".into(),
-                ));
+                return Err(PistonError::CommandFailed { program: "ditto".into(), output: copy });
             }
             if self.external { self.notarize()?; }
-            messages.push(format!("Signed notification app: {}", self.output_path.display()));
-            return Ok(messages);
+            return Ok(());
         }
-        if self.keystore_path.is_none() || self.asc_api_key.is_none() {
-            messages.push(format!(
-                "Either the Keystore path or ASC API key missing from .env, skipping automated signing"
-            ));
-        } else if self.external {
+        if self.keystore_path.is_none() || self.asc_api_key.is_none() { return Ok(()); }
+        if self.external {
             if self.external_cert.is_none() {
-                return Err(PistonError::Generic(
-                    "external-release certificate is not properly configured, see documentation"
-                        .to_string(),
-                ));
+                return Err(PistonError::MissingSetting { key: "external_cert".into() });
             }
             AppleSigning::sign_app_bundle(
                 &self.output_path,
@@ -426,7 +388,6 @@ impl MacOSBuilder {
             )?;
             self.notarize()?;
         } else {
-            messages.push(format!("keystore path & ASC API key properly configured"));
             let asc = AppleSigning::new(
                 self.asc_api_key.clone().unwrap(),
                 self.keystore_path.clone().unwrap(),
@@ -434,13 +395,12 @@ impl MacOSBuilder {
             )?;
             let security_cert = asc.create_or_find_security_cert(self.team_id.clone())?;
             let security_profile = format!("{} ({})", security_cert.1, security_cert.0);
-            messages.push(format!("your security profile is: {:?}", security_profile));
             AppleSigning::sign_app_bundle(
                 &self.output_path,
                 &security_profile,
                 AppleSigningTarget::MacAppStore,
             )?;
         }
-        Ok(messages)
+        Ok(())
     }
 }

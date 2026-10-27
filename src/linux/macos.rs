@@ -3,12 +3,13 @@ use sha2::{Digest, Sha256};
 use toml_edit::{DocumentMut, Item, Value};
 use std::collections::BTreeSet;
 use std::env;
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{ Arc, atomic::{AtomicBool, Ordering}, };
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::thread;
 use std::time::{Duration, Instant};
 use crate::dev::DevelopmentArgs;
@@ -44,42 +45,51 @@ impl LinuxDevelopment {
                 .to_owned();
         let name =
             args.vm.or(settings.get("vm").cloned()).unwrap_or_else(|| format!("piston-{identity}"));
-        if name.is_empty()
-            || !name.starts_with(|c: char| c.is_ascii_alphanumeric())
-            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
-        {
-            return Err(PistonError::Generic(
-                "Use an alphanumeric Lima VM name with '.', '_' or '-'.".into(),
-            ));
+        Self::validate_name(&name)?;
+        if args.lima_home.is_none() {
+            if let Some(value) = manifest.setting(&["linux", "lima_home"])? {
+                let path = value.as_str().ok_or_else(|| PistonError::ManifestStringRequired {
+                    path: manifest.path().to_owned(), key: "linux.lima_home".into(),
+                })?;
+                Self::validate_home(Path::new(path))?;
+            }
         }
-        let lima = match args.lima.or_else(|| settings.get("lima").map(PathBuf::from)) {
-            Some(path) => path,
-            None => Host::linux_lima()?,
+        let lima = match args.lima {
+            Some(path) => {
+                Project::output(Command::new(&path).arg("--version"))?;
+                path
+            }
+            None => match settings.get("lima").map(PathBuf::from).filter(|path| {
+                Command::new(path).arg("--version").stdout(Stdio::null()).stderr(Stdio::null())
+                    .status().is_ok_and(|status| status.success())
+            }) {
+                Some(path) => path,
+                None => Host::linux_lima()?,
+            },
         };
         let home = args
             .lima_home
             .or_else(|| settings.get("lima_home").map(PathBuf::from))
             .or_else(|| env::var_os("LIMA_HOME").map(PathBuf::from))
             .or_else(|| env::var_os("HOME").map(|home| PathBuf::from(home).join(".lima")))
-            .ok_or_else(|| PistonError::Generic("Set HOME or provide --lima-home.".into()))?;
+            .ok_or_else(|| PistonError::LinuxVmHomeMissing)?;
         let home =
             env::current_dir().map_err(|error| PistonError::Generic(error.to_string()))?.join(home);
         fs::create_dir_all(&home)
-            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+            .map_err(|source| PistonError::LinuxVmHomeAccess { path: home.clone(), source })?;
         let lock = File::options()
             .create(true)
             .truncate(false)
             .write(true)
             .open(home.join(format!(".piston-{name}.lock")))
-            .map_err(|error| PistonError::Generic(error.to_string()))?;
-        lock.try_lock().map_err(|_| {
-            PistonError::Generic(format!("Another Piston session already owns VM {name}."))
+            .map_err(|source| PistonError::LinuxVmHomeAccess { path: home.clone(), source })?;
+        lock.try_lock().map_err(|source| PistonError::LinuxVmLocked {
+            name: name.clone(), source: Box::new(source),
         })?;
         let interrupted = Arc::new(AtomicBool::new(false));
         let cancelled = interrupted.clone();
-        ctrlc::set_handler(move || cancelled.store(true, Ordering::SeqCst)).map_err(|error| {
-            PistonError::Generic(format!("Cannot install Linux session shutdown handler: {error}"))
-        })?;
+        ctrlc::set_handler(move || cancelled.store(true, Ordering::SeqCst))
+            .map_err(PistonError::LinuxVmSignalHandler)?;
         let development = Self {
             project,
             lima,
@@ -94,9 +104,6 @@ impl LinuxDevelopment {
             viewer: None,
             _lock: lock,
         };
-        let mut command = development.lima();
-        command.arg("--version");
-        Project::output(&mut command, "Finding Lima (install Lima or provide --lima)")?;
         manifest.save(
             &["linux"],
             &[
@@ -106,6 +113,19 @@ impl LinuxDevelopment {
             ],
         )?;
         Ok(development)
+    }
+
+    pub fn validate_name(name: &str) -> Result<()> {
+        if !name.starts_with(|c: char| c.is_ascii_alphanumeric())
+            || !name.chars().all(|c| c.is_ascii_alphanumeric() || "._-".contains(c))
+        { return Err(PistonError::LinuxVmNameInvalid { name: name.into() }); }
+        Ok(())
+    }
+
+    pub fn validate_home(path: &Path) -> Result<()> {
+        if !path.is_dir() { return Err(PistonError::LinuxVmHomeInvalid { path: path.into() }); }
+        tempfile::tempfile_in(path).map(|_| ())
+            .map_err(|source| PistonError::LinuxVmHomeAccess { path: path.into(), source })
     }
 
     pub fn name(&self) -> &str { &self.name }
@@ -132,7 +152,6 @@ impl LinuxDevelopment {
                 .arg(&pending)
                 .arg("-o")
                 .arg(&pending_binary),
-            "Compiling the Linux viewer",
         )?;
         fs::rename(&pending_binary, &binary)
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
@@ -141,22 +160,25 @@ impl LinuxDevelopment {
         Ok(())
     }
 
-    pub fn prepare_viewer(&self) -> Result<()> {
-        Project::write(
-            &self.project.work.join("Piston Linux.app/Contents/Info.plist"),
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0"><dict><key>CFBundleExecutable</key><string>PistonLinux</string>
-<key>CFBundleIdentifier</key><string>dev.piston.linux-viewer</string>
-<key>CFBundleName</key><string>Piston Linux</string><key>CFBundlePackageType</key><string>APPL</string>
-<key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict></dict></plist>
-"#,
-        )
+    pub fn prepare_viewer(&self, name: &str) -> Result<()> {
+        let network = plist::Value::Dictionary(plist::Dictionary::from_iter([
+            ("NSAllowsLocalNetworking", plist::Value::Boolean(true)),
+        ]));
+        let info = plist::Value::Dictionary(plist::Dictionary::from_iter([
+            ("CFBundleExecutable", plist::Value::String("PistonLinux".into())),
+            ("CFBundleIdentifier", plist::Value::String("dev.piston.linux-viewer".into())),
+            ("CFBundleName", plist::Value::String(name.into())),
+            ("CFBundlePackageType", plist::Value::String("APPL".into())),
+            ("NSAppTransportSecurity", network),
+        ]));
+        let mut contents = Vec::new();
+        info.to_writer_xml(&mut contents)
+            .map_err(|error| PistonError::WritePlUtilError(error.to_string()))?;
+        Project::write(&self.project.work.join("Piston Linux.app/Contents/Info.plist"), contents)
     }
 
     pub fn start_vm(&mut self) -> Result<()> {
-        let output =
-            Project::output(self.lima().args(["list", "--json"]), "Reading Lima instances")?;
+        let output = Project::output(self.lima().args(["list", "--json"]))?;
         let instances = String::from_utf8_lossy(&output)
             .lines()
             .map(serde_json::from_str::<serde_json::Value>)
@@ -166,10 +188,9 @@ impl LinuxDevelopment {
             instances.iter().find(|instance| instance["name"].as_str() == Some(&self.name))
         {
             if instance["status"].as_str() != Some("Stopped") {
-                return Err(PistonError::Generic(format!(
-                    "VM {} is already running or changing state. Stop it first or select another --vm; Piston only shuts down its own sessions.",
-                    self.name,
-                )));
+                return Err(PistonError::LinuxVmUnavailable {
+                    name: self.name.clone(), state: instance["status"].as_str().map(str::to_owned),
+                });
             }
         } else {
             self.run(
@@ -187,33 +208,24 @@ impl LinuxDevelopment {
                     "--image-variant=minimal",
                     "template:ubuntu-24.04",
                 ]),
-                "Creating Linux VM",
             )?;
         }
         self.owned = true;
-        self.run(self.lima().args(["start", "--tty=false", &self.name]), "Starting Linux VM")
+        self.run(self.lima().args(["start", "--tty=false", &self.name]))
     }
 
     pub fn prepare_guest(&mut self) -> Result<()> {
-        let output = Project::output(
-            &mut self.shell("printf '%s' \"$HOME\""),
-            "Reading Linux home directory",
-        )?;
+        let output = Project::output(&mut self.shell("printf '%s' \"$HOME\""))?;
         let home =
             String::from_utf8(output).map_err(|error| PistonError::Generic(error.to_string()))?;
         self.guest = PathBuf::from(home).join(".local/share/piston").join(&self.identity);
-        self.run(
-            &mut self
-                .shell(&format!("mkdir -p {} \"$HOME/.cache/piston\"", Self::quote(&self.guest))),
-            "Preparing Linux cache",
-        )?;
+        self.run(&mut self.shell(&format!(
+            "mkdir -p {} \"$HOME/.cache/piston\"", Self::quote(&self.guest)
+        )))?;
         let setup = self.project.work.join("setup.sh");
         Project::write(&setup, include_str!("setup.sh"))?;
         self.copy(&setup, &self.guest.join("setup.sh"))?;
-        self.run(
-            &mut self.shell(&format!("bash {}", Self::quote(&self.guest.join("setup.sh")))),
-            "Installing Linux prerequisites",
-        )
+        self.run(&mut self.shell(&format!("bash {}", Self::quote(&self.guest.join("setup.sh")))))
     }
 
     pub fn sync(&self) -> Result<()> {
@@ -225,7 +237,6 @@ impl LinuxDevelopment {
             roots.insert(manifest.parent().unwrap().to_owned());
             manifests.insert(manifest);
         }
-        let build_dirs: Vec<_> = roots.iter().map(|root| root.join("target")).collect();
         let roots: Vec<_> = roots
             .iter()
             .filter(|root| !roots.iter().any(|parent| parent != *root && root.starts_with(parent)))
@@ -236,27 +247,31 @@ impl LinuxDevelopment {
         tar.env("COPYFILE_DISABLE", "1")
             .args(["--no-xattrs", "-cf"])
             .arg(&archive)
-            .args(["--exclude=.git", "--exclude=node_modules", "--exclude=.DS_Store"])
+            .args([
+                "--exclude=.git", "--exclude=node_modules", "--exclude=.DS_Store", "--exclude=target",
+            ])
             .arg(format!(
                 "--exclude={}",
                 self.project.target_dir.strip_prefix("/").unwrap().display()
             ))
             .args(["-C", "/"]);
-        for path in build_dirs {
-            tar.arg(format!("--exclude={}", path.strip_prefix("/").unwrap().display()));
-        }
         for root in &roots { tar.arg(root.strip_prefix("/").unwrap()); }
-        self.run(&mut tar, "Packing Linux source")?;
-        self.copy(&archive, &self.guest.join("source.tar"))?;
+        self.run(&mut tar)?;
         let source = self.guest.join("source");
+        let guest_archive = self.guest.join("source.tar");
+        self.run(&mut self.shell(&format!(
+            "rm -rf {0} && rm -f {1} && mkdir -p {0}",
+            Self::quote(&source), Self::quote(&guest_archive),
+        )))?;
+        self.copy(&archive, &guest_archive)?;
         self.run(
             &mut self.shell(&format!(
-                "rm -rf {0} && mkdir -p {0} && tar -xf {1} -C {0}",
-                Self::quote(&source),
-                Self::quote(&self.guest.join("source.tar"))
+                "tar -xf {0} -C {1} && rm -f {0}",
+                Self::quote(&guest_archive), Self::quote(&source),
             )),
-            "Updating Linux source",
         )?;
+        fs::remove_file(&archive)
+            .map_err(|source| PistonError::RemoveFileError { path: archive, source })?;
         let config_roots: BTreeSet<_> =
             manifests.iter().map(|path| path.parent().unwrap().to_owned()).collect();
         for root in config_roots {
@@ -282,27 +297,22 @@ impl LinuxDevelopment {
     }
 
     pub fn compile<F: FnMut(&str)>(&mut self, mut report: F) -> Result<PathBuf> {
-        let version = Project::output(
-            &mut self.shell(". \"$HOME/.cargo/env\"; rustc -vV"),
-            "Reading Linux Rust target",
-        )?;
+        let version = Project::output(&mut self.shell(". \"$HOME/.cargo/env\"; rustc -vV"))?;
         let target = String::from_utf8_lossy(&version)
             .lines()
             .find_map(|line| line.strip_prefix("host: "))
             .map(str::to_owned)
-            .ok_or_else(|| {
-                PistonError::Generic("Linux rustc did not report a host target.".into())
-            })?;
+            .ok_or(PistonError::LinuxVmTargetMissing)?;
         if self.project.args.cargo.target.as_ref().is_some_and(|requested| requested != &target) {
-            return Err(PistonError::Generic(format!(
-                "This VM builds {target}; choose a VM matching the requested --target."
-            )));
+            return Err(PistonError::LinuxVmTargetMismatch {
+                actual: target, requested: self.project.args.cargo.target.clone().unwrap(),
+            });
         }
         let mut args = self.project.args.cargo.clone();
         args.manifest_path =
             Some(self.guest_path(self.project.package.manifest_path.as_std_path()));
         args.target_dir = Some(self.guest.join("target"));
-        args.target = Some(target);
+        args.target = Some(target.clone());
         let mut cargo = Command::new("cargo");
         cargo.args(["build", "--message-format=json-render-diagnostics"]);
         args.apply(&mut cargo);
@@ -321,7 +331,7 @@ impl LinuxDevelopment {
         let log = self.project.work.join("linux-build.jsonl");
         command
             .stdout(File::create(&log).map_err(|error| PistonError::Generic(error.to_string()))?);
-        let result = self.run(&mut command, "Building Linux application");
+        let result = self.run(&mut command);
         let mut executable = None;
         for message in Message::parse_stream(BufReader::new(
             File::open(&log).map_err(|error| PistonError::Generic(error.to_string()))?,
@@ -341,11 +351,12 @@ impl LinuxDevelopment {
             }
         }
         result?;
-        executable
-            .ok_or_else(|| PistonError::BuildError("Cargo produced no Linux executable.".into()))
+        executable.ok_or_else(|| PistonError::ArtifactNotProduced {
+            package: self.project.package.name.to_string(), target: Some(target),
+        })
     }
 
-    pub fn show(&mut self, executable: &Path) -> Result<()> {
+    pub fn show(&mut self, executable: &Path, title_prefix: &str, close_label: &str, quit_label: &str) -> Result<()> {
         let port = TcpListener::bind("127.0.0.1:0")
             .and_then(|listener| listener.local_addr())
             .map_err(|error| PistonError::Generic(error.to_string()))?
@@ -357,10 +368,7 @@ impl LinuxDevelopment {
         let token = random[..16].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let password = random[16..].iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let session = self.guest.join(format!("session-{token}"));
-        self.run(
-            &mut self.shell(&format!("mkdir -p {}", Self::quote(&session))),
-            "Preparing Linux desktop",
-        )?;
+        self.run(&mut self.shell(&format!("mkdir -p {}", Self::quote(&session))))?;
         let script = self.project.work.join("desktop.sh");
         Project::write(&script, include_str!("desktop.sh"))?;
         self.copy(&script, &session.join("desktop.sh"))?;
@@ -372,7 +380,6 @@ impl LinuxDevelopment {
                 password,
                 Self::quote(&session.join("password"))
             )),
-            "Configuring Linux display",
         )?;
         let arguments = self
             .app_args
@@ -390,7 +397,9 @@ impl LinuxDevelopment {
         self.desktop = Some(
             self.shell(&command)
                 .spawn()
-                .map_err(|error| PistonError::Generic(error.to_string()))?,
+                .map_err(|source| PistonError::CommandSpawn {
+                    program: self.lima.clone().into(), source,
+                })?,
         );
         let agent = ureq::AgentBuilder::new().timeout(Duration::from_secs(1)).build();
         let deadline = Instant::now() + Duration::from_secs(45);
@@ -401,8 +410,10 @@ impl LinuxDevelopment {
                 .as_mut()
                 .unwrap()
                 .try_wait()
-                .map_err(|error| PistonError::Generic(error.to_string()))?
-            { return Self::status(status, "Linux application"); }
+                .map_err(|source| PistonError::CommandWait {
+                    program: self.lima.clone().into(), source,
+                })?
+            { return Self::status(status, self.lima.as_os_str()); }
             if agent
                 .get(&format!("http://127.0.0.1:{port}/piston-session"))
                 .call()
@@ -411,16 +422,20 @@ impl LinuxDevelopment {
                 .is_some_and(|value| value.trim() == token)
             { break; }
             if Instant::now() > deadline {
-                return Err(PistonError::Generic(
-                    "Linux desktop forwarding did not become ready. Check the VM desktop logs."
-                        .into(),
-                ));
+                return Err(PistonError::LinuxVmDesktopTimeout);
             }
             thread::sleep(Duration::from_millis(200));
         }
-        self.viewer = Some(Command::new(self.viewer_binary()).env("PISTON_VIEWER_TITLE", self.project.package.name.as_str())
-            .env("PISTON_VIEWER_URL", format!("http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale&password={password}"))
-            .stdin(Stdio::null()).spawn().map_err(|error| PistonError::Generic(format!("Opening Linux viewer: {error}")))?);
+        self.viewer = Some(Command::new(self.viewer_binary())
+            .env("PISTON_VIEWER_TITLE", format!("{title_prefix}{}", self.project.package.name))
+            .env("PISTON_VIEWER_CLOSE", close_label)
+            .env("PISTON_VIEWER_QUIT", quit_label)
+            .env("PISTON_VIEWER_URL", format!(
+                "http://127.0.0.1:{port}/vnc.html?autoconnect=true&resize=scale&password={password}"
+            ))
+            .stdin(Stdio::null()).spawn().map_err(|source| PistonError::CommandSpawn {
+                program: self.viewer_binary().into(), source,
+            })?);
         loop {
             self.check_interrupt()?;
             if let Some(status) = self
@@ -428,15 +443,19 @@ impl LinuxDevelopment {
                 .as_mut()
                 .unwrap()
                 .try_wait()
-                .map_err(|error| PistonError::Generic(error.to_string()))?
-            { return Self::status(status, "Linux viewer"); }
+                .map_err(|source| PistonError::CommandWait {
+                    program: self.viewer_binary().into(), source,
+                })?
+            { return Self::status(status, self.viewer_binary().as_os_str()); }
             if let Some(status) = self
                 .desktop
                 .as_mut()
                 .unwrap()
                 .try_wait()
-                .map_err(|error| PistonError::Generic(error.to_string()))?
-            { return Self::status(status, "Linux application"); }
+                .map_err(|source| PistonError::CommandWait {
+                    program: self.lima.clone().into(), source,
+                })?
+            { return Self::status(status, self.lima.as_os_str()); }
             thread::sleep(Duration::from_millis(100));
         }
     }
@@ -454,21 +473,21 @@ impl LinuxDevelopment {
             command.arg(&self.name);
             let mut child = command
                 .spawn()
-                .map_err(|error| PistonError::Generic(format!("Stopping VM: {error}")))?;
+                .map_err(|source| PistonError::CommandSpawn {
+                    program: self.lima.clone().into(), source,
+                })?;
             let deadline = Instant::now() + Duration::from_secs(30);
             loop {
                 if let Some(status) =
-                    child.try_wait().map_err(|error| PistonError::Generic(error.to_string()))?
+                    child.try_wait().map_err(|source| PistonError::CommandWait {
+                        program: self.lima.clone().into(), source,
+                    })?
                 { if status.success() { self.owned = false; return Ok(()); } break; }
                 if Instant::now() > deadline { let _ = child.kill(); let _ = child.wait(); break; }
                 thread::sleep(Duration::from_millis(100));
             }
         }
-        Err(PistonError::Generic(format!(
-            "Could not stop VM {}. Run limactl stop --force with LIMA_HOME={}",
-            self.name,
-            self.home.display()
-        )))
+        Err(PistonError::LinuxVmStopFailed { name: self.name.clone(), home: self.home.clone() })
     }
 
     fn lima(&self) -> Command {
@@ -484,47 +503,39 @@ impl LinuxDevelopment {
     }
 
     fn copy(&self, source: &Path, destination: &Path) -> Result<()> {
-        self.run(
-            self.lima().arg("copy").arg(source).arg(format!(
-                "{}:{}",
-                self.name,
-                destination.display()
-            )),
-            "Copying Linux files",
-        )
+        self.run(self.lima().arg("copy").arg(source)
+            .arg(format!("{}:{}", self.name, destination.display())))
     }
 
-    fn run(&self, command: &mut Command, operation: &str) -> Result<()> {
+    fn run(&self, command: &mut Command) -> Result<()> {
         self.check_interrupt()?;
-        let mut child = command
-            .spawn()
-            .map_err(|error| PistonError::Generic(format!("{operation}: {error}")))?;
+        let program = command.get_program().to_owned();
+        let mut child = command.spawn()
+            .map_err(|source| PistonError::CommandSpawn { program: program.clone(), source })?;
         loop {
             if self.interrupted.load(Ordering::SeqCst) {
                 let _ = child.kill();
                 let _ = child.wait();
                 return self.check_interrupt();
             }
-            if let Some(status) =
-                child.try_wait().map_err(|error| PistonError::Generic(error.to_string()))?
-            { return Self::status(status, operation); }
+            if let Some(status) = child.try_wait()
+                .map_err(|source| PistonError::CommandWait { program: program.clone(), source })?
+            { return Self::status(status, &program); }
             thread::sleep(Duration::from_millis(100));
         }
     }
 
     fn check_interrupt(&self) -> Result<()> {
         if self.interrupted.load(Ordering::SeqCst) {
-            Err(PistonError::Generic("Linux development interrupted.".into()))
+            Err(PistonError::LinuxVmInterrupted)
         } else {
             Ok(())
         }
     }
 
-    fn status(status: ExitStatus, operation: &str) -> Result<()> {
-        if status.success() {
-            Ok(())
-        } else {
-            Err(PistonError::Generic(format!("{operation} failed: {status}")))
+    fn status(status: ExitStatus, program: &OsStr) -> Result<()> {
+        if status.success() { Ok(()) } else {
+            Err(PistonError::CommandStatus { program: program.into(), status })
         }
     }
 

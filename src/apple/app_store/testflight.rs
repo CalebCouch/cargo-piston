@@ -4,6 +4,7 @@ use crate::{PistonError, Result};
 use super::{AppStoreConnect, AscApiKey};
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct FlightStatus {
     pub state: String,
@@ -26,21 +27,19 @@ impl TestFlight {
             "/v1/apps",
             &[("filter[bundleId]", bundle_id), ("fields[apps]", "name,bundleId")],
         )?;
-        let app = apps.first().ok_or_else(|| PistonError::Generic(format!(
-            "No App Store Connect app is accessible for {bundle_id}. Open \
-             https://appstoreconnect.apple.com/apps, choose + > New App, and select this bundle ID. \
-             Set the app's name, primary language and SKU, then rerun cargo piston deploy testflight. \
-             If it already exists, check the API key's team and access to the app.",
-        )))?;
+        let app = apps.first().ok_or_else(|| PistonError::StoreAppMissing {
+            bundle_id: bundle_id.into(), testflight: true,
+        })?;
         let app_id = app["id"]
             .as_str()
             .ok_or_else(|| {
-                PistonError::Generic("Apple returned an app without an identifier.".into())
+                PistonError::StoreResponseField { field: "apps.id".into() }
             })?
             .to_string();
         let upload = manifest.settings(&["testflight"])?;
-        let pending = upload.get("build_number").filter(|_| {
+        let pending = upload.get("build_number").filter(|number| {
             !new_build
+                && AppStoreConnect::version_number(number).is_ok()
                 && upload.get("app_id") == Some(&app_id)
                 && upload.get("version").is_some_and(|saved| saved == version)
                 && upload.get("state").is_some_and(|state| state == "uploaded")
@@ -93,7 +92,7 @@ impl TestFlight {
         let mut url = self.url();
         let state = if let Some(build) = self.build()? {
             let id = build["id"].as_str().ok_or_else(|| {
-                PistonError::Generic("Apple returned a build without an identifier.".into())
+                PistonError::StoreResponseField { field: "builds.id".into() }
             })?;
             url = format!("{url}/{id}");
             if build["attributes"]["expired"].as_bool() == Some(true) {
@@ -101,7 +100,7 @@ impl TestFlight {
             } else {
                 let processing =
                     build["attributes"]["processingState"].as_str().ok_or_else(|| {
-                        PistonError::Generic("Apple returned no build processing state.".into())
+                        PistonError::StoreResponseField { field: "builds.processingState".into() }
                     })?;
                 if processing == "VALID" {
                     let details = self.client.request(
@@ -113,7 +112,9 @@ impl TestFlight {
                     details["data"]["attributes"]["internalBuildState"]
                         .as_str()
                         .ok_or_else(|| {
-                            PistonError::Generic("Apple returned no TestFlight state.".into())
+                            PistonError::StoreResponseField {
+                                field: "buildBetaDetail.internalBuildState".into(),
+                            }
                         })?
                         .to_string()
                 } else {

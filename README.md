@@ -9,6 +9,12 @@ native Linux applications and Android development with an installed SDK. Apple
 development requires macOS. The older `build` and `run` commands retain their
 separate packaging configuration, including Windows GNU builds from macOS.
 
+Setup uses short steps with descriptive prompts and labeled links whose full URLs
+remain visible. Open those links when needed; Piston does not automatically open
+web pages or account/settings windows. Links are clickable in supported interactive
+terminals and appear as plain text when output is redirected, `TERM=dumb`, or
+`NO_COLOR` is set.
+
 ## Code organization
 
 Destination modules (`ios.rs`, `macos.rs`, `android.rs`, `linux.rs`, and `windows.rs`)
@@ -17,7 +23,7 @@ own app packaging and deployment for that destination. `host/macos.rs` and
 declarations with `cfg`. These select the machine running Piston, not the app being
 built, so a macOS host can still build Android and Windows GNU outputs.
 
-Shared Apple signing and keychain operations live in `apple.rs`. App Store Connect
+Shared Apple signing operations live in `apple.rs`. App Store Connect
 authentication and API requests live separately in `apple/app_store.rs`, used by
 Apple signing and deployment. App Store screenshot preparation and upload live in
 `apple/app_store/artwork.rs`
@@ -27,15 +33,21 @@ Xcode App Store archives, exports, and binary uploads. Rust modules use named fi
 such as `host.rs`, with child modules in the matching directory.
 
 Start tracing a command in `src/cli.rs`. CLI files own argument parsing, prompts,
-terminal messages, recovery-page opening, and the sequence of operations. Service
+terminal messages, setup and recovery links, and the sequence of operations. Service
 structures in the neighboring files perform builds, signing, device operations,
-network requests, and persistence. Services return results and recovery actions;
-they do not prompt or call back into CLI flows. Native tool and app output can
-still stream directly to the terminal.
+network requests, and persistence. Services propagate structured `PistonError`
+values and recovery actions from `error.rs`. The error formatter in `cli.rs`
+chooses the user-facing wording; the distribution CLI handles its Xcode log
+guidance. Services do not prompt or call back into CLI flows. Native tool and app
+output can still stream directly to the terminal. Every CLI structure is named
+`Cli` and is referenced through its owner, such as `ios::Cli`,
+`ios::deployment::Cli`, or `host::macos::Cli`.
+The shared `host::Cli::link` method formats terminal links using OSC 8 when enabled.
 
 | Flow | CLI entry points under `src/` |
 | --- | --- |
 | Command dispatch and shared arguments | `cli.rs` |
+| Developer identity creation, selection, backup, and restoration | `developer/cli.rs` |
 | Development platform selection | `dev/cli.rs`, then `host/cli.rs` for the default host |
 | macOS, iOS, Android development and older build/run commands | `macos/cli.rs`, `ios/cli.rs`, `android/cli.rs` |
 | Linux development and packaging | `linux/cli.rs`, then `linux/macos/cli.rs` for the VM or `host/linux/cli.rs` for native runs |
@@ -60,7 +72,8 @@ APKs, and `ios/simulator.rs` manages Simulator runs. Linux VM operations live in
 `linux/macos.rs`; the Swift viewer's window lifetime controls the VM.
 `apple/xcode.rs` generates signing projects, `apple/notifications.rs` registers
 notification credentials, and `apple/push.rs` prepares and verifies entitlements.
-Native Keychain access belongs to `host/macos/credentials.rs`.
+`developer.rs` owns the encrypted AIR developer contract, credential synchronization,
+and local developer identity storage. `developer/cli.rs` owns its setup and backup flow.
 
 Piston generates platform metadata, including `Info.plist`, into the app's build
 output using project settings. Application runtime behavior belongs in Maverick.
@@ -71,10 +84,10 @@ out. The Android development path packages Maverick's Gradle bridge instead.
 Cargo piston is a global cargo crate. There are two ways you can install it. Choose option one unless you have a reason not to.
 
 1. Globally install the crate directly with
-`cargo install cargo-piston`
+`cargo install cargo-piston --locked`
 
-2. Or obtain the source code locally via `git clone https://github.com/dav-anderson/cargo-piston` and then run the following command with the proper path to the source code
-`cargo install --path </path/to/cargo-piston>`
+2. Or clone the source with `git clone https://github.com/CalebCouch/cargo-piston`
+and install it with `cargo install --locked --path </path/to/cargo-piston>`.
 
 The iOS development command below does not require a `.env` file. The older platform
 build/run commands use the configuration described later in this document.
@@ -145,8 +158,10 @@ On macOS, `cargo piston dev linux` uses Lima and a dedicated desktop window. Pis
 installs Lima through Homebrew when needed, creates an Ubuntu VM, installs the
 guest build and desktop dependencies, copies the project and local dependencies,
 and builds inside Linux. The default VM uses two CPUs, 4 GiB RAM, and a sparse
-24 GiB disk. Source copies and the Cargo cache remain in the VM for later runs;
-host folders are not mounted.
+24 GiB disk. Setup provides 2 GiB of disk-backed swap for build memory peaks.
+Rust `target` directories are excluded from source copies at every depth.
+Piston replaces its previous source copy and removes temporary transfer archives;
+the Linux Cargo build cache remains in the VM for later runs. Host folders are not mounted.
 
 Closing the window, stopping with Ctrl-C, or a build/run failure shuts down the
 VM started by that command. Piston refuses to take over an already-running VM.
@@ -176,14 +191,14 @@ cargo piston build --target macos
 ```
 
 During setup, Piston asks **Does this app use push notifications?** if the app has
-no saved choice or notification configuration. Both yes and no are saved in
+no valid saved notification choice. Both yes and no are saved in
 Cargo.toml, so later commands do not ask again. Answering no continues the normal
 build or deployment without notification setup. Answering yes starts the setup
-below, then continues the original command. Existing notification configuration
-already counts as yes. There is no `--notifications` flag.
+below, then continues the original command. A missing or invalid choice asks again while preserving any existing notification registration.
+There is no `--notifications` flag.
 
 For apps that use notifications, Piston asks for an **APNs** key ID or downloaded
-`.p8` path and opens Apple's
+`.p8` path and shows a link to Apple's
 [Keys page](https://developer.apple.com/account/resources/authkeys/list).
 Choose Apple Push Notification service when creating the key, and configure its
 topic and environment scope for the app and selected Apple team. App Store Connect
@@ -192,67 +207,112 @@ supplies the key ID; entering an ID searches Spotlight for that exact filename.
 The selected key must remain outside the project and repository. Apple allows
 downloading each private key only once.
 
-After successful setup, ordinary builds reuse the saved configuration. To change
-the choice, edit `enabled` in `[package.metadata.piston.notifications]`. To rotate
-the APNs key, update the environment's `key_path` and `key_id`, or remove those two
-fields to be prompted again. Unattended builds require a saved choice or existing
-configuration; Piston reports how to supply it instead of guessing.
+After the initial import, ordinary builds retrieve the APNs credentials from the
+team's encrypted AIR developer contract; the source `.p8` file is no longer needed.
+To change whether the app uses notifications, edit `enabled` in
+`[package.metadata.piston.notifications]`. Unattended builds require a saved choice,
+the team's local identity, and an existing AIR configuration. The old `key_path` and
+`key_id` manifest fields are not used to configure or rotate APNs credentials.
 Development and production have separate settings; configuring development does
 not assume that its APNs key also permits production. iPhone development uses the
 sandbox even with `--release`; TestFlight and App Store exports use production.
 For macOS, development builds use the sandbox and distribution exports use production.
-The existing `--prepare-only` deployment option checks App Store Connect and tools;
-notification registration runs when preparing the actual application build.
 
-Piston keeps its private deployment identities and notification registrations in
-one macOS Keychain item: service `cargo-piston`, account `credentials`. Each Apple
-team has its own AIR deployment identity inside that item, shared by that team's
-apps. Each app/environment retains its own private registration state, including
-the contract location and APNs credentials. Piston reads the item once during
-setup and updates that same item as progress is confirmed; simultaneous setup
-commands cannot overwrite each other's credentials.
+To import replacement APNs credentials for an enabled app, use:
+
+```sh
+cargo piston dev ios --setup
+cargo piston dev macos --setup
+cargo piston deploy testflight --setup
+```
+
+Development setup replaces the development APNs credentials; iOS requires a physical
+device. Deployment setup also replaces App Store Connect credentials and replaces
+enabled production APNs credentials when preparing the actual application build.
+With `--prepare-only`, deployment setup checks App Store Connect and tools without
+registering notifications.
+
+Piston stores APNs keys and notification registration state in the selected team's
+encrypted AIR developer contract. Each app, platform, and environment has its own
+credential entry; registration snapshots preserve pending requests and AIR Inbox
+sharing progress across interrupted runs. The developer contract also stores the
+team's App Store Connect key and its IDs. These credentials are retrieved from AIR
+when needed, rather than cached in Piston's own Keychain item.
 
 ### Developer identities
 
-On a Mac with no Piston credentials, the first Apple build or development/deployment
-command asks whether to create or restore a developer identity. Choose **restore**
-when joining a team that already uses Piston. Creating an identity asks for the
-Apple Team ID; it does not create an Apple account or a signing certificate.
-Help, version, device listing, dry-run, and Android/Linux development commands do
-not require Apple identity setup.
-You can also open setup directly, outside a Cargo project:
+Piston selects the project's developer identity before starting build, development,
+or deployment tools, including Android/Linux development and iOS Simulator runs.
+If the project has no selection, a menu lists saved Team IDs and **Create a team identity**.
+Piston saves the chosen team and public identity in the selected package's Cargo.toml
+for later runs. When creating an identity needs an Apple Team ID, Piston shows a link to your
+[Apple Developer account](https://developer.apple.com/account#MembershipDetailsCard)
+and asks you to copy and paste the ID. Open the link, sign in, and select your team,
+then click **Membership details** near the top of the page. Apple may reset the
+section link while loading. Creating an identity does not create an Apple account
+or signing certificate. Selecting an identity is local; AIR access starts when
+credentials are needed. Help, version, and device-listing commands skip identity setup.
+
+Plain `cargo piston` resolves the current Cargo project and uses its saved selection
+or opens the menu. `cargo piston setup` always opens that menu so the current project
+can select another identity or create one. Restore the existing identity when
+joining a team: restoration is an explicit command, not a paste prompt in the menu.
+If a project's saved identity is missing locally, Piston reports the restore command.
 
 ```sh
-cargo piston                    # create-or-restore setup
-cargo piston setup              # set up another team
-cargo piston share              # choose a stored team identity and copy its transfer line
-cargo piston restore            # paste a transfer line on another developer's Mac
+cargo piston                                    # use or select this project's identity
+cargo piston setup                              # reselect or create this project's identity
+cargo piston backup                             # choose an identity and copy its backup line
+cargo piston restore "piston-identity:<data>"     # restore the complete quoted backup line
 ```
 
-The share menu lists Apple Team IDs and public AIR identities. Selecting one prints
-a single `piston-identity:` line containing that team's private identity. Share it
-privately: it grants full authority over every app using that identity. It is not
-permission-limited delegation. Piston exports neither other teams' identities nor
-the entire Keychain item. Apple account access, signing certificates, and `.p8`
-files are configured separately; they are not included in the transfer.
+`backup` and `restore` also work outside a Cargo project. Restore only adds the
+identity to local storage; choose it for the project at the next startup or through
+`cargo piston setup`.
 
-Restore validates the identity and its team before saving it into the same
-`cargo-piston` / `credentials` Keychain item. Restoring the same identity again is
-safe; a different identity for an existing team is rejected. Other identities and
-notification registrations remain intact. Notification setup offers restore when
-Cargo.toml names an owner missing from this Mac, and checks that the restored
-identity matches before continuing. AIR registration locations are derived from
-the identity, app topic, and environment, so a restored identity can resume the
-same notification contracts on another Mac.
+Missing or invalid Piston metadata reopens only the affected setup step. Valid values
+and unrelated Cargo settings remain intact. Identity selection returns to the menu;
+notification choices are asked again; saved app settings and paths can be corrected
+or explicitly removed. Notification references are rebuilt from AIR, and unusable
+TestFlight receipts trigger a fresh lookup. An unreadable TOML document or invalid
+Cargo package definition must be corrected before Cargo can load the project.
 
-Secrets are never written into the project or passed to Cargo. Xcode's signing
-certificates remain managed by Apple and may have separate Keychain access prompts.
-Public settings and key-file paths remain in Cargo.toml. Identity storage currently
-requires macOS Keychain; native Linux development does not require this setup.
+Local identity secrets are stored in `~/.cargo/piston/identities.json`, or
+`$CARGO_HOME/piston/identities.json` when `CARGO_HOME` is set. The directory has
+owner-only permissions (`0700`) and the identity file has owner-only read/write
+permissions (`0600`). This local file is not encrypted; it is the private identity
+needed to open the encrypted developer contract. A file lock prevents simultaneous
+local setup commands from overwriting each other's identity changes.
 
-Cargo.toml stores public references and the original APNs key-file path:
+The backup menu lists Apple Team IDs. Selecting one prints
+a single `piston-identity:` line containing that team's private identity. Keep a
+private backup and share it only with trusted teammates: it grants full authority
+over every app and stored credential using that identity. It is not
+permission-limited delegation. Other teams' identities are not included. Restoring
+the identity lets another computer retrieve the team's credentials from AIR;
+Xcode's Apple Account access and signing certificates remain configured separately.
+
+Restore validates the identity and its team before saving it in the local identity
+file. Restoring the same identity again is safe; a different identity for an existing
+team is rejected. A missing or invalid project selection returns to the identity menu.
+AIR contract locations are derived from the identity and their initial settings, so
+restoring the same identity accesses the same developer and notification contracts
+on another computer.
+
+Piston does not read or automatically migrate its previous Keychain storage. Use
+`cargo piston restore "piston-identity:<data>"` with an explicit backup to retain an
+existing identity. The backup is a required command argument; there is no paste
+prompt. Apple credentials that have not been imported into the developer
+contract are requested by their setup flow. Xcode still manages its signing
+certificates and may show its own Keychain access prompts.
+
+Cargo.toml stores the selected developer identity and public notification references:
 
 ```toml
+[package.metadata.piston.developer]
+team = "ABCDEFGHIJ"
+identity = "<public AIR owner name>"
+
 [package.metadata.piston.notifications]
 enabled = true
 
@@ -260,10 +320,7 @@ enabled = true
 team = "ABCDEFGHIJ"
 topic = "org.example.app"
 identity = "<public AIR owner name>"
-keychain = "cargo-piston/credentials"
 application = "<public AIR application ID>"
-key_id = "1234567890"
-key_path = "/Users/developer/.keys/AuthKey_1234567890.p8"
 ```
 
 Production settings use `notifications.ios.production`; macOS uses
@@ -276,9 +333,9 @@ macOS builder's default identifier.
 Piston creates or opens an ordinary `air_notifications::NotificationApplication`
 contract, waits for confirmed credential acceptance in AIR, and shares its private
 location with the notification service using AIR Inbox. Interrupted setup resumes
-the same application, and rotating credentials preserves its public ID. Confirmed
-AIR storage is distinct from Apple accepting an APNs delivery; key scope and
-revocation are ultimately checked when the notification service contacts Apple.
+the same application. Confirmed AIR storage is distinct from Apple accepting an
+APNs delivery; key scope and revocation are ultimately checked when the notification
+service contacts Apple.
 
 Only the public ID is supplied as `RAMP_NOTIFICATION_APPLICATION` to the actual
 Cargo compilation, including both architectures in universal macOS builds.
@@ -310,6 +367,10 @@ application, prepares an app bundle, asks Xcode to sign it for development, inst
 and launches it with its standard output and standard error attached to your terminal.
 Ctrl-C stops the console session and is forwarded to the app. Repeating the command
 installs an update without uninstalling the app or erasing its container.
+If the phone locks before launch, Piston pauses. Unlock it and press Enter in the
+terminal to retry launching the installed app without rebuilding or reinstalling.
+Type `q` or press Ctrl-C to cancel. Commands without an interactive terminal report
+the locked device and exit instead of waiting for input.
 Each run cleans Xcode's generated signing products before importing the Rust app,
 so Xcode signs the copied executable again. Cargo's compilation cache is preserved.
 
@@ -399,10 +460,9 @@ pairing, and requests automatic development signing and device registration. App
 Account sign-in, verification codes, Trust prompts, and enabling Developer Mode need
 your interaction. Piston reports the specific failure and the next steps in readable
 terminal output. When no signing account is configured or Xcode rejects its login,
-Piston opens the selected Xcode app directly to Settings > Accounts. Successful runs
-and unrelated build failures keep the Xcode UI closed. Rerun the same command after
-completing sign-in; if macOS cannot open the settings automatically, Piston prints the
-manual navigation steps.
+Piston displays a link to Xcode's Accounts settings and the manual navigation steps.
+Open the link or go to Xcode > Settings > Accounts, complete sign-in, then rerun the
+same command.
 
 - **Apple Account rejected or expired:** open Xcode > Settings > Accounts, select the
   account for the listed team, and complete sign-in and verification. Confirm your team
@@ -480,12 +540,14 @@ is never used for a store upload. Select the signing team from the existing menu
 set it in metadata, or pass `--team`. Use the team belonging to the API key below.
 
 App Store Connect API access is separate from Xcode's saved Apple Account. Run your
-deploy command in a terminal. When credentials are missing or invalid, Piston opens
-Apple's API-key page and guides you through setup. Enter the Issuer ID first, then
-either the Team API Key ID or the downloaded `.p8` file's path. Piston finds files by Key ID or infers the Key
-ID from an `AuthKey_<KEY_ID>.p8` filename. Renamed files need the Key ID entered manually.
+deploy command in a terminal. When credentials are missing or invalid, Piston shows
+a link to Apple's API-key page and guides you through setup. Enter the Issuer ID first,
+then either the Team API Key ID or the downloaded `.p8` file's path. Piston finds files
+by Key ID or infers the Key ID from an `AuthKey_<KEY_ID>.p8` filename. Renamed files
+need the Key ID entered manually.
 The Issuer ID comes from Apple's Team Keys page: it cannot be derived from the private
-key. Piston checks API access and remembers the complete configuration for later runs.
+key. Piston checks API access and stores the key, Key ID, and Issuer ID in the selected
+team's encrypted AIR developer contract for later runs.
 Enter `q` to cancel. For automatic signing and uploads, create a
 Team Key with Admin access; the Account Holder may first need to enable API access.
 Store distribution requires Apple Developer Program membership.
@@ -506,49 +568,54 @@ produce a selection menu; scripts must set `ASC_KEY_PATH` to choose one. Discove
 uses filenames, and the selected file and IDs are verified against Apple before saving.
 Spotlight cannot find excluded, unindexed or inaccessible files; entering a path still
 works for an accessible file in an unindexed folder. Piston does not alter search privacy
-settings or copy private key files.
+settings. After import, later deployments retrieve the key from AIR without searching
+for the original file.
 
-Piston writes remembered settings to the selected package's `Cargo.toml`, under
-`package.metadata.piston`. Account setup adds:
+Piston writes public project references to the selected package's `Cargo.toml`:
 
 ```toml
-[package.metadata.piston.app_store_connect]
-issuer_id = "YOUR-ISSUER-UUID"
-key_id = "YOURKEY1234"
-key_path = "/path/to/AuthKey_YOURKEY1234.p8"
+[package.metadata.piston.ios]
+team = "ABCDE12345"
+
+[package.metadata.piston.developer]
+team = "ABCDE12345"
+identity = "<public AIR owner name>"
 ```
 
-Only identifiers and the key-file location are saved; the private key stays in its
-original `.p8` file. Keep that file outside the repository, such as
-`~/.appstoreconnect/private_keys/AuthKey_<KEY_ID>.p8`. A manually configured `key_path`
-may use `~/` or a path relative to the package. Use `--setup` on your deploy command
-to replace the account settings in `Cargo.toml`.
+The key's PEM contents and Apple API identifiers are stored in AIR under the
+selected team's developer identity. No source `.p8` path is saved in the manifest.
+Keep downloaded private keys outside the repository. Use `--setup` on the deploy
+command to import replacement App Store Connect credentials for the selected team.
+Existing AIR credentials take precedence over import environment variables on normal
+runs. Xcode receives a temporary `.p8` file for archive, export, and upload; Piston
+removes that temporary file when the deployment operation releases it, including
+normal error returns. It does not delete the file originally downloaded from Apple.
 
 Signing-team selections are saved as `package.metadata.piston.ios.team`.
 An explicit `--team` changes that saved choice after selection. Successful TestFlight
 uploads save `app_id`, `version`, `build_number`, and `state` in
-`package.metadata.piston.testflight`, so
-deployment can resume even after `cargo clean`. The legacy Apple signing path saves
-its `team` and `identity` in `package.metadata.piston.apple.signing`.
+`package.metadata.piston.testflight`, so deployment can resume even after
+`cargo clean`. The legacy Apple signing path separately saves its `team` and
+`identity` in `package.metadata.piston.apple.signing`.
 
-Old settings and receipt files are not read or migrated. Run deployment in an
-interactive terminal to enter the account setup again. Updates preserve unrelated
-manifest settings, comments, and formatting, and write the selected package's
-manifest even when using `--package` from a workspace. Build products, downloaded
-tools, diagnostics, and provisioning files remain build artifacts; private keys and
-OS-managed credentials remain in their key files or keychain. Xcode is discovered
-on each run.
+Old account settings and receipt files are not read or migrated by the modern
+deployment flow. Run deployment in an interactive terminal to import credentials
+again when no AIR entry exists. Updates preserve unrelated manifest settings,
+comments, and formatting, and write the selected package's manifest even when
+using `--package` from a workspace. Build products, downloaded tools, diagnostics,
+and provisioning files remain build artifacts. Xcode's certificates and Apple
+Account credentials stay managed by Xcode. Xcode is discovered on each run.
 
-For CI, supply `ASC_ISSUER_ID` and either `ASC_KEY_ID` or `ASC_KEY_PATH` through the
-environment. A standard filename supplies the missing Key ID; a unique search match
-supplies the missing file path. Supplying all three remains supported.
-The app's `.env` also supports these names, including their lowercase forms. Shell
-values override `.env`; relative key paths resolve against the selected package.
-If any of these explicit values are supplied, Piston uses that configuration instead
-of mixing it with Cargo.toml account settings from another key. Environment overrides
-are not automatically saved. An explicitly supplied path
-always takes precedence over search results. Noninteractive runs report missing configuration and
-exit instead of prompting. Keep `.env` and private keys out of source control.
+For the initial credential import in CI, first provision the team's local developer
+identity, then supply `ASC_ISSUER_ID` and either `ASC_KEY_ID` or `ASC_KEY_PATH` through
+the environment. A standard filename supplies the missing Key ID; a unique search
+match supplies the missing file path. Supplying all three remains supported.
+Relative input paths resolve against the selected package, and an explicitly
+supplied path takes precedence over search results. Piston validates and saves
+these imported credentials in AIR; subsequent runs need the local identity and AIR
+access, not those environment variables. The modern deployment flow does not read
+`.env` for App Store Connect setup. Noninteractive runs report missing configuration
+and exit instead of prompting.
 
 Create the iOS app record in [App Store Connect → Apps](https://appstoreconnect.apple.com/apps)
 with the same bundle identifier. Piston uses its primary language and the numeric
@@ -619,11 +686,14 @@ If no suitable Xcode is installed, Piston checks the community-maintained
 whose macOS, CPU, and SDK requirements fit. It prefers the Apple silicon installer
 on Apple silicon and a Universal installer on Intel. Download URLs must point to
 Apple's official developer downloads. There is no fixed fallback version. Catalog
-access is needed only for setup; existing installations can be used offline.
+access is needed only for Xcode setup; using an installed Xcode does not require
+that catalog. AIR-backed credentials and Apple deployment services still require
+network access.
 
-In an interactive terminal, Piston opens the exact `.xip` download, waits for the
-completed file in Downloads or Spotlight, extracts it with Apple's `xip`, verifies
-Apple's app signature and the expected version/build, and installs it alongside
+In an interactive terminal, Piston displays a link to the exact `.xip` download.
+Open the link and download the file. Piston waits for the completed file in Downloads
+or Spotlight, extracts it with Apple's `xip`, verifies Apple's app signature and the
+expected version/build, and installs it alongside
 existing versions in `~/Applications/Xcode-<version>-<build>.app`. It then selects
 that Xcode for the current command, prepares its first-launch components, and
 continues the build. It does not overwrite existing applications or remove the
@@ -638,9 +708,9 @@ while waiting or installing.
 
 For a custom download location or noninteractive setup, set
 `PISTON_XCODE_ARCHIVE=/absolute/path/to/Xcode.xip`. The archive must match the version
-and build selected from the catalog. Noninteractive runs never open a browser or
-wait for a download, and report any license or administrator setup still required.
-If this Mac cannot run a suitable release, Piston opens Software Update and explains
+and build selected from the catalog. Noninteractive runs do not wait for a download
+and report any license or administrator setup still required.
+If this Mac cannot run a suitable release, Piston links to Software Update and explains
 the minimum macOS version. See [Apple's compatibility table](https://developer.apple.com/xcode/system-requirements/).
 
 ```sh
@@ -668,17 +738,21 @@ with the same Cargo version and a new build number. To replace a pending upload
 instead of resuming it, run `cargo piston deploy testflight --new-build`.
 `--prepare-only` displays the selected version and build number without reserving it.
 
-A processed build may still need export-compliance answers. Piston opens that exact
-build's TestFlight page once when manual answers are required. Click **Provide Export
-Compliance Information** to open Apple's questionnaire. Piston also prints the direct
-build link and keeps monitoring until Apple clears the build, including during Apple's
+A processed build may still need export-compliance answers. Piston displays a link
+to that exact build's TestFlight page once when manual answers are required. Open the
+link and click **Provide Export Compliance Information** to answer Apple's questionnaire.
+Piston keeps monitoring until Apple clears the build, including during Apple's
 compliance review. Groups configured for automatic internal distribution receive
 eligible builds automatically; otherwise select an Internal Testing group in App
 Store Connect and add the build. External testers require beta information and
 Apple's beta review. This command does not create testers, invite people, submit
 an external beta review, or submit the app for public App Store review.
 
-## Existing platform build setup
+## Legacy platform build/run setup
+
+The remaining sections document the older `build` and `run` paths and their
+manual tool/signing configuration. They do not describe credential storage for
+`cargo piston dev` or `cargo piston deploy`; those flows use the setup above.
 
 Configure your `.env` and project `Cargo.toml` as shown below and install the desired
 build targets via rustup.
@@ -767,10 +841,10 @@ In theory this tool should support build targets for all of the supported operat
 
 # General Configuration
 
-## .ENV configuration
+## Legacy .ENV configuration
 
-Cargo Piston reads its configuration from a `.env` file in your project root — the directory
-you run `cargo piston` from.
+The older `build` and `run` commands read their configuration from a `.env` file in
+your project root — the directory you run `cargo piston` from.
 
 Piston utilizes `cargo`, so it needs to be able to locate it. `cargo`'s file path needs to 
 match the file path in the .env. If `cargo` is on your PATH, Piston can usually find it
@@ -972,9 +1046,11 @@ in [Deploy to TestFlight](#deploy-to-testflight). Use `DEVELOPER_DIR` to overrid
 selection. You do not need to change the system-wide `xcode-select` setting. License
 acceptance and administrator approval, when required, are handled interactively.
 
-## Automated Signing & Automated Device Provisioning
+## Legacy automated signing and device provisioning
 
-Any app that is compiled with piston will automatically be signed for apple app store distribution, provided automated signing is properly configured.
+The older Apple `build` and `run` paths can sign through the configuration below.
+Modern `dev ios` and `deploy` use Xcode automatic provisioning and the earlier
+setup instructions instead.
 
 First, create an App Store Connect API key through your apple developer portal at the following URL. **This MUST be an admin key**. A developer key will not have sufficient privileges to access the device provisioning endpoints.
 
@@ -1079,8 +1155,8 @@ Import the paired .p12 into your keychain
 
 ```
 security import ~/key.p12 \
--k /Users/testor/Library/Keychains/login.keychain-db \
-/Users/testor/Library/Keychains \
+-k $HOME/Library/Keychains/login.keychain-db \
+$HOME/Library/Keychains \
 -P "<password>" \
 -T /usr/bin/codesign \
 -T /usr/bin/productsign

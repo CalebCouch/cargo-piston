@@ -3,51 +3,34 @@ use air_notifications::{ApnsCredentials, NotificationApplication, Notifications}
 use air_server::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
-use crate::host::Credentials;
+use crate::developer::Credentials;
 use crate::manifest::Manifest;
 use crate::{PistonError, Result};
 use super::PushSigning;
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct NotificationSetup {
-    pub manifest: Manifest,
+    manifest: Manifest,
     pub signing: PushSigning,
-    pub settings: HashMap<String, String>,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl NotificationSetup {
     pub fn enabled(manifest: &Manifest) -> Result<Option<bool>> {
-        if let Some(value) = manifest.setting(&["notifications", "enabled"])? {
-            return value.as_bool().map(Some).ok_or_else(|| {
-                PistonError::CargoParseError(
-                    "package.metadata.piston.notifications.enabled must be true or false.".into(),
-                )
-            });
-        }
-        for platform in ["ios", "macos"] {
-            for environment in ["development", "production"] {
-                if !manifest.settings(&["notifications", platform, environment])?.is_empty() {
-                    return Ok(Some(true));
-                }
-            }
-        }
-        Ok(None)
+        Ok(manifest.setting(&["notifications", "enabled"])?
+            .and_then(|value| value.as_bool()))
     }
 
     pub fn new(manifest: &Path, signing: PushSigning) -> Result<Self> {
         let manifest = Manifest::new(manifest)?;
-        let settings = manifest.settings(&[
-            "notifications",
-            signing.platform.name(),
-            if signing.sandbox { "development" } else { "production" },
-        ])?;
-        Ok(Self { manifest, signing, settings })
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
+        Ok(Self { manifest, signing, runtime })
     }
 
     pub fn key_path(&self, input: &str) -> Result<PathBuf> {
@@ -55,19 +38,13 @@ impl NotificationSetup {
         let path = if let Some(path) = input.strip_prefix("~/") {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
-                .ok_or_else(|| {
-                    PistonError::Generic("Cannot expand ~ without a home directory.".into())
-                })?
+                .ok_or(PistonError::MissingEnvironment { name: "HOME" })?
                 .join(path)
         } else {
             self.manifest.path().parent().unwrap().join(input)
         };
         let path = fs::canonicalize(&path).map_err(|error| {
-            PistonError::Generic(format!(
-                "Cannot read the APNs key at {}: {error}. Download it from \
-             https://developer.apple.com/account/resources/authkeys/list.",
-                path.display(),
-            ))
+            PistonError::PushKeyRead { path: path.clone(), source: error }
         })?;
         let root = self.manifest.path().parent().unwrap();
         let repository = Command::new("git")
@@ -78,11 +55,7 @@ impl NotificationSetup {
             .filter(|output| output.status.success())
             .map(|output| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()));
         if path.starts_with(root) || repository.is_some_and(|root| path.starts_with(root)) {
-            return Err(PistonError::Generic(
-                "Keep the APNs .p8 key outside the project and repository, for example in \
-                 ~/.keys. Cargo.toml stores its path, never its contents."
-                    .into(),
-            ));
+            return Err(PistonError::PushKeyInRepository { path });
         }
         Ok(path)
     }
@@ -95,122 +68,100 @@ impl NotificationSetup {
         id.len() == 10 && id.bytes().all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
     }
 
-    pub fn expected_identity(&self) -> Option<&str> {
-        self.settings.get("identity")
-            .filter(|_| self.settings.get("team") == Some(&self.signing.team))
-            .map(String::as_str)
-    }
-
-    pub fn configure(&self, path: &Path, key_id: &str, refresh: bool, store: &mut Credentials) -> Result<String> {
-        if !Self::valid_id(key_id) || !Self::valid_id(&self.signing.team) {
-            return Err(PistonError::Generic(
-                "APNs Key ID and Team ID must be 10 uppercase letters or digits.".into(),
-            ));
-        }
-        if Self::key_id(path).is_some_and(|id| id != key_id) {
-            return Err(PistonError::Generic(
-                "The APNs Key ID does not match the .p8 filename.".into(),
-            ));
-        }
-        let key = fs::read_to_string(path).map_err(|error| {
-            PistonError::Generic(format!("Cannot read APNs key {}: {error}", path.display(),))
-        })?;
-        let encoding = jsonwebtoken::EncodingKey::from_ec_pem(key.as_bytes()).map_err(|_| {
-            PistonError::Generic("The APNs .p8 file must contain an EC private key.".into())
-        })?;
-        jsonwebtoken::encode(
-            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-            &serde_json::json!({"iss": self.signing.team, "iat": 0}),
-            &encoding,
-        )
-        .map_err(|_| {
-            PistonError::Generic("The APNs .p8 file is not a valid P-256 signing key.".into())
-        })?;
-        let credentials =
-            ApnsCredentials { key, key_id: key_id.into(), team_id: self.signing.team.clone() };
-        let same_app = self.settings.get("team") == Some(&self.signing.team)
-            && self.settings.get("topic") == Some(&self.signing.topic);
-        let secret = store.identity(&self.signing.team, self.expected_identity())?
-            .ok_or_else(|| PistonError::Generic(
-                "The team's developer identity is missing. \
-                 Run cargo piston setup or cargo piston restore.".into(),
-            ))?;
+    pub fn configure(&self, key: Option<(&Path, &str)>, store: &mut Credentials) -> Result<Option<String>> {
+        let team = &self.signing.team;
+        let account = format!(
+            "apns:{}:{}:{}", self.signing.platform.name(), self.signing.topic, self.signing.sandbox,
+        );
+        self.runtime.block_on(store.load(team))?;
+        let credentials = match key {
+            Some((path, key_id)) => {
+                if !Self::valid_id(key_id) || !Self::valid_id(team) {
+                    return Err(PistonError::PushIdentifiersInvalid);
+                }
+                if Self::key_id(path).is_some_and(|id| id != key_id) {
+                    return Err(PistonError::PushKeyIdMismatch {
+                        key_id: key_id.into(), path: path.to_path_buf(),
+                    });
+                }
+                let key = fs::read_to_string(path).map_err(|source| {
+                    PistonError::PushKeyRead { path: path.to_path_buf(), source }
+                })?;
+                let encoding = jsonwebtoken::EncodingKey::from_ec_pem(key.as_bytes())
+                    .map_err(PistonError::PushKeyEncoding)?;
+                jsonwebtoken::encode(
+                    &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
+                    &serde_json::json!({"iss": team, "iat": 0}), &encoding,
+                ).map_err(PistonError::PushKeySigning)?;
+                let credentials = ApnsCredentials { key, key_id: key_id.into(), team_id: team.clone() };
+                let bytes = serde_json::to_vec(&credentials).unwrap();
+                self.runtime.block_on(store.save(team, &account, bytes))?;
+                credentials
+            }
+            None => match store.get(team, &account) {
+                Some(bytes) => serde_json::from_slice(bytes)
+                    .map_err(PistonError::PushCredentialsInvalid)?,
+                None => return Ok(None),
+            },
+        };
+        if credentials.team_id != *team { return Err(PistonError::PushIdentifiersInvalid); }
+        let secret = store.identity(team, None)?
+            .ok_or_else(|| PistonError::PushIdentityMissing { team: team.clone() })?;
         let owner = secret.name().to_string();
         let init = (self.signing.topic.clone(), self.signing.sandbox);
-        let mut registration = Registration::new(&secret, &init, store)?;
-        let application = registration.instance.id().to_string();
-        if same_app && self.settings.get("application").is_some_and(|id| id != &application) {
-            return Err(PistonError::Generic(
-                "The saved notification application does not match its Keychain identity.".into(),
-            ));
-        }
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| PistonError::Generic(error.to_string()))?;
-        runtime.block_on(async {
-            let publish = registration.publish(credentials, refresh, secret, init, store);
+        let application = self.runtime.block_on(async {
+            let publish = async {
+                let mut registration = Registration::new(team, &secret, &init, store).await?;
+                let application = registration.instance.id().to_string();
+                registration.publish(credentials, key.is_some(), secret, init, store).await?;
+                Ok(application)
+            };
             tokio::time::timeout(Duration::from_secs(90), publish).await
-                .map_err(|_| PistonError::Generic(
-                    "Notification setup timed out before confirmation. Check your connection and rerun; \
-                     Piston will resume the same registration.".into(),
-                ))?
+                .map_err(|_| PistonError::PushSetupTimeout)?
         })?;
         self.manifest.save::<&str>(
             &[
-                "notifications",
-                self.signing.platform.name(),
+                "notifications", self.signing.platform.name(),
                 if self.signing.sandbox { "development" } else { "production" },
             ],
             &[
-                ("team", &self.signing.team),
-                ("topic", &self.signing.topic),
-                ("identity", &owner),
-                ("keychain", "cargo-piston/credentials"),
-                ("application", &application),
-                ("key_id", key_id),
-                ("key_path", &path.to_string_lossy()),
+                ("team", team), ("topic", &self.signing.topic),
+                ("identity", &owner), ("application", &application),
             ],
         )?;
-        Ok(application)
+        Ok(Some(application))
     }
 }
 
 #[derive(Serialize, Deserialize)]
 struct Registration {
+    team: String,
     instance: Instance<NotificationApplication>,
     inbox: Inbox,
-    shared: bool,
+    shared: Option<bool>,
 }
 
 impl Registration {
-    fn new(secret: &Secret, init: &(String, bool), store: &mut Credentials) -> Result<Self> {
+    async fn new(team: &str, secret: &Secret, init: &(String, bool), store: &mut Credentials) -> Result<Self> {
         let location = Instance::<NotificationApplication>::generate_location(secret, init)
-            .map_err(|error| {
-                PistonError::Generic(format!("Cannot create notification location: {error:?}"))
-            })?;
+            .map_err(|error| PistonError::PushLocationError(format!("{error:?}")))?;
         let account = format!("application:{}", Id::hash(&location));
-        if let Some(bytes) = store.get(&account) {
-            let registration: Self = serde_json::from_slice(bytes).map_err(|_| {
-                PistonError::Generic(
-                    "Invalid notification registration in Keychain. Restore its backup.".into(),
-                )
-            })?;
-            if registration.instance.location() != &location {
-                return Err(PistonError::Generic(
-                    "The Keychain notification location does not match this app.".into(),
-                ));
+        if let Some(bytes) = store.get(team, &account) {
+            let registration: Self = serde_json::from_slice(bytes)
+                .map_err(PistonError::PushRegistrationInvalid)?;
+            if registration.team != team || registration.instance.location() != &location {
+                return Err(PistonError::PushLocationMismatch);
             }
             return Ok(registration);
         }
         let instance = Instance::receive(secret.clone(), location).map_err(|error| {
-            PistonError::Generic(format!("Cannot create notification contract: {error:?}"))
+            PistonError::PushContractError(format!("{error:?}"))
         })?;
         let inbox = Inbox::new(secret.clone()).map_err(|error| {
-            PistonError::Generic(format!("Cannot create deployment inbox: {error:?}"))
+            PistonError::PushInboxError(format!("{error:?}"))
         })?;
-        let registration = Self { instance, inbox, shared: false };
-        registration.save(store)?;
+        let registration = Self { team: team.into(), instance, inbox, shared: None };
+        registration.save(store).await?;
         Ok(registration)
     }
 
@@ -218,85 +169,80 @@ impl Registration {
         &mut self, credentials: ApnsCredentials, refresh: bool,
         secret: Secret, init: (String, bool), store: &mut Credentials,
     ) -> Result<()> {
-        if !refresh && self.shared && self.matches(&credentials) { return Ok(()); }
+        if !refresh && self.shared == Some(true) && self.matches(&credentials) { return Ok(()); }
         let mut resolver = DefaultResolver::default();
         let identity = resolver.resolve(self.instance.location().server, None).await;
         let client = Client::new((*identity).clone(), "wss")
             .await
-            .map_err(|error| PistonError::Generic(format!("Cannot connect to AIR: {error}")))?;
-        self.synchronize(&client, &mut resolver, store).await?;
+            .map_err(|error| PistonError::PushConnectionError(error.to_string()))?;
+        self.synchronize(&client, &mut resolver, &secret, store).await?;
         if self.instance.confirmed().is_none() {
-            self.instance = Instance::new(secret, init).map_err(|error| {
-                PistonError::Generic(format!("Cannot initialize notification contract: {error:?}"))
+            self.instance = Instance::new(secret.clone(), init).map_err(|error| {
+                PistonError::PushInitializationError(format!("{error:?}"))
             })?;
-            self.synchronize(&client, &mut resolver, store).await?;
+            self.synchronize(&client, &mut resolver, &secret, store).await?;
         }
         if !self.matches(&credentials) {
             if !self.instance.send(credentials.clone()) {
-                return Err(PistonError::Generic(
-                    "The deployment identity cannot update this notification contract.".into(),
-                ));
+                return Err(PistonError::PushUpdateDenied);
             }
-            self.synchronize(&client, &mut resolver, store).await?;
+            self.synchronize(&client, &mut resolver, &secret, store).await?;
             if !self.matches(&credentials) {
-                return Err(PistonError::Generic(
-                    "AIR did not confirm acceptance of the APNs credentials.".into(),
-                ));
+                return Err(PistonError::PushCredentialsUnconfirmed);
             }
         }
-        if !self.shared {
-            // Reusing the encrypted inbox channel safely resumes writes after interruption.
-            self.inbox
-                .send(&mut resolver, Notifications::server(), *self.instance.location())
-                .await;
+        if self.shared != Some(true) {
+            if self.shared.is_none() {
+                self.inbox.send(&mut resolver, Notifications::server(), *self.instance.location()).await;
+                self.shared = Some(false);
+            }
             let mut requests = self.inbox.start();
-            self.save(store)?;
+            self.save(store).await?;
             while !requests.is_empty() {
                 for (kind, request) in requests {
                     let responses = client.send(request).await;
                     let response = responses.recv().await.map_err(|_| {
-                        PistonError::Generic(
-                            "AIR disconnected before the notification configuration was shared."
-                                .into(),
-                        )
+                        PistonError::PushSharingDisconnected
                     })?;
                     if matches!(response, Response::InvalidSignature) {
-                        return Err(PistonError::Generic(
-                            "AIR rejected the notification inbox signature.".into(),
-                        ));
+                        return Err(PistonError::PushInboxSignatureRejected);
                     }
                     self.inbox.response(&mut resolver, kind, response).await;
                 }
                 requests = self.inbox.requests();
-                self.save(store)?;
+                self.save(store).await?;
             }
-            self.shared = true;
-            self.save(store)?;
+            self.shared = Some(true);
+            self.save(store).await?;
         }
         Ok(())
     }
 
-    async fn synchronize(&mut self, client: &Client, resolver: &mut DefaultResolver, store: &mut Credentials) -> Result<()> {
+    async fn synchronize(&mut self, client: &Client, resolver: &mut DefaultResolver, secret: &Secret, store: &mut Credentials) -> Result<()> {
+        let mut initializing = self.instance.confirmed().is_none() && self.instance.pending().is_some();
         let mut request = Some(self.instance.start());
         while let Some(outgoing) = request {
-            self.save(store)?;
+            self.save(store).await?;
             let responses = client.send(outgoing).await;
             let response = responses.recv().await.map_err(|_| {
-                PistonError::Generic(
-                    "AIR disconnected before confirming notification setup.".into(),
-                )
+                PistonError::PushConfirmationDisconnected
             })?;
             match self.instance.response(resolver, response).await {
+                Output::Init(_) if initializing => {
+                    self.instance = Instance::receive(secret.clone(), *self.instance.location())
+                        .map_err(|error| PistonError::PushContractError(format!("{error:?}")))?;
+                    initializing = false;
+                    request = Some(self.instance.start());
+                    continue;
+                }
                 Output::Created(false, _) | Output::Read(false, _) | Output::Garbage => {
-                    return Err(PistonError::Generic(
-                        "AIR rejected the notification configuration update.".into(),
-                    ));
+                    return Err(PistonError::PushUpdateRejected);
                 }
                 _ => {}
             }
             request = self.instance.request();
         }
-        self.save(store)
+        self.save(store).await
     }
 
     fn matches(&self, credentials: &ApnsCredentials) -> bool {
@@ -310,8 +256,8 @@ impl Registration {
         )
     }
 
-    fn save(&self, store: &mut Credentials) -> Result<()> {
-        store
-            .save(&format!("application:{}", self.instance.id()), serde_json::to_vec(self).unwrap())
+    async fn save(&self, store: &mut Credentials) -> Result<()> {
+        let account = format!("application:{}", self.instance.id());
+        store.save(&self.team, &account, serde_json::to_vec(self).unwrap()).await
     }
 }

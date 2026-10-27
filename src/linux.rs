@@ -11,6 +11,7 @@ use crate::error::PistonError;
 use crate::host::LinuxToolchain;
 
 pub mod cli;
+pub use cli::Cli;
 #[cfg(target_os = "macos")]
 mod macos;
 
@@ -105,31 +106,23 @@ impl AppImage {
             &format!("{appdir_prefix}/usr/bin"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| PistonError::Generic(format!("Failed to create dir usr/bin: {}", e)))?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         fs.push_dir_all(
             &format!("{appdir_prefix}/usr/share/applications"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| {
-            PistonError::Generic(format!("Failed to create dir usr/share/applications: {}", e))
-        })?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         fs.push_dir_all(
             &format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| {
-            PistonError::Generic(format!("Failed to create dir usr/share/icons/...: {}", e))
-        })?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         {
             let binary_data = fs::read(&binary_path).map_err(|e| {
-                PistonError::Generic(format!(
-                    "Failed to read binary {}: {}",
-                    &binary_path.display(),
-                    e
-                ))
+                PistonError::ReadFile { path: binary_path.clone(), source: e }
             })?;
 
             fs.push_file(
@@ -137,9 +130,7 @@ impl AppImage {
                 &format!("{appdir_prefix}/usr/bin/{}", &app_name),
                 NodeHeader { permissions: 0o755, ..NodeHeader::default() },
             )
-            .map_err(|e| {
-                PistonError::Generic(format!("Failed to push binary into AppDir: {}", e))
-            })?;
+            .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
         }
 
         let apprun_content = format!("#!/bin/sh\nexec \"$APPDIR/usr/bin/{}\" \"$@\"\n", app_name);
@@ -148,7 +139,7 @@ impl AppImage {
             &format!("{appdir_prefix}/AppRun"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| PistonError::Generic(format!("Failed to push apprun content: {}", e)))?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         let desktop_content = format!(
             r#"[Desktop Entry]
@@ -168,21 +159,21 @@ Comment={}
             &format!("{appdir_prefix}/{}.desktop", app_name),
             NodeHeader { permissions: 0o644, ..NodeHeader::default() },
         )
-        .map_err(|e| PistonError::Generic(format!("Failed to push {}.desktop: {}", app_name, e)))?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         let icon_dest =
             format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps/{}.png", app_name);
 
         {
             let file = fs::read(&icon_path).map_err(|e| {
-                PistonError::Generic(format!("Failed to read icon {}: {}", icon_path.display(), e))
+                PistonError::ReadFile { path: icon_path.clone(), source: e }
             })?;
 
             let mut header = NodeHeader::default();
             header.permissions = 0o644;
 
             fs.push_file(Cursor::new(file), &icon_dest, header).map_err(|e| {
-                PistonError::Generic(format!("Failed to push icon into AppDir: {}", e))
+                PistonError::LinuxImageError(e.to_string())
             })?;
         }
 
@@ -194,31 +185,28 @@ Comment={}
             &dir_icon,
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| PistonError::Generic(format!("Failed to create .DirIcon symlink: {}", e)))?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
         fs.push_symlink(
             icon_dest,
             &root_icon,
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| PistonError::Generic(format!("Failed to create root icon symlink: {}", e)))?;
+        .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         if let Some(assets) = &assets {
             let base_dest = format!("{appdir_prefix}/assets");
 
             fs.push_dir_all(&base_dest, NodeHeader { permissions: 0o755, ..NodeHeader::default() })
-                .map_err(|e| {
-                    PistonError::Generic(format!("Failed to create assets directory: {}", e))
-                })?;
+                .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
-            Self::add_assets(&mut fs, assets, &base_dest)
-                .map_err(|e| PistonError::Generic(format!("Failed to bundle assets: {}", e)))?;
+            Self::add_assets(&mut fs, assets, &base_dest)?;
         }
 
         let squash_path = output_dir.join(format!("{}.squashfs", app_name));
         let mut squash_file = File::create(&squash_path)
-            .map_err(|e| PistonError::Generic(format!("Failed to create squashfs file: {}", e)))?;
+            .map_err(|source| PistonError::CreateFileError { path: squash_path.clone(), source })?;
         fs.write(&mut squash_file)
-            .map_err(|e| PistonError::Generic(format!("Failed to write squashfs: {}", e)))?;
+            .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
 
         let binding = runtime_path.unwrap();
         let runtime_dir = Path::new(&binding);
@@ -232,52 +220,49 @@ Comment={}
             t if t.starts_with("ppc64le") => "runtime-ppc64le",
             t if t.starts_with("riscv64") => "runtime-riscv64",
             _ => {
-                return Err(PistonError::Generic(format!(
-                    "Unsupported target architecture for AppImage: {}\n\
-                    Supported: x86_64, aarch64, arm*, i686, ppc64le, riscv64",
-                    target
-                )));
+                return Err(PistonError::LinuxAppImageTargetUnsupported { target });
             }
         };
         let runtime_path = runtime_dir.join(runtime_filename);
         if !runtime_path.exists() {
-            return Err(PistonError::Generic(format!(
-                "{} not found in {}",
-                runtime_filename,
-                runtime_dir.display()
-            )));
+            return Err(PistonError::LinuxRuntimeMissing { path: runtime_path });
         }
 
-        let mut runtime = File::open(runtime_path)
-            .map_err(|e| PistonError::Generic(format!("Failed to open runtime: {}", e)))?;
+        let mut runtime = File::open(&runtime_path)
+            .map_err(|source| PistonError::ReadFile { path: runtime_path.clone(), source })?;
 
         let mut appimage_file = File::create(&final_appimage)
-            .map_err(|e| PistonError::Generic(format!("Failed to create final AppImage: {}", e)))?;
+            .map_err(|source| PistonError::CreateFileError { path: final_appimage.clone(), source })?;
 
-        io::copy(&mut runtime, &mut appimage_file)
-            .map_err(|e| PistonError::Generic(format!("Failed to copy runtime: {}", e)))?;
+        io::copy(&mut runtime, &mut appimage_file).map_err(|source| PistonError::CopyFileError {
+            input_path: runtime_path, output_path: final_appimage.clone(), source,
+        })?;
 
         let mut squash = File::open(&squash_path)
-            .map_err(|e| PistonError::Generic(format!("Failed to open squashfs: {}", e)))?;
+            .map_err(|source| PistonError::ReadFile { path: squash_path.clone(), source })?;
 
-        io::copy(&mut squash, &mut appimage_file)
-            .map_err(|e| PistonError::Generic(format!("Failed to append squashfs: {}", e)))?;
+        io::copy(&mut squash, &mut appimage_file).map_err(|source| PistonError::CopyFileError {
+            input_path: squash_path.clone(), output_path: final_appimage.clone(), source,
+        })?;
 
         fs::set_permissions(&final_appimage, fs::Permissions::from_mode(0o755))
-            .map_err(|e| PistonError::Generic(format!("Failed to set permissions: {}", e)))?;
+            .map_err(|source| PistonError::SetPermissions { path: final_appimage.clone(), source })?;
 
         let _ = fs::remove_file(squash_path);
 
         Ok(final_appimage)
     }
 
-    fn add_assets(fs: &mut FilesystemWriter, source_dir: &Path, dest_base: &str) -> Result<(), String> {
-        for entry in fs::read_dir(source_dir).map_err(|e| e.to_string())? {
-            let entry = entry.map_err(|e| e.to_string())?;
+    fn add_assets(fs: &mut FilesystemWriter, source_dir: &Path, dest_base: &str) -> Result<(), PistonError> {
+        for entry in fs::read_dir(source_dir).map_err(|source| PistonError::ReadDirError {
+            path: source_dir.into(), source,
+        })? {
+            let entry = entry.map_err(|source| PistonError::MapDirError {
+                path: source_dir.into(), source,
+            })?;
             let path = entry.path();
 
-            let relative =
-                path.strip_prefix(source_dir).map_err(|e| format!("Strip prefix failed: {}", e))?;
+            let relative = path.strip_prefix(source_dir).unwrap();
             let dest_path = PathBuf::from(dest_base).join(relative).to_string_lossy().into_owned();
 
             if path.is_dir() {
@@ -285,18 +270,18 @@ Comment={}
                     &dest_path,
                     NodeHeader { permissions: 0o755, ..NodeHeader::default() },
                 )
-                .map_err(|e| format!("push_dir_all failed for {}: {}", dest_path, e))?;
+                .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
                 Self::add_assets(fs, &path, &dest_path)?;
             } else {
                 let data = fs::read(&path)
-                    .map_err(|e| format!("Failed to read {}: {}", path.display(), e))?;
+                    .map_err(|source| PistonError::ReadFile { path: path.clone(), source })?;
 
                 fs.push_file(
                     Cursor::new(data),
                     &dest_path,
                     NodeHeader { permissions: 0o644, ..NodeHeader::default() },
                 )
-                .map_err(|e| format!("Failed to push file {}: {}", dest_path, e))?;
+                .map_err(|e| PistonError::LinuxImageError(e.to_string()))?;
             }
         }
         Ok(())
@@ -314,127 +299,55 @@ impl GPGSigner {
         output.is_ok_and(|output| output.status.success())
     }
 
-    fn gpg_sign(key_id: Option<String>, key_pass: Option<String>, gpg_path: Option<String>, bundle_path: &PathBuf) -> String {
-        let mut sig_path = bundle_path.clone();
-        sig_path.set_extension("asc");
-
-        let mut cmd = Command::new(gpg_path.unwrap());
-
-        cmd.arg("--batch");
-        cmd.arg("--no-tty");
-        cmd.arg("--yes");
-        cmd.arg("--pinentry-mode").arg("loopback");
-        cmd.arg("--passphrase-fd").arg("0");
-
-        cmd.arg("--armor")
-            .arg("--output")
-            .arg(&sig_path)
-            .arg("-u")
-            .arg(&key_id.unwrap())
-            .arg("--detach-sig")
-            .arg("--verbose")
-            .arg(&bundle_path.display().to_string())
-            .stdin(Stdio::piped());
-
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(..) => return "Error spawning child process, GPG signing failed".to_string(),
-        };
-
+    fn gpg_sign(
+        key_id: Option<String>, key_pass: Option<String>,
+        gpg_path: Option<String>, bundle_path: &Path,
+    ) -> Result<PathBuf, PistonError> {
+        let sig_path = bundle_path.with_extension("asc");
+        let mut command = Command::new(gpg_path.unwrap());
+        command.args(["--batch", "--no-tty", "--yes", "--pinentry-mode", "loopback"])
+            .args(["--passphrase-fd", "0", "--armor", "--output"]).arg(&sig_path)
+            .arg("-u").arg(key_id.unwrap()).args(["--detach-sig", "--verbose"])
+            .arg(bundle_path).stdin(Stdio::piped());
+        let mut child = command.spawn().map_err(|source| PistonError::CommandSpawn {
+            program: command.get_program().into(), source,
+        })?;
         if let Some(pass) = key_pass {
-            if let Some(mut stdin) = child.stdin.take() {
-                match stdin.write(pass.as_bytes()) {
-                    Ok(res) => res,
-                    Err(..) => {
-                        return "Error writing passphrase to bytes, GPG signing failed".to_string();
-                    }
-                };
-            }
+            child.stdin.take().unwrap().write_all(pass.as_bytes())
+                .map_err(PistonError::LinuxSigningInput)?;
         }
-
-        let output = match child.wait_with_output() {
-            Ok(c) => c,
-            Err(..) => return "Error with gpg child output spawn, GPG signing failed".to_string(),
-        };
+        let output = child.wait_with_output().map_err(|source| PistonError::CommandWait {
+            program: command.get_program().into(), source,
+        })?;
         if !output.status.success() {
-            let err_msg = String::from_utf8_lossy(&output.stderr);
-            return format!("GPG signing failed: {}", err_msg);
+            return Err(PistonError::CommandFailed {
+                program: command.get_program().into(), output,
+            });
         }
-
-        format!(
-            "successfully signed {} with signature at {:?}",
-            bundle_path.display(),
-            sig_path.display()
-        )
+        Ok(sig_path)
     }
 }
 
 impl LinuxBuilder {
-    fn post_build(&self) -> Result<Vec<String>, PistonError> {
-        let mut messages = Vec::new();
-        messages.push(format!("post build for linux"));
-        let binary_path = self
-            .cwd
-            .join("target")
-            .join(&self.target)
-            .join(if self.release { "release" } else { "debug" })
-            .join(&self.app_name);
-        let bundle_path = &self.output_path;
-        messages.push(format!("binary path is: {}", &binary_path.display()));
-        messages.push(format!("bundle path is: {}", &bundle_path.display()));
-        let icon_path: PathBuf = PathBuf::from(&self.icon_path);
-        let assets_str: &str = self.assets.as_ref();
-        let assets_path: PathBuf = PathBuf::from(assets_str);
-        let assets = assets_path.exists().then_some(assets_path);
+    fn post_build(&self) -> Result<PathBuf, PistonError> {
+        let binary_path = self.cwd.join("target").join(&self.target)
+            .join(if self.release { "release" } else { "debug" }).join(&self.app_name);
+        let assets = PathBuf::from(&self.assets);
         if self.appimage {
-            if self.runtime_path.is_some() {
-                let image = AppImage::build(
-                    self.app_name.clone(),
-                    self.runtime_path.clone(),
-                    self.target.clone(),
-                    binary_path.clone(),
-                    bundle_path.clone(),
-                    icon_path,
-                    None,
-                    assets,
-                )?;
-                messages.push(format!("appimage was created: {:?}", image));
-                if GPGSigner::gpg_valid(self.key_id.clone(), self.gpg_path.clone()) {
-                    messages.push(format!("key is valid"));
-                    let sign = GPGSigner::gpg_sign(
-                        self.key_id.clone(),
-                        self.key_pass.clone(),
-                        self.gpg_path.clone(),
-                        &image,
-                    );
-                    messages.push(format!("{}", sign));
-                }
-                messages.push(format!("app image available at: {}", &image.display()));
-            } else {
-                return Err(PistonError::Generic("Missing path to runtimes in .env".to_string()));
+            if self.runtime_path.is_none() {
+                return Err(PistonError::MissingSetting { key: "linux_runtime_path".into() });
             }
+            AppImage::build(
+                self.app_name.clone(), self.runtime_path.clone(), self.target.clone(),
+                binary_path, self.output_path.clone(), PathBuf::from(&self.icon_path), None,
+                assets.exists().then_some(assets),
+            )
         } else {
-            messages.push(format!("Building static binary"));
-            let target_path = bundle_path.join(&self.app_name);
-            messages.push(format!("copying binary to app bundle"));
-            copy(&binary_path, &target_path).map_err(|e| PistonError::CopyFileError {
-                input_path: target_path.to_path_buf(),
-                output_path: bundle_path.to_path_buf(),
-                source: e,
+            let target_path = self.output_path.join(&self.app_name);
+            copy(&binary_path, &target_path).map_err(|source| PistonError::CopyFileError {
+                input_path: binary_path, output_path: target_path.clone(), source,
             })?;
-            //TODO tarball the static binary and output it at the output path
-            if GPGSigner::gpg_valid(self.key_id.clone(), self.gpg_path.clone()) {
-                messages.push(format!("key is valid"));
-                let sign = GPGSigner::gpg_sign(
-                    self.key_id.clone(),
-                    self.key_pass.clone(),
-                    self.gpg_path.clone(),
-                    &target_path,
-                );
-                messages.push(format!("{}", sign));
-            }
-            messages.push(format!("app bundle available at: {}", &bundle_path.display()));
+            Ok(target_path)
         }
-        Ok(messages)
     }
 }

@@ -10,6 +10,7 @@ pub struct IOSDevice {
     pub udid: String,
     pub name: String,
     connected: bool,
+    available: bool,
     wired: bool,
     pub paired: bool,
     developer_mode: Option<String>,
@@ -24,8 +25,9 @@ impl IOSDevice {
         let name = value.pointer("/deviceProperties/name")?.as_str()?.to_owned();
         let wired = value.pointer("/connectionProperties/transportType").and_then(Value::as_str)
             == Some("wired");
-        let connected = value.pointer("/connectionProperties/tunnelState").and_then(Value::as_str)
-            == Some("connected");
+        let tunnel = value.pointer("/connectionProperties/tunnelState").and_then(Value::as_str);
+        let connected = tunnel == Some("connected");
+        let available = wired || matches!(tunnel, Some("connected" | "disconnected"));
         let paired = match value.pointer("/connectionProperties/pairingState")?.as_str()? {
             "paired" => true,
             "unpaired" => false,
@@ -39,7 +41,7 @@ impl IOSDevice {
             .pointer("/deviceProperties/osVersionNumber")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        Some(Self { id, udid, name, connected, wired, paired, developer_mode, os_version })
+        Some(Self { id, udid, name, connected, available, wired, paired, developer_mode, os_version })
     }
 }
 
@@ -62,33 +64,55 @@ impl IOSDevelopment {
             .arg("--quiet")
             .output()
             .map_err(|error| PistonError::XcrunInstallError(error.to_string()))?;
-        IOSApplication::check(output, "Installing the app")?;
+        IOSApplication::check(output, "devicectl")?;
         Ok(())
     }
 
     pub fn launch(&self, identifier: &str, device: &IOSDevice, arguments: &[String]) -> Result<()> {
+        let diagnostics = tempfile::tempdir()
+            .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
+        let lock_state = diagnostics.path().join("lock-state.json");
+        let output = self.command("devicectl")
+            .args([
+                "device", "info", "lockState", "--device", &device.id,
+                "--quiet", "--timeout", "10", "--json-output",
+            ])
+            .arg(&lock_state).output()
+            .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
+        IOSApplication::check(output, "devicectl")?;
+        let contents = fs::read(&lock_state)
+            .map_err(|source| PistonError::ReadFile { path: lock_state, source })?;
+        let document: Value = serde_json::from_slice(&contents)
+            .map_err(|error| PistonError::IntoJSONError(error.to_string()))?;
+        let locked = document.pointer("/result/passcodeRequired").and_then(Value::as_bool)
+            .ok_or(PistonError::IosLockStateMissing)?;
+        if locked { return Err(PistonError::IosDeviceLocked { name: device.name.clone() }); }
+
+        let launch_result = diagnostics.path().join("launch.json");
         let status = self
             .command("devicectl")
             .args([
-                "device",
-                "process",
-                "launch",
-                "--device",
-                &device.id,
-                "--terminate-existing",
-                "--console",
-                identifier,
+                "device", "process", "launch", "--device", &device.id,
+                "--terminate-existing", "--console", "--json-output",
             ])
-            .arg("--")
-            .args(arguments)
-            .status()
+            .arg(&launch_result).arg(identifier).arg("--").args(arguments).status()
             .map_err(|error| PistonError::XcrunLaunchError(error.to_string()))?;
-        if !status.success() {
-            return Err(PistonError::XcrunLaunchError(format!(
-                "Device console exited with {status}"
-            )));
+        if status.success() { return Ok(()); }
+        if status.code() == Some(1) {
+            let document = fs::read(&launch_result).ok()
+                .and_then(|contents| serde_json::from_slice::<Value>(&contents).ok());
+            let mut error = document.as_ref().and_then(|document| document.get("error"));
+            while let Some(cause) = error {
+                if cause.get("domain").and_then(Value::as_str)
+                    == Some("FBSOpenApplicationErrorDomain")
+                    && cause.get("code").and_then(Value::as_u64) == Some(7)
+                {
+                    return Err(PistonError::IosDeviceLocked { name: device.name.clone() });
+                }
+                error = cause.pointer("/userInfo/NSUnderlyingError/error");
+            }
         }
-        Ok(())
+        Err(PistonError::CommandStatus { program: "devicectl".into(), status })
     }
 }
 
@@ -102,26 +126,17 @@ impl IOSDevelopment {
                 &device.id == selector || &device.udid == selector || &device.name == selector
             });
         } else {
-            devices.retain(|device| device.connected || device.wired);
+            devices.retain(|device| device.available);
             if devices.iter().any(|device| device.wired) { devices.retain(|device| device.wired); }
         }
         if devices.is_empty() { return Ok(None); }
         if devices.len() > 1 {
-            let choices = devices
-                .iter()
-                .map(|device| format!("{} ({})", device.name, device.udid))
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(PistonError::XcrunDevicectlError(format!(
-                "Multiple devices match: {choices}. Select one with --device <name-or-UDID>."
-            )));
+            let devices = devices.into_iter().map(|device| (device.name, device.udid)).collect();
+            return Err(PistonError::IosDevicesAmbiguous { devices });
         }
         let device = devices.remove(0);
-        if !device.connected && !device.wired {
-            return Err(PistonError::XcrunDevicectlError(format!(
-                "{} is not connected.",
-                device.name
-            )));
+        if !device.available {
+            return Err(PistonError::IosDeviceUnavailable { name: device.name });
         }
         Ok(Some(device))
     }
@@ -133,14 +148,9 @@ impl IOSDevelopment {
             .arg(self.application.work().join("pairing.json"))
             .output()
             .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
-        IOSApplication::check(
-            output,
-            "Pairing with the phone; unlock it and accept Trust This Computer",
-        )?;
+        IOSApplication::check(output, "devicectl")?;
         let device = self.devices()?.into_iter().find(|current| current.udid == device.udid)
-            .ok_or_else(|| PistonError::XcrunDevicectlError(
-                "The selected phone disappeared after pairing. Reconnect and unlock it, then rerun.".into()
-            ))?;
+            .ok_or_else(|| PistonError::IosDeviceDisappeared { name: device.name.clone() })?;
         Ok(device)
     }
 
@@ -160,49 +170,23 @@ impl IOSDevelopment {
             .arg(self.application.work().join("selected-device.json"))
             .output()
             .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
-        IOSApplication::check(
-            output,
-            "Connecting to the selected device; unlock it and accept any Trust prompt",
-        )?;
+        IOSApplication::check(output, "devicectl")?;
         for attempt in 0..5 {
             let current = self
                 .devices()?
                 .into_iter()
                 .find(|current| current.udid == device.udid)
-                .ok_or_else(|| {
-                PistonError::XcrunDevicectlError(format!(
-                    "{} disconnected while connecting. Reconnect and unlock it, then rerun.",
-                    device.name
-                ))
-            })?;
+                .ok_or_else(|| PistonError::IosDeviceDisappeared { name: device.name.clone() })?;
             if current.developer_mode.as_deref() == Some("disabled") {
-                let version = current
-                    .os_version
-                    .as_ref()
-                    .map(|version| format!(" (iOS {version})"))
-                    .unwrap_or_default();
-                return Err(PistonError::XcrunDevicectlError(format!(
-                    "Developer Mode is disabled on {}{version}. Pairing succeeded.\n\n\
-                    1. Reopen Settings on the phone and scroll to the bottom of Privacy & Security.\n\
-                    2. Turn on Developer Mode and accept the restart.\n\
-                    3. Unlock the phone after restart and confirm Turn On.\n\
-                    4. Rerun the same cargo piston dev command.\n\n\
-                    If the setting is missing, reopen Settings after pairing. If it is still missing, \
-                    select the phone in Xcode's device manager and let Xcode prepare it.\n\
-                    Apple requires this confirmation on the phone.",
-                    current.name
-                )));
+                return Err(PistonError::IosDeveloperModeDisabled {
+                    name: current.name, version: current.os_version,
+                });
             }
             if current.paired && current.connected { return Ok(current); }
             if attempt < 4 {
                 std::thread::sleep(std::time::Duration::from_secs(1));
             } else {
-                return Err(PistonError::XcrunDevicectlError(format!(
-                    "{} is attached, but Apple's development connection is not ready. \
-                    Keep it unlocked, accept Trust This Computer, and enable \
-                    Settings > Privacy & Security > Developer Mode, then rerun.",
-                    current.name
-                )));
+                return Err(PistonError::IosConnectionNotReady { name: current.name });
             }
         }
         unreachable!()
@@ -216,14 +200,12 @@ impl IOSDevelopment {
             .arg(&path)
             .output()
             .map_err(|error| PistonError::XcrunDevicectlError(error.to_string()))?;
-        IOSApplication::check(output, "Discovering iPhones with Apple's CoreDevice service")?;
+        IOSApplication::check(output, "devicectl")?;
         let contents = fs::read(&path).map_err(|error| PistonError::Generic(error.to_string()))?;
         let document: Value = serde_json::from_slice(&contents)
             .map_err(|error| PistonError::IntoJSONError(error.to_string()))?;
-        let values =
-            document.pointer("/result/devices").and_then(Value::as_array).ok_or_else(|| {
-                PistonError::IntoJSONError("devicectl returned no device list.".into())
-            })?;
+        let values = document.pointer("/result/devices").and_then(Value::as_array)
+            .ok_or(PistonError::IosDeviceListMissing)?;
         Ok(values.iter().filter_map(IOSDevice::read).collect())
     }
 }

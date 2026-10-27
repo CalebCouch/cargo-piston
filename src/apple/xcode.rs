@@ -6,6 +6,7 @@ use std::process::{Command, Stdio};
 use crate::PistonError;
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct XcodeSigning {
     team: String,
@@ -20,14 +21,11 @@ impl XcodeSigning {
         let output = Command::new("defaults")
             .args(["read", "com.apple.dt.Xcode", "IDEProvisioningTeamByIdentifier"])
             .output()
-            .map_err(|e| PistonError::CodesignError(format!("Cannot read Xcode teams: {e}")))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "defaults".into(), source: e })?;
         if !output.status.success() {
             let reason = String::from_utf8_lossy(&output.stderr);
             if reason.to_lowercase().contains("does not exist") { return Ok(Vec::new()); }
-            return Err(PistonError::CodesignError(format!(
-                "Could not read Xcode's saved signing teams.\n{}",
-                reason.trim(),
-            )));
+            return Err(PistonError::CommandFailed { program: "defaults".into(), output });
         }
 
         let accounts = Self::plist_json(&output.stdout)?;
@@ -39,7 +37,7 @@ impl XcodeSigning {
             .flatten()
             .filter_map(|team| {
                 let id = team.get("teamID")?.as_str()?;
-                let name = team.get("teamName").and_then(Value::as_str).unwrap_or("Unnamed team");
+                let name = team.get("teamName").and_then(Value::as_str).unwrap_or(id);
                 Some((id.to_string(), name.to_string()))
             })
             .collect();
@@ -80,7 +78,7 @@ impl XcodeSigning {
         } else {
             command.args(["clean", "build"]);
         }
-        self.run(command, &work.join("xcodebuild.log"), "Signing the macOS notification app")?;
+        self.run(command, &work.join("xcodebuild.log"))?;
         if !release {
             return Ok(work.join("DerivedData/Build/Products/Debug").join(format!("{name}.app")));
         }
@@ -99,7 +97,7 @@ impl XcodeSigning {
             .output()
             .map_err(|error| PistonError::CodesignError(error.to_string()))?;
         if !converted.status.success() {
-            return Err(PistonError::CodesignError("Cannot create macOS export options.".into()));
+            return Err(PistonError::CommandFailed { program: "plutil".into(), output: converted });
         }
         let exported = work.join("export");
         if exported.exists() {
@@ -117,7 +115,7 @@ impl XcodeSigning {
             .arg("-exportOptionsPlist")
             .arg(&options)
             .arg("-allowProvisioningUpdates");
-        self.run(command, &work.join("export.log"), "Exporting the macOS notification app")?;
+        self.run(command, &work.join("export.log"))?;
         let app = exported.join(format!("{name}.app"));
         if app.is_dir() { return Ok(app); }
 
@@ -131,10 +129,7 @@ impl XcodeSigning {
             .filter(|path| path.extension().is_some_and(|ext| ext == "pkg"))
             .collect();
         let [package] = packages.as_slice() else {
-            return Err(PistonError::CodesignError(format!(
-                "Xcode produced no app or installer in {}.",
-                exported.display()
-            )));
+            return Err(PistonError::SigningExportMissing { path: exported });
         };
         let expanded = work.join("expanded-package");
         if expanded.exists() {
@@ -143,7 +138,7 @@ impl XcodeSigning {
         }
         let mut command = Command::new("pkgutil");
         command.arg("--expand-full").arg(package).arg(&expanded);
-        self.run(command, &work.join("package.log"), "Checking the macOS installer")?;
+        self.run(command, &work.join("package.log"))?;
         let mut directories = vec![expanded];
         let mut apps = Vec::new();
         while let Some(directory) = directories.pop() {
@@ -164,21 +159,19 @@ impl XcodeSigning {
             }
         }
         if apps.len() != 1 {
-            return Err(PistonError::CodesignError(
-                "The exported macOS installer must contain one matching app.".into(),
-            ));
+            return Err(PistonError::SigningExportAppCount { count: apps.len() });
         }
         Ok(apps.remove(0))
     }
 
     pub fn project(&self, bundle: &Path, work: &Path, entitlements: Option<&Path>, configuration: &str) -> Result<PathBuf, PistonError> {
         let bundle = fs::canonicalize(bundle).map_err(|e| {
-            PistonError::CodesignError(format!("Cannot open app bundle {}: {e}", bundle.display()))
+            PistonError::ReadFile { path: bundle.to_path_buf(), source: e }
         })?;
         let macos = bundle.join("Contents/Info.plist").is_file();
         let plist_path = bundle.join(if macos { "Contents/Info.plist" } else { "Info.plist" });
         let plist = Self::plist_json(&fs::read(&plist_path).map_err(|e| {
-            PistonError::CodesignError(format!("Cannot read {}: {e}", plist_path.display()))
+            PistonError::ReadFile { path: plist_path.clone(), source: e }
         })?)?;
         let bundle_id = Self::plist_string(&plist, "CFBundleIdentifier")?;
         let executable = Self::plist_string(&plist, "CFBundleExecutable")?;
@@ -188,7 +181,7 @@ impl XcodeSigning {
             Self::plist_string(&plist, "MinimumOSVersion")?
         };
         let name = bundle.file_stem().and_then(|name| name.to_str()).ok_or_else(|| {
-            PistonError::CodesignError("The app bundle needs a UTF-8 filename.".into())
+            PistonError::SigningBundleName { path: bundle.clone() }
         })?;
         let executable_path = if macos {
             bundle.join("Contents/MacOS").join(executable)
@@ -196,16 +189,13 @@ impl XcodeSigning {
             bundle.join(executable)
         };
         if !executable_path.is_file() {
-            return Err(PistonError::CodesignError(format!(
-                "The app executable is missing: {}",
-                executable_path.display(),
-            )));
+            return Err(PistonError::SigningExecutableMissing { path: executable_path });
         }
 
         fs::create_dir_all(&work)
             .map_err(|e| PistonError::CreateDirAllError { path: work.to_path_buf(), source: e })?;
         let work = fs::canonicalize(&work).map_err(|e| {
-            PistonError::CodesignError(format!("Cannot resolve {}: {e}", work.display()))
+            PistonError::ReadFile { path: work.to_path_buf(), source: e }
         })?;
         let project = work.join("Piston.xcodeproj");
         let schemes = project.join("xcshareddata/xcschemes");
@@ -243,9 +233,9 @@ impl XcodeSigning {
                 .output()
                 .map_err(|error| PistonError::CodesignError(error.to_string()))?;
             if !architectures.status.success() {
-                return Err(PistonError::CodesignError(
-                    "Cannot read the macOS executable's architectures.".into(),
-                ));
+                return Err(PistonError::CommandFailed {
+                    program: "/usr/bin/lipo".into(), output: architectures,
+                });
             }
             settings["ARCHS"] = json!(String::from_utf8_lossy(&architectures.stdout).trim());
             settings["SDKROOT"] = json!("macosx");
@@ -258,17 +248,16 @@ impl XcodeSigning {
         if let Some(entitlements) = entitlements {
             settings["CODE_SIGN_ENTITLEMENTS"] =
                 json!(fs::canonicalize(entitlements).map_err(|e| {
-                    PistonError::CodesignError(format!(
-                        "Cannot read entitlements {}: {e}",
-                        entitlements.display(),
-                    ))
+                    PistonError::ReadFile { path: entitlements.to_path_buf(), source: e }
                 })?);
         }
 
         let push_enabled = entitlements
             .map(plist::Value::from_file)
             .transpose()
-            .map_err(|error| PistonError::CodesignError(format!("Invalid entitlements: {error}")))?
+            .map_err(|source| PistonError::ApplePlistRead {
+                path: entitlements.unwrap().to_path_buf(), source,
+            })?
             .and_then(|value| {
                 value
                     .as_dictionary()
@@ -354,16 +343,13 @@ impl XcodeSigning {
         });
         let project_path = project.join("project.pbxproj");
         fs::write(&project_path, serde_json::to_vec_pretty(&project_data).unwrap())
-            .map_err(|e| PistonError::WriteFileError(format!("{}: {e}", project_path.display())))?;
+            .map_err(|e| PistonError::CreateFileError { path: project_path.clone(), source: e })?;
         let output =
             Command::new("plutil").args(["-convert", "xml1"]).arg(&project_path).output().map_err(
-                |e| PistonError::CodesignError(format!("Cannot generate Xcode project: {e}")),
+                |e| PistonError::CommandSpawn { program: "plutil".into(), source: e },
             )?;
         if !output.status.success() {
-            return Err(PistonError::CodesignError(format!(
-                "Cannot generate Xcode project: {}",
-                String::from_utf8_lossy(&output.stderr),
-            )));
+            return Err(PistonError::CommandFailed { program: "plutil".into(), output });
         }
 
         let scheme_name = name
@@ -384,7 +370,7 @@ impl XcodeSigning {
   <LaunchAction buildConfiguration="{configuration}"/>
   <ArchiveAction buildConfiguration="{configuration}" revealArchiveInOrganizer="NO"/>
 </Scheme>
-"#)).map_err(|e| PistonError::WriteFileError(format!("Cannot write Xcode scheme: {e}")))?;
+"#)).map_err(|e| PistonError::CreateFileError { path: schemes.join("Piston.xcscheme"), source: e })?;
 
         Ok(project)
     }
@@ -395,9 +381,9 @@ impl XcodeSigning {
         let name = bundle.file_stem().unwrap().to_str().unwrap();
         let log_path = work.join("xcodebuild.log");
         let log = File::create(&log_path)
-            .map_err(|e| PistonError::WriteFileError(format!("{}: {e}", log_path.display())))?;
+            .map_err(|e| PistonError::CreateFileError { path: log_path.clone(), source: e })?;
         let stderr = log.try_clone().map_err(|e| {
-            PistonError::WriteFileError(format!("Cannot capture Xcode output: {e}"))
+            PistonError::CreateFileError { path: log_path.clone(), source: e }
         })?;
         let derived_data = work.join("DerivedData");
         let status = Command::new("xcrun")
@@ -419,7 +405,7 @@ impl XcodeSigning {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .status()
-            .map_err(|e| PistonError::CodesignError(format!("Cannot run xcodebuild: {e}")))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
         if !status.success() {
             let log = fs::read_to_string(&log_path).unwrap_or_default();
             let (error, needs_account) = self.build_error(&log, &log_path);
@@ -434,11 +420,9 @@ impl XcodeSigning {
         let signed_bundle =
             derived_data.join("Build/Products/Debug-iphoneos").join(format!("{name}.app"));
         if !signed_bundle.join("embedded.mobileprovision").is_file() {
-            return Err(PistonError::CodesignError(format!(
-                "Xcode did not produce a provisioned app at {}. See {}.",
-                signed_bundle.display(),
-                log_path.display(),
-            )));
+            return Err(PistonError::SigningProvisionedAppMissing {
+                bundle: signed_bundle, log: log_path,
+            });
         }
         let verification = Command::new("codesign")
             .args(["--verify", "--strict"])
@@ -446,18 +430,14 @@ impl XcodeSigning {
             .output()
             .map_err(|error| PistonError::CodesignError(error.to_string()))?;
         if !verification.status.success() {
-            return Err(PistonError::CodesignError(format!(
-                "Invalid development signature: {}\nXcode log: {}",
-                String::from_utf8_lossy(&verification.stderr).trim(),
-                log_path.display(),
-            )));
+            return Err(PistonError::SigningSignatureInvalid { output: verification, log: log_path });
         }
         Ok(signed_bundle)
     }
 }
 
 impl XcodeSigning {
-    fn run(&self, mut command: Command, log_path: &Path, operation: &str) -> Result<(), PistonError> {
+    fn run(&self, mut command: Command, log_path: &Path) -> Result<(), PistonError> {
         let log = File::create(log_path)
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
         let stderr =
@@ -466,7 +446,9 @@ impl XcodeSigning {
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))
             .status()
-            .map_err(|error| PistonError::CodesignError(format!("{operation}: {error}")))?;
+            .map_err(|source| PistonError::CommandSpawn {
+                program: command.get_program().into(), source,
+            })?;
         if !status.success() {
             let log = fs::read_to_string(log_path).unwrap_or_default();
             let (error, needs_account) = self.build_error(&log, log_path);
@@ -490,21 +472,15 @@ impl XcodeSigning {
             || errors.contains("your session has expired. please log in")
             || errors.contains("authentication credentials are missing or invalid")
         {
-            Some((
-                true,
-                "Xcode could not sign in to your Apple Account.",
-                "Open Xcode > Settings > Accounts, select the Apple Account for the team below, \
-                 and sign in again. Complete any password or verification prompts.",
-            ))
+            Some((true, PistonError::SigningAccountRejected {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if errors.contains("there are no accounts registered with xcode")
             || errors.contains("no accounts: add a new account in accounts settings")
         {
-            Some((
-                true,
-                "Xcode has no Apple Account available for signing.",
-                "Open Xcode > Settings > Accounts, add your Apple Account, and complete sign-in. \
-                 Confirm that the team below is listed for that account.",
-            ))
+            Some((true, PistonError::SigningAccountMissing {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("program license agreement")
             && (lower.contains("must accept")
                 || lower.contains("must be accepted")
@@ -512,12 +488,9 @@ impl XcodeSigning {
                 || lower.contains("agreement needs to be updated")
                 || lower.contains("accept the latest program license agreement"))
         {
-            Some((
-                false,
-                "Apple requires an updated developer agreement.",
-                "Sign in at https://developer.apple.com/account and review the agreement shown \
-                 there. If the team belongs to an organization, ask its Account Holder to accept it.",
-            ))
+            Some((false, PistonError::SigningAgreementRequired {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("no account for team")
             || lower.contains("could not find team")
             || lower.contains("not a member of the specified team")
@@ -525,62 +498,41 @@ impl XcodeSigning {
             || (lower.contains("does not have permission to create")
                 && lower.contains("provisioning profile"))
         {
-            Some((
-                false,
-                "Xcode cannot use the selected development team.",
-                "Open Xcode > Settings > Accounts and confirm that your account belongs to the \
-                 team below and has permission to sign apps. Select an available team with \
-                 --team <TEAM_ID>, or ask that team's administrator to grant the required access.",
-            ))
+            Some((false, PistonError::SigningTeamUnavailable {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower
             .contains("cannot be registered to your development team because it is not available")
             || lower.contains("bundle identifier is already in use")
             || (lower.contains("an app id with identifier") && lower.contains("is not available"))
         {
-            Some((
-                false,
-                "Apple cannot register this bundle identifier for the selected team.",
-                "Choose a unique development identifier with --bundle-id <unique.identifier>, \
-                 or select the team that owns the existing identifier with --team <TEAM_ID>.",
-            ))
+            Some((false, PistonError::SigningBundleUnavailable {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("maximum app id limit has been reached") {
-            Some((
-                false,
-                "The Apple team has reached its App ID registration limit.",
-                "Reuse an app identifier already registered to this team, wait until Apple's \
-                 registration limit resets, or select another eligible team with --team <TEAM_ID>.",
-            ))
+            Some((false, PistonError::SigningAppIdLimit {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower
             .contains("maximum number of apps for free development profiles has been reached")
         {
-            Some((
-                false,
-                "The iPhone has reached its limit for apps signed with free development profiles.",
-                "Choose an unused development app to remove from the iPhone, or use a team whose \
-                 membership permits this installation. Keep the current bundle identifier when \
-                 updating an app already installed.",
-            ))
+            Some((false, PistonError::SigningFreeAppLimit {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("device limit has been reached")
             || (lower.contains("reached the maximum number of") && lower.contains("devices"))
             || (lower.contains("maximum number of registered devices") && lower.contains("reached"))
         {
-            Some((
-                false,
-                "The Apple team has reached its device registration limit.",
-                "Ask the team's Account Holder to review its device registration limit at \
-                 https://developer.apple.com/account, or select another eligible team with \
-                 --team <TEAM_ID>. Re-pairing the phone does not reset this limit.",
-            ))
+            Some((false, PistonError::SigningDeviceLimit {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("keychain is locked")
             || lower.contains("user interaction is not allowed")
             || lower.contains("errsecinteractionnotallowed")
         {
-            Some((
-                false,
-                "Code signing could not access the signing key in Keychain.",
-                "Open Keychain Access and unlock the keychain containing your development \
-                 certificate. When macOS asks whether codesign may use its private key, allow it.",
-            ))
+            Some((false, PistonError::SigningKeychainLocked {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("no signing certificate")
             || lower.lines().any(|line| {
                 line.contains("no ")
@@ -588,47 +540,25 @@ impl XcodeSigning {
                     && line.contains("with a private key was found")
             })
         {
-            Some((
-                false,
-                "Xcode could not find a usable development signing certificate and private key.",
-                "Open Xcode > Settings > Accounts, select your account and team, and open Manage \
-                 Certificates. Create an Apple Development certificate if needed, or import your \
-                 existing certificate together with its private key.",
-            ))
+            Some((false, PistonError::SigningCertificateUnavailable {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if lower.contains("push notifications") || lower.contains("aps-environment") {
-            Some((
-                false,
-                "Apple could not provision Push Notifications for this app.",
-                "Use an Apple Developer Program team with Push Notifications access. On the opened \
-                 Identifiers page, select this app's bundle ID and enable Push Notifications. \
-                 Confirm that the APNs key belongs to the same team and permits this topic and \
-                 environment, then rerun so Xcode can regenerate the provisioning profile.",
-            ))
+            Some((false, PistonError::SigningPushUnavailable {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else if (lower.contains("no profiles for ") && lower.contains("were found"))
             || lower
                 .contains("couldn't find any ios app development provisioning profiles matching")
             || lower.contains("no provisioning profiles found")
         {
-            Some((
-                false,
-                "Xcode could not obtain a development provisioning profile for this app.",
-                "Open Xcode > Settings > Accounts and confirm the team below is available. \
-                 Verify that the bundle identifier belongs to that team and that it can register \
-                 this device and the app's requested capabilities. Piston already requests \
-                 automatic provisioning; no distribution profile is needed.",
-            ))
+            Some((false, PistonError::SigningProfileUnavailable {
+                team: self.team.clone(), log: log_path.to_path_buf(),
+            }))
         } else {
             None
         };
-        if let Some((needs_account, cause, action)) = guidance {
-            let error = PistonError::CodesignError(format!(
-                "{cause}\n\n1. {action}\n\
-                 2. Rerun your original Piston command with any corrected options. \
-                 Cargo will reuse its existing build cache.\n\n\
-                 Selected team: {}\nXcode log: {}",
-                self.team,
-                log_path.display(),
-            ));
+        if let Some((needs_account, error)) = guidance {
             let error = if lower.contains("push notifications") || lower.contains("aps-environment")
             {
                 error.setup(crate::error::SetupPage::Url(
@@ -655,19 +585,8 @@ impl XcodeSigning {
             }
         }
         details.reverse();
-        let details = if details.is_empty() {
-            "Xcode did not report a recognizable cause in its output.".into()
-        } else {
-            details.join("\n")
-        };
         (
-            PistonError::CodesignError(format!(
-                "Xcode failed while preparing the development app.\n\n{details}\n\n\
-             1. Open the Xcode log below and address the reported Xcode error.\n\
-             2. Rerun your dev command. Cargo will reuse its existing build cache.\n\n\
-             Xcode log: {}",
-                log_path.display(),
-            )),
+            PistonError::SigningBuildFailed { log: log_path.to_path_buf(), details },
             false,
         )
     }
@@ -679,29 +598,23 @@ impl XcodeSigning {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| PistonError::CodesignError(format!("Cannot read property list: {e}")))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "plutil".into(), source: e })?;
         command
             .stdin
             .take()
             .unwrap()
             .write_all(data)
-            .map_err(|e| PistonError::CodesignError(format!("Cannot read property list: {e}")))?;
-        let output = command
-            .wait_with_output()
-            .map_err(|e| PistonError::CodesignError(format!("Cannot read property list: {e}")))?;
+            .map_err(PistonError::ApplePlistInput)?;
+        let output = command.wait_with_output().map_err(PistonError::ApplePlistWait)?;
         if !output.status.success() {
-            return Err(PistonError::CodesignError(format!(
-                "Invalid property list: {}",
-                String::from_utf8_lossy(&output.stderr),
-            )));
+            return Err(PistonError::CommandFailed { program: "plutil".into(), output });
         }
-        serde_json::from_slice(&output.stdout)
-            .map_err(|e| PistonError::CodesignError(format!("Invalid property list: {e}")))
+        serde_json::from_slice(&output.stdout).map_err(PistonError::ApplePlistJson)
     }
 
     fn plist_string<'a>(plist: &'a Value, key: &str) -> Result<&'a str, PistonError> {
         plist.get(key).and_then(Value::as_str).filter(|value| !value.is_empty()).ok_or_else(|| {
-            PistonError::CodesignError(format!("The app Info.plist needs a nonempty {key} string."))
+            PistonError::ApplePlistField { key: key.into() }
         })
     }
 }

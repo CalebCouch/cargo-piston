@@ -15,7 +15,7 @@ final class LinuxViewer: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 780),
                               styleMask: [.titled, .closable, .miniaturizable, .resizable],
                               backing: .buffered, defer: false)
-        window.title = "Piston Linux — " + (environment["PISTON_VIEWER_TITLE"] ?? "Application")
+        window.title = environment["PISTON_VIEWER_TITLE"]!
         window.isReleasedWhenClosed = false
         window.delegate = self
         let web = WKWebView(frame: window.contentView!.bounds)
@@ -28,8 +28,8 @@ final class LinuxViewer: NSObject, NSApplicationDelegate, NSWindowDelegate, WKNa
         let app = NSMenuItem()
         menu.addItem(app)
         let commands = NSMenu()
-        commands.addItem(withTitle: "Close Linux VM", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
-        commands.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        commands.addItem(withTitle: environment["PISTON_VIEWER_CLOSE"]!, action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        commands.addItem(withTitle: environment["PISTON_VIEWER_QUIT"]!, action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         app.submenu = commands
         NSApp.mainMenu = menu
         window.center()

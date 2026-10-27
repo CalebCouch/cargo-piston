@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use crate::linux;
 use crate::dev::DevelopmentArgs;
 use crate::host::Host;
-use crate::linux::cli::LinuxCli;
 use crate::project::Project;
 use crate::{PistonError, Result};
-use crate::host::cli::HostCli;
 
-impl HostCli {
-    pub fn develop(args: DevelopmentArgs) -> Result<()> { LinuxCli::start(args) }
+impl super::Cli {
+    pub fn develop(args: DevelopmentArgs) -> Result<()> { linux::Cli::start(args) }
     pub fn develop_macos(_args: DevelopmentArgs) -> Result<()> {
         Err(PistonError::Generic("macOS development requires a Mac.".into()))
     }
@@ -22,8 +21,13 @@ impl HostCli {
     }
 }
 
-impl LinuxCli {
+impl linux::Cli {
     pub fn start(args: DevelopmentArgs) -> Result<()> {
+        if args.setup {
+            return Err(PistonError::Generic(
+                "Notification --setup requires macOS or a physical iOS device.".into(),
+            ));
+        }
         let project = Project::new(args.application, "linux", false)?;
         if project.args.cargo.target.as_deref().is_some_and(|target| !target.contains("-linux-")) {
             return Err(PistonError::Generic(

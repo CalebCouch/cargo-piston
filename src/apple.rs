@@ -11,8 +11,8 @@ use app_store::AppStoreConnect;
 pub use app_store::{AscApiKey, AppStoreRelease, IOSArtwork, TestFlight};
 mod push;
 pub use push::{PushBuild, PushPlatform, PushSigning};
-mod notifications;
-pub use notifications::{NotificationSetup, cli::NotificationCli};
+pub mod notifications;
+pub use notifications::NotificationSetup;
 pub mod xcode;
 pub use xcode::XcodeSigning;
 
@@ -63,9 +63,7 @@ impl AppleSigning {
             let check = Command::new("security")
                 .args(["find-identity", "-v", "-p", "codesigning"])
                 .output()
-                .map_err(|e| {
-                    PistonError::KeyChainImportError(format!("Failed to check keychain: {}", e))
-                })?;
+                .map_err(|e| PistonError::CommandSpawn { program: "security".into(), source: e })?;
 
             if !check.status.success() {
                 return Err(PistonError::SecurityFindIdentityError(
@@ -116,20 +114,20 @@ impl AppleSigning {
         }
 
         let csr_content = fs::read_to_string(&csr_path)
-            .map_err(|e| PistonError::ReadCSRError(format!("Failed to read CSR: {}", e)))?;
+            .map_err(|e| PistonError::ReadFile { path: csr_path.clone(), source: e })?;
 
         let (cert_name, cert_der) = app_store.create_distribution_certificate(&csr_content)?;
 
         let cer_path = temporary.path().join("certificate.cer");
         fs::write(&cer_path, cert_der)
-            .map_err(|e| PistonError::WriteFileError(format!("Write failed: {}", e)))?;
+            .map_err(|e| PistonError::CreateFileError { path: cer_path.clone(), source: e })?;
 
         let import_key = Command::new("security")
             .arg("import")
             .arg(&key_path)
             .args(["-k", &keychain_path, "-P", ""])
             .output()
-            .map_err(|e| PistonError::KeyChainImportError(format!("Key import failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "security".into(), source: e })?;
 
         if !import_key.status.success() {
             return Err(PistonError::KeyChainImportError(
@@ -142,7 +140,7 @@ impl AppleSigning {
             .arg(&cer_path)
             .args(["-k", &keychain_path])
             .output()
-            .map_err(|e| PistonError::KeyChainImportError(format!("Cert import failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "security".into(), source: e })?;
 
         if !import_cert.status.success() {
             return Err(PistonError::KeyChainImportError(
@@ -153,9 +151,7 @@ impl AppleSigning {
         let check = Command::new("security")
             .args(["find-identity", "-v", "-p", "codesigning"])
             .output()
-            .map_err(|e| {
-                PistonError::KeyChainImportError(format!("Failed to check keychain: {}", e))
-            })?;
+            .map_err(|e| PistonError::CommandSpawn { program: "security".into(), source: e })?;
         if !check.status.success() {
             return Err(PistonError::SecurityFindIdentityError(
                 String::from_utf8_lossy(&check.stderr).trim().to_string(),
@@ -181,7 +177,7 @@ impl AppleSigning {
 
         let profile_path = format!("{}.mobileprovision", profile_name);
         fs::write(&profile_path, profile_data)
-            .map_err(|e| PistonError::WriteFileError(format!("Failed to write profile: {}", e)))?;
+            .map_err(|e| PistonError::CreateFileError { path: (&profile_path).into(), source: e })?;
 
         let _ = fs::create_dir_all(provision_cache);
         let cached_profile = provision_cache.join(format!("{}.mobileprovision", profile_name));
@@ -189,13 +185,15 @@ impl AppleSigning {
 
         let embedded_path = format!("{}/embedded.mobileprovision", app_bundle_path.display());
         fs::copy(&profile_path, &embedded_path)
-            .map_err(|e| PistonError::WriteFileError(format!("Failed to embed profile: {}", e)))?;
+            .map_err(|e| PistonError::CopyFileError {
+                input_path: (&profile_path).into(), output_path: (&embedded_path).into(), source: e,
+            })?;
 
         let install = Command::new(ideviceprovision_path)
             .args(["install", &embedded_path, "--udid", device_id])
             .output()
             .map_err(|e| {
-                PistonError::DeviceProvisionError(format!("ideviceprovision failed: {}", e))
+                PistonError::CommandSpawn { program: ideviceprovision_path.into(), source: e }
             })?;
 
         if !install.status.success() {
@@ -209,7 +207,7 @@ impl AppleSigning {
         let _ = Command::new("xattr")
             .args(["-cr", app_bundle_path.to_str().unwrap()])
             .status()
-            .map_err(|e| PistonError::Generic(format!("xattr error: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "xattr".into(), source: e })?;
 
         let _ = fs::remove_file(profile_path);
 
@@ -245,12 +243,12 @@ impl AppleSigning {
             let xml = String::from_utf8_lossy(&output.stdout);
             let target = format!("<string>{}</string>", device_id);
             if xml.contains(&target) {
-                let list = Command::new(idp_path).args(["list", "--udid", device_id]).output();
-                let list_res = list.unwrap();
+                let list_res = Command::new(idp_path).args(["list", "--udid", device_id]).output()
+                    .map_err(|source| PistonError::CommandSpawn { program: idp_path.into(), source })?;
                 if !list_res.status.success() {
-                    return Err(PistonError::Generic(
-                        "Failed to list provisioning profiles with IDP".into(),
-                    ));
+                    return Err(PistonError::CommandFailed {
+                        program: idp_path.into(), output: list_res,
+                    });
                 }
                 let installed = String::from_utf8_lossy(&list_res.stdout);
                 let target_partial = profile_path.file_name().unwrap().to_str().unwrap();
@@ -322,9 +320,7 @@ impl AppleSigning {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| {
-                PistonError::CodesignError(format!("Failed to sign outer bundle: {}", e))
-            })?;
+            .map_err(|e| PistonError::CommandSpawn { program: "codesign".into(), source: e })?;
 
         if !status.status.success() {
             return Err(PistonError::CodesignError(
@@ -348,7 +344,7 @@ impl AppleSigning {
             </plist>"#;
 
             fs::write(&entitlements_path, content.trim()).map_err(|e| {
-                PistonError::WriteFileError(format!("Failed to write entitlements.plist: {}", e))
+                PistonError::CreateFileError { path: entitlements_path.clone(), source: e }
             })?;
 
             return Ok(());
@@ -356,7 +352,7 @@ impl AppleSigning {
         let cms = Command::new("security")
             .args(["cms", "-D", "-i", embedded.to_str().unwrap()])
             .output()
-            .map_err(|e| PistonError::Generic(format!("security cms failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "security".into(), source: e })?;
 
         let mut plutil = Command::new("plutil")
             .args([
@@ -369,19 +365,15 @@ impl AppleSigning {
             ])
             .stdin(Stdio::piped())
             .spawn()
-            .map_err(|e| PistonError::Generic(format!("plutil spawn failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "plutil".into(), source: e })?;
 
         if let Some(mut stdin) = plutil.stdin.take() {
-            stdin.write_all(&cms.stdout).map_err(|e| {
-                PistonError::WritePlUtilError(format!("Failed to write plutil file: {}", e))
-            })?;
+            stdin.write_all(&cms.stdout).map_err(PistonError::ApplePlistInput)?;
         }
 
-        let result = plutil
-            .wait_with_output()
-            .map_err(|e| PistonError::Generic(format!("plutil failed: {}", e)))?;
+        let result = plutil.wait_with_output().map_err(PistonError::ApplePlistWait)?;
         if !result.status.success() {
-            return Err(PistonError::Generic("Failed to extract entitlements.plist".to_string()));
+            return Err(PistonError::CommandFailed { program: "plutil".into(), output: result });
         }
 
         Ok(())
@@ -391,10 +383,10 @@ impl AppleSigning {
         let mut settings = self.manifest.settings(&["apple", "signing"])?;
         if settings.is_empty() { return Ok(None); }
         let team = settings.remove("team").ok_or_else(|| {
-            PistonError::Generic("Missing package.metadata.piston.apple.signing.team.".into())
+            PistonError::MissingSetting { key: "package.metadata.piston.apple.signing.team".into() }
         })?;
         let identity = settings.remove("identity").ok_or_else(|| {
-            PistonError::Generic("Missing package.metadata.piston.apple.signing.identity.".into())
+            PistonError::MissingSetting { key: "package.metadata.piston.apple.signing.identity".into() }
         })?;
         Ok(Some((team, identity)))
     }
@@ -419,17 +411,12 @@ impl AppleSigning {
         let team_id = match team_ids_for_cert.len() {
             1 => team_ids_for_cert.into_iter().next().unwrap(),
             0 => {
-                return Err(PistonError::Generic(format!(
-                    "No certificate matching the name '{}' was found in the keychain.",
-                    cert_name
-                )));
+                return Err(PistonError::SigningCertificateMissing { name: cert_name.into() });
             }
             _ => {
-                return Err(PistonError::Generic(format!(
-                    "Multiple certificates with the exact same name '{}' were found but with different Team IDs: {:?}. \
-                    Team ID cannot be uniquely determined. Please designate a team ID in your .env with 'team_id=<team_id>' ",
-                    cert_name, team_ids_for_cert
-                )));
+                return Err(PistonError::SigningCertificateAmbiguous {
+                    name: cert_name.into(), teams: team_ids_for_cert.into_iter().collect(),
+                });
             }
         };
         Ok(team_id)

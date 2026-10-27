@@ -1,6 +1,6 @@
 use cargo_metadata::{Message, MetadataCommand, Package, TargetKind};
-use serde::Deserialize;
 use serde_json::{Value, json};
+use toml_edit::Item;
 use std::env;
 use std::fs;
 use std::io::BufReader;
@@ -31,9 +31,7 @@ impl IOSApplication {
             || !args.cargo.example.is_empty()
             || !args.cargo.exclude.is_empty()
         {
-            return Err(PistonError::Generic(
-                "Choose one application with --package and --bin; one command builds one executable.".into()
-            ));
+            return Err(PistonError::AppSelectionInvalid);
         }
         let mut command = MetadataCommand::new();
         command.no_deps();
@@ -47,22 +45,14 @@ impl IOSApplication {
         if args.locked { options.push("--locked".into()); }
         if args.offline { options.push("--offline".into()); }
         command.other_options(options);
-        let metadata = command.exec().map_err(|error| {
-            let mut message = error.to_string();
-            if message.contains("Operation not permitted") || message.contains("Permission denied") {
-                message.push_str("\n\nAllow your terminal app to read the project folder. If it is in \
-                    Documents, Desktop, or Downloads, check macOS System Settings > Privacy & Security \
-                    > Files and Folders, or move the project to an accessible folder.\n\n\
-                    Then rerun the same cargo piston command.");
-            }
-            PistonError::CargoParseError(message)
-        })?;
+        let metadata = command.exec()
+            .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
         let mut locate = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         locate.args(["locate-project", "--message-format", "plain"]);
         if let Some(path) = &args.cargo.manifest_path { locate.arg("--manifest-path").arg(path); }
         let manifest =
             locate.output().map_err(|error| PistonError::CargoParseError(error.to_string()))?;
-        let manifest = Self::check(manifest, "Locating the application manifest")?;
+        let manifest = Self::check(manifest, "cargo")?;
         let manifest = PathBuf::from(String::from_utf8_lossy(&manifest).trim());
         let manifest = fs::canonicalize(manifest)
             .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
@@ -72,12 +62,7 @@ impl IOSApplication {
             metadata.packages.iter().find(|package| package.manifest_path.as_std_path() == manifest)
         }
         .cloned()
-        .ok_or_else(|| {
-            PistonError::CargoParseError(
-                "Choose an application package with --package when running from a workspace."
-                    .into(),
-            )
-        })?;
+        .ok_or(PistonError::AppPackageMissing)?;
         let binaries: Vec<_> = package
             .targets
             .iter()
@@ -91,17 +76,10 @@ impl IOSApplication {
         } else {
             None
         };
-        let binary = binary.ok_or_else(|| {
-            PistonError::CargoParseError(
-                "Choose an application executable with --bin (or set package.default-run).".into(),
-            )
-        })?;
+        let binary = binary.ok_or(PistonError::AppBinaryMissing)?;
         args.cargo.package = vec![package.name.to_string()];
         args.cargo.bin = vec![binary.name.clone()];
-        let config = package.metadata.pointer("/piston/ios").cloned().unwrap_or(json!({}));
-        let config: IOSConfig = serde_json::from_value(config).map_err(|error| {
-            PistonError::Generic(format!("Invalid package.metadata.piston.ios: {error}"))
-        })?;
+        let config = IOSConfig::new(package.metadata.pointer("/piston/ios"));
         let version: Vec<_> = config.minimum_os.split('.').collect();
         if version.is_empty()
             || version.len() > 3
@@ -110,10 +88,7 @@ impl IOSApplication {
                 .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
             || version[0].parse::<u32>().unwrap_or(0) < 17
         {
-            return Err(PistonError::Generic(
-                "minimum_os must be an iOS version of 17.0 or newer for CoreDevice development."
-                    .into(),
-            ));
+            return Err(PistonError::IosMinimumVersion { value: config.minimum_os });
         }
         let target_dir = args
             .cargo
@@ -141,8 +116,41 @@ impl IOSApplication {
         self.args.cargo.target.as_deref().unwrap_or("aarch64-apple-ios")
     }
 
-    pub fn remember_team(&self, team: &str) -> Result<()> {
-        Manifest::new(self.package.manifest_path.as_std_path())?.save(&["ios"], &[("team", team)])
+    pub fn valid_setting(name: &str, value: &Item, root: &Path) -> bool {
+        if name == "resources" {
+            return value.as_array().is_some_and(|paths| paths.iter().all(|value| {
+                value.as_str().is_some_and(|path| {
+                    !path.is_empty() && root.join(path).exists()
+                        && root.join(path).file_name().is_some()
+                })
+            }));
+        }
+        let Some(value) = value.as_str() else { return false; };
+        match name {
+            "team" => value.len() == 10 && value.bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "bundle_id" => value.contains('.') && !value.split('.').any(str::is_empty)
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-".contains(character)
+                }),
+            "minimum_os" | "build_number" => {
+                let parts: Vec<_> = value.split('.').collect();
+                parts.len() <= 3 && parts.iter().all(|part| {
+                    !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())
+                        && part.parse::<u64>().is_ok()
+                }) && (name == "build_number" || parts[0].parse::<u32>().is_ok_and(|major| major >= 17))
+            }
+            "info_plist" | "entitlements" => !value.is_empty()
+                && plist::Value::from_file(root.join(value))
+                    .is_ok_and(|value| value.as_dictionary().is_some()),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn remember_team(&mut self, team: &str) -> Result<()> {
+        Manifest::new(self.package.manifest_path.as_std_path())?.save(&["ios"], &[("team", team)])?;
+        self.config.team = Some(team.into());
+        Ok(())
     }
 
     pub fn notification_setup(&self, team: &str, sandbox: bool) -> Result<NotificationSetup> {
@@ -194,18 +202,14 @@ impl IOSApplication {
 
     pub fn store_bundle_id(&self) -> Result<&str> {
         let identifier = self.args.bundle_id.as_deref().or(self.config.bundle_id.as_deref())
-            .ok_or_else(|| PistonError::Generic(
-                "App Store deployment requires --bundle-id or package.metadata.piston.ios.bundle_id.".into()
-            ))?;
+            .ok_or(PistonError::IosStoreIdentifierMissing)?;
         if !identifier.contains('.')
             || identifier.split('.').any(str::is_empty)
             || !identifier.chars().all(|character| {
                 character.is_ascii_alphanumeric() || character == '.' || character == '-'
             })
         {
-            return Err(PistonError::Generic(format!(
-                "Use the registered App Store bundle identifier instead of {identifier:?}."
-            )));
+            return Err(PistonError::InvalidBundleId { value: identifier.into() });
         }
         Ok(identifier)
     }
@@ -220,10 +224,7 @@ impl IOSApplication {
                 .as_ref()
                 .is_some_and(|profile| profile.to_string() != "release")
         {
-            return Err(PistonError::Generic(
-                "App Store builds require --target aarch64-apple-ios and the release profile."
-                    .into(),
-            ));
+            return Err(PistonError::IosStoreTargetInvalid);
         }
         self.args.cargo.release = true;
         self.args.cargo.profile = None;
@@ -239,9 +240,7 @@ impl IOSApplication {
         };
         let target = self.args.cargo.target.as_deref().unwrap_or(default);
         if !matches!(target, "aarch64-apple-ios-sim" | "x86_64-apple-ios") {
-            return Err(PistonError::UnsupportedTargetError(format!(
-                "{target} cannot run in the iOS Simulator."
-            )));
+            return Err(PistonError::IosSimulatorTarget { target: target.into() });
         }
         self.args.cargo.target = Some(target.into());
         Ok(())
@@ -262,19 +261,14 @@ impl IOSApplication {
 
     pub fn build_store(&mut self, developer: &Path, team: &str, report: &mut dyn FnMut(&str)) -> Result<PathBuf> {
         let source = Project::find_icon(self.package.manifest_path.parent().unwrap().as_std_path())
-            .ok_or_else(|| PistonError::Generic(
-                "Add icon.png, icon.jpg or icon.jpeg beside the selected package Cargo.toml for App Store deployment.".into()
-            ))?;
+            .ok_or(PistonError::IosStoreIconMissing)?;
         let icon = image::open(&source)
             .map_err(|error| PistonError::OpenImageError { path: source.clone(), source: error })?;
         if icon.width() != icon.height()
             || icon.width() < 1024
             || icon.to_rgba16().pixels().any(|pixel| pixel.0[3] != u16::MAX)
         {
-            return Err(PistonError::Generic(format!(
-                "App Store icon {} must be square, at least 1024 by 1024 pixels, and fully opaque.",
-                source.display(),
-            )));
+            return Err(PistonError::IosStoreIconInvalid { path: source });
         }
         let normalized = self.work.join("store-icon.png");
         icon.to_rgb8().save(&normalized).map_err(PistonError::WriteImageError)?;
@@ -288,19 +282,12 @@ impl IOSApplication {
         command
     }
 
-    pub fn check(output: std::process::Output, operation: &str) -> Result<Vec<u8>> {
+    pub fn check(output: std::process::Output, program: &str) -> Result<Vec<u8>> {
         if output.status.success() { return Ok(output.stdout); }
-        Err(PistonError::Generic(format!(
-            "{operation} failed ({}).\n{}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )))
+        Err(PistonError::CommandFailed { program: program.into(), output })
     }
 }
 
-#[derive(Deserialize)]
-#[serde(default, deny_unknown_fields)]
 struct IOSConfig {
     team: Option<String>,
     build_number: Option<String>,
@@ -311,16 +298,21 @@ struct IOSConfig {
     resources: Vec<PathBuf>,
 }
 
-impl Default for IOSConfig {
-    fn default() -> Self {
+impl IOSConfig {
+    fn new(metadata: Option<&Value>) -> Self {
+        let text = |name| {
+            metadata.and_then(|value| value.get(name)).and_then(Value::as_str).map(str::to_owned)
+        };
         Self {
-            team: None,
-            build_number: None,
-            bundle_id: None,
-            minimum_os: "17.0".into(),
-            info_plist: None,
-            entitlements: None,
-            resources: Vec::new(),
+            team: text("team"),
+            build_number: text("build_number"),
+            bundle_id: text("bundle_id"),
+            minimum_os: text("minimum_os").unwrap_or_else(|| "17.0".into()),
+            info_plist: text("info_plist").map(PathBuf::from),
+            entitlements: text("entitlements").map(PathBuf::from),
+            resources: metadata.and_then(|value| value.get("resources"))
+                .and_then(Value::as_array).into_iter().flatten()
+                .filter_map(Value::as_str).map(PathBuf::from).collect(),
         }
     }
 }
@@ -328,21 +320,19 @@ impl Default for IOSConfig {
 impl IOSApplication {
     pub fn prepare_target(&self, target: &str) -> Result<()> {
         if !matches!(target, "aarch64-apple-ios" | "aarch64-apple-ios-sim" | "x86_64-apple-ios") {
-            return Err(PistonError::UnsupportedTargetError(format!(
-                "Unsupported iOS device/simulator target: {target}"
-            )));
+            return Err(PistonError::IosTargetUnsupported { target: target.into() });
         }
         let installed = Command::new("rustup")
             .args(["target", "list", "--installed"])
             .output()
             .map_err(|error| PistonError::BuildError(error.to_string()))?;
-        let installed = Self::check(installed, "Checking installed Rust targets")?;
+        let installed = Self::check(installed, "rustup")?;
         if !String::from_utf8_lossy(&installed).lines().any(|line| line == target) {
             let output = Command::new("rustup")
                 .args(["target", "add", target])
                 .output()
                 .map_err(|error| PistonError::BuildError(error.to_string()))?;
-            Self::check(output, "Installing Rust target libraries")?;
+            Self::check(output, "rustup")?;
         }
         Ok(())
     }
@@ -388,10 +378,10 @@ impl IOSApplication {
         }
         let status = child.wait().map_err(|error| PistonError::BuildError(error.to_string()))?;
         if !status.success() {
-            return Err(PistonError::BuildError(format!("Cargo build failed with {status}")));
+            return Err(PistonError::CommandStatus { program: "cargo".into(), status });
         }
-        executable.ok_or_else(|| {
-            PistonError::BuildError("Cargo produced no application executable.".into())
+        executable.ok_or_else(|| PistonError::ArtifactNotProduced {
+            package: self.package.name.to_string(), target: Some(target.into()),
         })
     }
 
@@ -411,7 +401,7 @@ impl IOSApplication {
             || !identifier.chars().all(|character| {
                 character.is_ascii_alphanumeric() || character == '.' || character == '-'
             })
-        { return Err(PistonError::Generic(format!("Invalid bundle identifier: {identifier}"))); }
+        { return Err(PistonError::InvalidBundleId { value: identifier }); }
         Ok(identifier)
     }
 
@@ -437,7 +427,7 @@ impl IOSApplication {
                 .arg(self.project_path(path))
                 .output()
                 .map_err(|error| PistonError::PlutilConvertError(error.to_string()))?;
-            let bytes = Self::check(output, "Reading app Info.plist")?;
+            let bytes = Self::check(output, "plutil")?;
             serde_json::from_slice::<Value>(&bytes)
                 .map_err(|error| PistonError::IntoJSONError(error.to_string()))?
         } else {
@@ -445,7 +435,9 @@ impl IOSApplication {
         };
         let settings = plist
             .as_object_mut()
-            .ok_or_else(|| PistonError::Generic("Info.plist must contain a dictionary.".into()))?;
+            .ok_or_else(|| PistonError::PlistNotDictionary {
+                path: self.project_path(source.unwrap()),
+            })?;
         let version = format!(
             "{}.{}.{}",
             self.package.version.major, self.package.version.minor, self.package.version.patch
@@ -489,16 +481,14 @@ impl IOSApplication {
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
         for resource in &self.config.resources {
             let source = self.project_path(resource);
-            let name = source.file_name().ok_or_else(|| {
-                PistonError::Generic(format!("Invalid resource path: {}", source.display()))
+            let name = source.file_name().ok_or_else(|| PistonError::IosResourceInvalid {
+                path: source.clone(),
             })?;
             if name == "Info.plist" || name == slug.as_str() {
-                return Err(PistonError::Generic(format!(
-                    "Resource replaces an app file: {}",
-                    source.display()
-                )));
+                return Err(PistonError::IosResourceConflict { path: source });
             }
-            let output = if source.extension().is_some_and(|extension| extension == "storyboard") {
+            let storyboard = source.extension().is_some_and(|extension| extension == "storyboard");
+            let output = if storyboard {
                 Self::command(developer, "ibtool")
                     .arg("--compile")
                     .arg(bundle.join(name).with_extension("storyboardc"))
@@ -516,7 +506,7 @@ impl IOSApplication {
                 Command::new("ditto").arg(&source).arg(bundle.join(name)).output()
             }
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
-            Self::check(output, "Copying app resources")?;
+            Self::check(output, if storyboard { "ibtool" } else { "ditto" })?;
         }
         let icon = icon.map(Path::to_path_buf).or_else(|| {
             Project::find_icon(self.package.manifest_path.parent().unwrap().as_std_path())
@@ -533,7 +523,7 @@ impl IOSApplication {
             .arg(&plist_path)
             .output()
             .map_err(|error| PistonError::PlutilConvertError(error.to_string()))?;
-        Self::check(output, "Preparing app Info.plist")?;
+        Self::check(output, "plutil")?;
         Ok((bundle, identifier))
     }
 
@@ -554,9 +544,9 @@ impl IOSApplication {
             }
             let name = source.file_stem().unwrap().to_string_lossy();
             let set = catalog.join(format!("{name}.imageset"));
-            fs::create_dir(&set).map_err(|error| PistonError::WriteFileError(format!(
-                "Cannot create image asset {name}; resource image names must be unique: {error}",
-            )))?;
+            fs::create_dir(&set).map_err(|source| PistonError::IosImageAssetCreate {
+                path: set.clone(), source,
+            })?;
             let filename = source.file_name().unwrap();
             fs::copy(&source, set.join(filename))
                 .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
@@ -641,14 +631,14 @@ impl IOSApplication {
         if icon.is_some() { command.args(["--app-icon", "AppIcon"]); }
         let output = command
             .output()
-            .map_err(|error| PistonError::Generic(format!("Cannot compile app assets: {error}")))?;
-        Self::check(output, "Compiling app assets")?;
+            .map_err(|error| PistonError::CommandSpawn { program: "actool".into(), source: error })?;
+        Self::check(output, "actool")?;
         let output = Command::new("plutil")
             .args(["-convert", "json", "-o", "-"])
             .arg(&partial)
             .output()
             .map_err(|error| PistonError::PlutilConvertError(error.to_string()))?;
-        let bytes = Self::check(output, "Reading compiled asset settings")?;
+        let bytes = Self::check(output, "plutil")?;
         serde_json::from_slice(&bytes)
             .map_err(|error| PistonError::IntoJSONError(error.to_string()))
     }

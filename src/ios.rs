@@ -14,10 +14,11 @@ pub use crate::cli::ApplicationArgs;
 mod application;
 pub use application::IOSApplication;
 pub mod cli;
+pub use cli::Cli;
 pub mod deployment;
+pub use deployment::DeploymentArgs;
 mod development;
 mod simulator;
-pub use deployment::DeploymentArgs;
 pub mod distribution;
 pub use distribution::IOSStore;
 
@@ -157,13 +158,10 @@ impl IOSBuilder {
                 &assets_output.display().to_string(),
             ])
             .output()
-            .map_err(|e| PistonError::Generic(format!("Failed to compile assets: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "xcrun".into(), source: e })?;
 
         if !status.status.success() {
-            return Err(PistonError::Generic(format!(
-                "Failed to compile assets: {}",
-                String::from_utf8_lossy(&status.stderr)
-            )));
+            return Err(PistonError::CommandFailed { program: "xcrun".into(), output: status });
         }
 
         let plist_path: PathBuf = bundle_path.join("Info.plist");
@@ -273,13 +271,10 @@ impl IOSBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::BuildError(format!("Cargo build failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
 
         if !builder.status.success() {
-            return Err(PistonError::BuildError(format!(
-                "Cargo build failed: {}",
-                String::from_utf8_lossy(&builder.stderr)
-            )));
+            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
         }
 
         Ok(())
@@ -287,9 +282,7 @@ impl IOSBuilder {
 }
 
 impl IOSBuilder {
-    fn post_build(&mut self) -> Result<Vec<String>, PistonError> {
-        let mut messages = Vec::new();
-        messages.push(format!("post build for ios"));
+    fn post_build(&mut self) -> Result<(), PistonError> {
         let provision_cache = self.cwd.join("target").join("ios-cache").join("profiles");
         if !provision_cache.exists() {
             create_dir_all(&provision_cache).map_err(|e| PistonError::CreateDirAllError {
@@ -319,14 +312,8 @@ impl IOSBuilder {
         if !output.status.success() {
             return Err(PistonError::Generic(String::from_utf8_lossy(&output.stderr).to_string()));
         }
-        messages.push(format!("iOS app bundle available at: {}", &bundle_path.display()));
 
-        if self.keystore_path.is_none() || self.asc_api_key.is_none() {
-            messages.push(format!(
-                "Keystore path or ASC API key missing from .env, skipping automated signing"
-            ));
-        } else {
-            messages.push(format!("keystore path & ASC API key properly configured"));
+        if self.keystore_path.is_some() && self.asc_api_key.is_some() {
             let asc_client = AppleSigning::new(
                 self.asc_api_key.clone().unwrap(),
                 self.keystore_path.clone().unwrap(),
@@ -334,10 +321,8 @@ impl IOSBuilder {
             )?;
             let security_cert = asc_client.create_or_find_security_cert(self.team_id.clone())?;
             let security_profile = format!("{} ({})", security_cert.1, security_cert.0);
-            messages.push(format!("your security profile is: {:?}", security_profile));
             let output_path = &self.output_path;
             if let Some(device) = &self.device_target {
-                messages.push(format!("device target exists, checking for existing provisioning"));
                 let target_id = &device.id;
                 let idp_path = self.idp_path.as_ref().unwrap();
                 let provisioned = AppleSigning::is_device_provisioned(
@@ -347,10 +332,6 @@ impl IOSBuilder {
                     &provision_cache,
                 )?;
                 if !provisioned {
-                    messages.push(format!(
-                        "attempting to provision target device {:?}",
-                        self.device_target
-                    ));
                     asc_client.provision_ios_device(
                         target_id,
                         &self.bundle_id,
@@ -389,12 +370,7 @@ impl IOSBuilder {
                 })?;
 
             if !status.status.success() {
-                return Err(PistonError::Generic(format!(
-                    "error copying {} to {} Error message: {}",
-                    output_path.display(),
-                    dest.display(),
-                    String::from_utf8_lossy(&status.stderr)
-                )));
+                return Err(PistonError::CommandFailed { program: "cp".into(), output: status });
             }
 
             let status = Command::new("zip")
@@ -403,19 +379,15 @@ impl IOSBuilder {
                 .arg("Payload")
                 .current_dir(parent)
                 .output()
-                .map_err(|e| PistonError::Generic(format!("Error zipping payload: {}", e)))?;
+                .map_err(|e| PistonError::CommandSpawn { program: "zip".into(), source: e })?;
 
             if !status.status.success() {
-                return Err(PistonError::Generic(format!(
-                    "Error zipping payload: {}",
-                    String::from_utf8_lossy(&status.stderr)
-                )));
+                return Err(PistonError::CommandFailed { program: "zip".into(), output: status });
             }
             let _ = std::fs::remove_dir_all(payload_path);
 
-            messages.push(format!("Your app is available at: {:?}", &ipa_path.display()));
         }
-        Ok(messages)
+        Ok(())
     }
 }
 

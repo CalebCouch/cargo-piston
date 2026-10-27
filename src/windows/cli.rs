@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::PistonError;
 use super::WindowsBuilder;
 
-pub struct WindowsCli;
+pub struct Cli;
 
-impl WindowsCli {
+impl Cli {
     pub fn build(release: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<(), PistonError> {
         println!("Building for Windows");
         let op = WindowsBuilder::new(release, target, cwd, env_vars)?;

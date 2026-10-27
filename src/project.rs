@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use crate::{PistonError, Result};
 use crate::cli::ApplicationArgs;
+use crate::manifest::Manifest;
 
 pub struct Project {
     pub args: ApplicationArgs,
@@ -19,6 +20,33 @@ pub struct Project {
 }
 
 impl Project {
+    pub fn manifest(args: &cargo_subcommand::Args) -> Result<Manifest> {
+        if args.workspace || args.package.len() > 1 || !args.exclude.is_empty() {
+            return Err(PistonError::AppSelectionInvalid);
+        }
+        if let Some(name) = args.package.first() {
+            let mut metadata = MetadataCommand::new();
+            metadata.no_deps().other_options(vec!["--offline".into()]);
+            if let Some(path) = &args.manifest_path {
+                let path = fs::canonicalize(path).map_err(|source| PistonError::ReadFile {
+                    path: path.clone(), source,
+                })?;
+                metadata.manifest_path(&path).current_dir(path.parent().unwrap());
+            }
+            let metadata = metadata.exec()
+                .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
+            let package = metadata.packages.iter()
+                .find(|package| package.name.as_str() == name)
+                .ok_or(PistonError::AppPackageMissing)?;
+            return Manifest::new(package.manifest_path.as_std_path());
+        }
+        let mut command = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
+        command.args(["locate-project", "--message-format", "plain"]);
+        if let Some(path) = &args.manifest_path { command.arg("--manifest-path").arg(path); }
+        let path = Self::output(&mut command)?;
+        Manifest::new(Path::new(String::from_utf8_lossy(&path).trim()))
+    }
+
     pub fn new(mut args: ApplicationArgs, platform: &str, library: bool) -> Result<Self> {
         if args.cargo.workspace
             || args.cargo.package.len() > 1
@@ -30,10 +58,7 @@ impl Project {
             || (library && !args.cargo.bin.is_empty())
             || (!library && args.cargo.lib)
         {
-            return Err(PistonError::Generic(
-                "Select one app package; Android uses its cdylib, desktop and iOS use its binary."
-                    .into(),
-            ));
+            return Err(PistonError::AppSelectionInvalid);
         }
         let mut metadata = MetadataCommand::new();
         metadata.no_deps();
@@ -53,7 +78,7 @@ impl Project {
         let mut locate = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         locate.args(["locate-project", "--message-format", "plain"]);
         if let Some(path) = &args.cargo.manifest_path { locate.arg("--manifest-path").arg(path); }
-        let manifest = Self::output(&mut locate, "Locating the application manifest")?;
+        let manifest = Self::output(&mut locate)?;
         let manifest = fs::canonicalize(String::from_utf8_lossy(&manifest).trim())
             .map_err(|error| PistonError::CargoParseError(error.to_string()))?;
         let package = metadata
@@ -67,18 +92,12 @@ impl Project {
                 }
             })
             .cloned()
-            .ok_or_else(|| {
-                PistonError::CargoParseError(
-                    "Select an application with --package when running from a workspace.".into(),
-                )
-            })?;
+            .ok_or(PistonError::AppPackageMissing)?;
         args.cargo.package = vec![package.name.to_string()];
         args.cargo.manifest_path = Some(package.manifest_path.clone().into_std_path_buf());
         if library {
             if !package.targets.iter().any(|target| target.kind.contains(&TargetKind::CDyLib)) {
-                return Err(PistonError::CargoParseError(
-                    "Android needs an app library with crate-type = [\"cdylib\"] and an android_main entry point in Maverick.".into(),
-                ));
+                return Err(PistonError::AppLibraryMissing);
             }
             args.cargo.lib = true;
         } else {
@@ -95,9 +114,7 @@ impl Project {
             } else {
                 None
             };
-            let binary = binary.ok_or_else(|| {
-                PistonError::CargoParseError("Choose the application executable with --bin.".into())
-            })?;
+            let binary = binary.ok_or(PistonError::AppBinaryMissing)?;
             args.cargo.bin = vec![binary.name.clone()];
         }
         let target_dir =
@@ -155,11 +172,12 @@ impl Project {
     }
 
     pub fn compile<F: FnMut(&str)>(&self, mut command: Command, mut report: F) -> Result<PathBuf> {
+        let program = command.get_program().to_os_string();
         let mut child = command
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
             .spawn()
-            .map_err(|error| PistonError::BuildError(error.to_string()))?;
+            .map_err(|source| PistonError::CommandSpawn { program: program.clone(), source })?;
         let mut artifact = None;
         for message in Message::parse_stream(BufReader::new(child.stdout.take().unwrap())) {
             match message {
@@ -183,32 +201,25 @@ impl Project {
                 _ => {}
             }
         }
-        let status = child.wait().map_err(|error| PistonError::BuildError(error.to_string()))?;
+        let status = child.wait().map_err(|source| PistonError::CommandWait {
+            program: program.clone(), source,
+        })?;
         if !status.success() {
-            return Err(PistonError::BuildError(format!("Cargo build failed: {status}")));
+            return Err(PistonError::CommandStatus { program, status });
         }
-        artifact.ok_or_else(|| {
-            PistonError::BuildError("Cargo produced no runnable application artifact.".into())
+        artifact.ok_or_else(|| PistonError::ArtifactNotProduced {
+            package: self.package.name.to_string(), target: self.args.cargo.target.clone(),
         })
     }
 
     pub fn launch(&self, executable: &Path, arguments: &[String]) -> Result<()> {
-        Self::run(
-            Command::new(executable).args(arguments).current_dir(self.root()),
-            "Running application",
-        )
+        Self::run(Command::new(executable).args(arguments).current_dir(self.root()))
     }
 
     pub fn rust_target(target: &str) -> Result<()> {
-        let output = Self::output(
-            Command::new("rustup").args(["target", "list", "--installed"]),
-            "Checking Rust targets",
-        )?;
+        let output = Self::output(Command::new("rustup").args(["target", "list", "--installed"]))?;
         if !String::from_utf8_lossy(&output).lines().any(|line| line == target) {
-            Self::run(
-                Command::new("rustup").args(["target", "add", target]),
-                "Installing Rust target",
-            )?;
+            Self::run(Command::new("rustup").args(["target", "add", target]))?;
         }
         Ok(())
     }
@@ -224,9 +235,7 @@ impl Project {
                 } else if host.contains("x86_64") {
                     "x86_64"
                 } else {
-                    return Err(PistonError::Generic(
-                        "Unsupported host architecture for dynamic targeting. Try an explicit target.".into(),
-                    ));
+                    return Err(PistonError::HostArchitectureUnsupported { target: host });
                 };
                 let suffix = match target {
                     "ios" => "apple-ios",
@@ -242,36 +251,29 @@ impl Project {
     }
 
     pub fn host_target() -> Result<String> {
-        let version = Self::output(Command::new("rustc").arg("-vV"), "Reading Rust host target")?;
+        let version = Self::output(Command::new("rustc").arg("-vV"))?;
         String::from_utf8_lossy(&version)
             .lines()
             .find_map(|line| line.strip_prefix("host: "))
             .map(str::to_owned)
-            .ok_or_else(|| PistonError::Generic("rustc did not report its host target.".into()))
+            .ok_or(PistonError::RustHostMissing)
     }
 
-    pub fn run(command: &mut Command, operation: &str) -> Result<()> {
-        let status = command
-            .status()
-            .map_err(|error| PistonError::Generic(format!("{operation}: {error}")))?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(PistonError::Generic(format!("{operation} failed: {status}")))
-        }
+    pub fn run(command: &mut Command) -> Result<()> {
+        let program = command.get_program().to_os_string();
+        let status = command.status().map_err(|source| PistonError::CommandSpawn {
+            program: program.clone(), source,
+        })?;
+        if status.success() { Ok(()) } else { Err(PistonError::CommandStatus { program, status }) }
     }
 
-    pub fn output(command: &mut Command, operation: &str) -> Result<Vec<u8>> {
-        let output = command
-            .output()
-            .map_err(|error| PistonError::Generic(format!("{operation}: {error}")))?;
+    pub fn output(command: &mut Command) -> Result<Vec<u8>> {
+        let program = command.get_program().to_os_string();
+        let output = command.output().map_err(|source| PistonError::CommandSpawn {
+            program: program.clone(), source,
+        })?;
         if output.status.success() { return Ok(output.stdout); }
-        Err(PistonError::Generic(format!(
-            "{operation} failed ({}).\n{}{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        )))
+        Err(PistonError::CommandFailed { program, output })
     }
 
     pub fn write(path: &Path, contents: impl AsRef<[u8]>) -> Result<()> {
@@ -318,7 +320,7 @@ impl Project {
             return Ok(());
         }
         create_dir_all(tgt)
-            .map_err(|e| PistonError::Generic(format!("Failed to create base/assets: {}", e)))?;
+            .map_err(|e| PistonError::CreateDirAllError { path: tgt.to_path_buf(), source: e })?;
         Self::copy_updated_files(src, tgt)?;
         Self::remove_stale_files(src, tgt)?;
         Ok(())
@@ -357,16 +359,14 @@ impl Project {
             })?;
         }
         let resized_img = imageops::resize(&img, width, height, imageops::FilterType::Lanczos3);
-        resized_img.save(target_name).map_err(|e| {
-            PistonError::SaveImageError(format!("Failed to save {}: {}", target_name, e))
+        resized_img.save(target_name).map_err(|source| PistonError::SaveImage {
+            path: PathBuf::from(target_name), source,
         })?;
         Ok(())
     }
 
     pub fn get_lib_name(metadata: &Metadata) -> Result<String> {
-        let root_package = metadata.root_package().ok_or_else(|| {
-            PistonError::CargoParseError("no root package found in metadata".to_string())
-        })?;
+        let root_package = metadata.root_package().ok_or(PistonError::AppPackageMissing)?;
         let target_type: TargetKind = "cdylib".into();
         Ok(root_package
             .targets
@@ -407,15 +407,11 @@ impl Project {
     }
 
     pub fn get_app_name(metadata: &Metadata) -> Result<String> {
-        metadata.root_package().map(|pkg| pkg.name.to_string()).ok_or_else(|| {
-            PistonError::CargoParseError("app_name not found in [package]".to_string())
-        })
+        metadata.root_package().map(|pkg| pkg.name.to_string()).ok_or(PistonError::AppPackageMissing)
     }
 
     pub fn get_app_version(metadata: &Metadata) -> Result<String> {
-        metadata.root_package().map(|pkg| pkg.version.to_string()).ok_or_else(|| {
-            PistonError::CargoParseError("app_version not found in [package]".to_string())
-        })
+        metadata.root_package().map(|pkg| pkg.version.to_string()).ok_or(PistonError::AppPackageMissing)
     }
 
     pub fn get_bundle_id(metadata: &Metadata, app_name: &str) -> String {
@@ -447,48 +443,27 @@ impl Project {
             let src_path = entry.path();
             let dst_path = dst.join(entry.file_name());
             if src_path.is_dir() {
-                create_dir_all(&dst_path).map_err(|e| {
-                    PistonError::Generic(format!(
-                        "Failed to create asset subdir {}: {}",
-                        dst_path.display(),
-                        e,
-                    ))
+                create_dir_all(&dst_path).map_err(|source| PistonError::CreateDirAllError {
+                    path: dst_path.clone(), source,
                 })?;
                 Self::copy_updated_files(&src_path, &dst_path)?;
             } else {
                 let needs_copy = match (src_path.metadata(), dst_path.metadata()) {
                     (Ok(src_meta), Ok(dst_meta)) => {
-                        src_meta.modified().map_err(|e| {
-                            PistonError::Generic(format!(
-                                "Failed to get modified time of source {}: {}",
-                                src_path.display(),
-                                e,
-                            ))
-                        })? > dst_meta.modified().map_err(|e| {
-                            PistonError::Generic(format!(
-                                "Failed to get modified time of destination {}: {}",
-                                dst_path.display(),
-                                e,
-                            ))
+                        src_meta.modified().map_err(|source| PistonError::FileMetadata {
+                            path: src_path.clone(), source,
+                        })? > dst_meta.modified().map_err(|source| PistonError::FileMetadata {
+                            path: dst_path.clone(), source,
                         })?
                     }
                     (Ok(_), Err(_)) => true,
                     (Err(e), _) => {
-                        return Err(PistonError::Generic(format!(
-                            "Failed to read metadata of source {}: {}",
-                            src_path.display(),
-                            e,
-                        )));
+                        return Err(PistonError::FileMetadata { path: src_path, source: e });
                     }
                 };
                 if needs_copy {
-                    copy(&src_path, &dst_path).map_err(|e| {
-                        PistonError::Generic(format!(
-                            "Failed to copy asset {} → {}: {}",
-                            src_path.display(),
-                            dst_path.display(),
-                            e,
-                        ))
+                    copy(&src_path, &dst_path).map_err(|source| PistonError::CopyFileError {
+                        input_path: src_path.clone(), output_path: dst_path.clone(), source,
                     })?;
                 }
             }

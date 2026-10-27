@@ -5,6 +5,7 @@ use crate::error::PistonError;
 use crate::host::Host;
 
 pub mod cli;
+pub use cli::Cli;
 
 #[derive(Debug, Clone)]
 pub struct IOSDevice {

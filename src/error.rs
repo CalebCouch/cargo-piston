@@ -1,6 +1,5 @@
 use image::ImageError;
 use std::error::Error as StdError;
-use std::fmt;
 use std::io::Error as IoError;
 use std::path::PathBuf;
 
@@ -9,26 +8,267 @@ pub enum SetupPage { Url(String), XcodeAccounts(PathBuf), }
 
 #[derive(Debug)]
 pub enum PistonError {
+    LinuxVmHomeAccess { path: PathBuf, source: IoError },
+    LinuxVmHomeInvalid { path: PathBuf },
+    DeveloperStorageLock { path: PathBuf, source: Box<dyn StdError> },
+    DeveloperStoragePath { path: PathBuf },
+    DeveloperConnection(String),
+    DeveloperContract(String),
+    DeveloperTimeout { team: String },
+    DeveloperDisconnected { team: String },
+    DeveloperRejected { team: String },
+    DeveloperOwnerMismatch { team: String },
+    DeveloperUnconfirmed { team: String, account: String },
+    StoreTemporaryKey(IoError),
+    StoreCredentialsInvalid(serde_json::Error),
+    IosArchiveMissing { path: PathBuf, log: PathBuf },
+    IosExportMissing { path: PathBuf, log: PathBuf },
+    IosDistributionFailed { log: PathBuf, output: String, status: std::process::ExitStatus },
+    SigningExportMissing { path: PathBuf },
+    SigningExportAppCount { count: usize },
+    SigningBundleName { path: PathBuf },
+    SigningExecutableMissing { path: PathBuf },
+    SigningProvisionedAppMissing { bundle: PathBuf, log: PathBuf },
+    SigningSignatureInvalid { output: std::process::Output, log: PathBuf },
+    SigningAccountRejected { team: String, log: PathBuf },
+    SigningAccountMissing { team: String, log: PathBuf },
+    SigningAgreementRequired { team: String, log: PathBuf },
+    SigningTeamUnavailable { team: String, log: PathBuf },
+    SigningBundleUnavailable { team: String, log: PathBuf },
+    SigningAppIdLimit { team: String, log: PathBuf },
+    SigningFreeAppLimit { team: String, log: PathBuf },
+    SigningDeviceLimit { team: String, log: PathBuf },
+    SigningKeychainLocked { team: String, log: PathBuf },
+    SigningCertificateUnavailable { team: String, log: PathBuf },
+    SigningPushUnavailable { team: String, log: PathBuf },
+    SigningProfileUnavailable { team: String, log: PathBuf },
+    SigningBuildFailed { log: PathBuf, details: Vec<String> },
+    IosDevicesAmbiguous { devices: Vec<(String, String)> },
+    IosDeviceUnavailable { name: String },
+    IosDeviceDisappeared { name: String },
+    IosDeviceLocked { name: String },
+    IosLockStateMissing,
+    IosDeveloperModeDisabled { name: String, version: Option<String> },
+    IosConnectionNotReady { name: String },
+    IosDeviceListMissing,
+    IosSimulatorNotFound { selector: String },
+    IosSimulatorRuntimesMissing,
+    IosSimulatorRuntimeUnavailable,
+    IosSimulatorDeviceTypeMissing,
+    IosConfigInvalid(serde_json::Error),
+    IosMinimumVersion { value: String },
+    IosStoreIdentifierMissing,
+    IosStoreTargetInvalid,
+    IosSimulatorTarget { target: String },
+    IosTargetUnsupported { target: String },
+    IosStoreIconMissing,
+    IosStoreIconInvalid { path: PathBuf },
+    IosResourceInvalid { path: PathBuf },
+    IosResourceConflict { path: PathBuf },
+    IosImageAssetCreate { path: PathBuf, source: IoError },
+    AppSelectionInvalid,
+    AppPackageMissing,
+    AppLibraryMissing,
+    AppBinaryMissing,
+    RustHostMissing,
+    HostArchitectureUnsupported { target: String },
+    FileMetadata { path: PathBuf, source: IoError },
+    SaveImage { path: PathBuf, source: ImageError },
+    ManifestTableRequired { path: PathBuf, section: String },
+    ManifestStringRequired { path: PathBuf, key: String },
+    ManifestReadOnly { path: PathBuf },
+    ManifestChanged { path: PathBuf },
+    ManifestPackageMissing { path: PathBuf },
+    ManifestParse { path: PathBuf, source: toml_edit::TomlError },
+    ManifestWrite { path: PathBuf, source: IoError },
+    CommandWait { program: std::ffi::OsString, source: IoError },
+    CommandLogged { log: PathBuf, diagnostics: String, error: Box<PistonError> },
+    SetPermissions { path: PathBuf, source: IoError },
+    IdentityMissing { team: String },
+    IdentityImportInvalid,
+    IdentityTeamMismatch { expected: String, actual: String },
+    IdentityConflict { team: String },
+    IdentityTeamInvalid { team: String },
+    IdentityRootMismatch,
+    IdentityOwnerMismatch,
+    HostAndroidSdkMissing { path: PathBuf },
+    HostJavaMissing { path: PathBuf, source: IoError },
+    HostBuildUnsupported,
+    HostUsernameMissing,
+    XcodeSystemVersionInvalid { value: String },
+    XcodeArchitectureUnsupported { architecture: String },
+    XcodeSelectedTooOld { version: [u32; 3], minimum: u32 },
+    XcodeSdkUnavailable { developer: PathBuf, sdk: String, minimum: u32, output: std::process::Output },
+    XcodeIncomplete { developer: PathBuf },
+    XcodeIncompatible { developer: PathBuf },
+    XcodeDiscovery { path: PathBuf, error: Box<PistonError> },
+    XcodeCatalogUnavailable { source: Box<ureq::Error> },
+    XcodeSystemTooOld { sdk: String, minimum: [u32; 3] },
+    XcodeReleaseUnavailable { architecture: String, sdk: String },
+    XcodeDestinationExists { path: PathBuf },
+    XcodeArchiveMismatch { version: String, build: String, staging: PathBuf },
+    XcodeInstallMove { destination: PathBuf, staging: PathBuf, source: IoError },
+    XcodeLicenseIncomplete,
+    XcodeAdministratorApprovalIncomplete,
+    LinuxVmNameInvalid { name: String },
+    LinuxVmHomeMissing,
+    LinuxVmLocked { name: String, source: Box<dyn StdError> },
+    LinuxVmSignalHandler(ctrlc::Error),
+    LinuxVmUnavailable { name: String, state: Option<String> },
+    LinuxVmTargetMissing,
+    LinuxVmTargetMismatch { actual: String, requested: String },
+    LinuxVmDesktopTimeout,
+    LinuxVmStopFailed { name: String, home: PathBuf },
+    LinuxVmInterrupted,
+    ApplePlistRead { path: PathBuf, source: plist::Error },
+    ApplePlistWrite { path: PathBuf, source: plist::Error },
+    ApplePlistJson(serde_json::Error),
+    ApplePlistField { key: String },
+    ApplePlistInput(IoError),
+    ApplePlistWait(IoError),
+    SigningCertificateMissing { name: String },
+    SigningCertificateAmbiguous { name: String, teams: Vec<String> },
+    PushKeyRead { path: PathBuf, source: IoError },
+    PushKeyInRepository { path: PathBuf },
+    PushIdentifiersInvalid,
+    PushKeyIdMismatch { key_id: String, path: PathBuf },
+    PushKeyEncoding(jsonwebtoken::errors::Error),
+    PushKeySigning(jsonwebtoken::errors::Error),
+    PushIdentityMissing { team: String },
+    PushSetupTimeout,
+    PushLocationError(String),
+    PushContractError(String),
+    PushInboxError(String),
+    PushRegistrationInvalid(serde_json::Error),
+    PushLocationMismatch,
+    PushConnectionError(String),
+    PushInitializationError(String),
+    PushUpdateDenied,
+    PushCredentialsUnconfirmed,
+    PushCredentialsInvalid(serde_json::Error),
+    PushSharingDisconnected,
+    PushInboxSignatureRejected,
+    PushConfirmationDisconnected,
+    PushUpdateRejected,
+    PushIpaApplicationCount { count: usize },
+    PushProfileMissing { topic: String, output: std::process::Output },
+    PushTopicMismatch { topic: String },
+    PushArchitectures { output: std::process::Output },
+    PushEntitlementsRead { architecture: String, output: std::process::Output },
+    PushEntitlementsParse(plist::Error),
+    PushProfileNotDictionary,
+    PushProfileEntitlementsMissing,
+    PushEntitlementsNotDictionary,
+    PushEnvironmentMismatch { key: &'static str, environment: &'static str, topic: String },
+    PushTeamMismatch { team: String },
+    PushProfileTopicMismatch { topic: String },
+    PushProfileExpired,
+    StoreKeyInvalid { key_id: String, source: jsonwebtoken::errors::Error },
+    StoreKeyIdInvalid,
+    StoreIssuerInvalid,
+    StoreKeyMissing { key_id: String },
+    StoreKeyAmbiguous { key_id: String, paths: Vec<PathBuf> },
+    StoreKeyUnreadable { path: PathBuf, source: IoError },
+    StoreKeySearchFallback(Box<PistonError>),
+    StoreKeySearchDenied { path: PathBuf },
+    StoreResponseField { field: String },
+    StoreReleaseExists { requested: String, released: String },
+    StoreBuildNumberOverflow,
+    StoreResponseCollection { path: String },
+    StorePaginationUrl { url: String },
+    StorePaginationLimit,
+    StoreResponseJson { method: String, path: String, source: IoError },
+    StoreRequestFailed { method: String, path: String, status: u16, response: serde_json::Value },
+    StoreConnectionFailure { method: String, path: String, source: ureq::Transport },
+    StoreHttpError { method: &'static str, path: String, source: ureq::Error },
+    StoreHttpStatus { method: &'static str, path: String, status: u16, response: String },
+    StoreCertificateMissing { name: String },
+    StoreVersionInvalid { version: String },
+    StoreAppMissing { bundle_id: String, testflight: bool },
+    StoreScreenshotFolder { path: PathBuf, source: IoError },
+    StoreScreenshotNotFile { path: PathBuf, directory: PathBuf },
+    StoreScreenshotFormat { path: PathBuf },
+    StoreScreenshotCount { path: PathBuf, count: usize },
+    StoreScreenshotSizesMissing { family: String },
+    StoreScreenshotOutputOverlap { path: PathBuf },
+    StoreScreenshotDecode { path: PathBuf, source: ImageError },
+    StoreScreenshotOrientation { path: PathBuf, source: ImageError },
+    StoreScreenshotColorProfile { path: PathBuf, source: ImageError },
+    StoreScreenshotTransparent { path: PathBuf },
+    StoreScreenshotDimensions { path: PathBuf, original: (u32, u32), accepted: Vec<(u32, u32)> },
+    StoreScreenshotWrite { path: PathBuf, source: ImageError },
+    StoreScreenshotFlush { path: PathBuf, source: IoError },
+    StoreCatalogEmpty,
+    StoreScreenshotsMissing,
+    StoreScreenshotGroupCount { group: String, count: usize, maximum: usize },
+    StoreScreenshotFileSize { path: PathBuf, size: u64, maximum: u64 },
+    StoreScreenshotSync { source: Box<PistonError>, recovery: Vec<(String, PistonError)> },
+    StoreScreenshotGroupMismatch { images: Vec<(PathBuf, u32, u32)> },
+    StoreVersionNotEditable { version: String, state: String },
+    StoreUploadUrlsRejected,
+    StoreUploadOperationsMissing { image_id: String },
+    StoreUploadRangeInvalid,
+    StoreUploadRangeTooLarge,
+    StoreUploadRangeDiscontinuous,
+    StoreUploadRangeIncomplete,
+    StoreUploadInsecureUrl,
+    StoreUploadAuthorization,
+    StoreScreenshotUpload { image_id: String, status: Option<u16> },
+    StoreImageProcessingTimeout { image_id: String },
+    StoreImageSpecificationMismatch { image_id: String, group: String, spec: String },
+    StoreImageRejected { image_id: String, state: String, details: serde_json::Value },
+    StoreScreenshotOrder { group: String },
+    StoreCatalogFeatureMissing,
+    StoreCatalogPolicyMissing,
+    StoreCatalogSpecificationsMissing,
+    StoreCatalogCategoryRejected,
+    StoreCatalogDimensionsInvalid,
+    StoreCatalogSpecificationsUnavailable,
+    AndroidArgumentsUnsupported,
+    AndroidBridgeMissing,
+    AndroidNdkMissing { path: PathBuf },
+    AndroidDeviceUnavailable { serial: String, state: String },
+    AndroidDevicesAmbiguous { serials: Vec<String> },
+    AndroidTargetIncompatible { serial: String, target: Option<String>, abis: Vec<String> },
+    AndroidToolMissing { path: PathBuf },
+    AndroidBuildToolsMissing { path: PathBuf },
+    AndroidHostToolchainMissing { path: PathBuf },
+    AndroidManifestMissing { path: PathBuf },
+    AndroidSdkManagerMissing { path: PathBuf },
+    AndroidEmulatorNotFound { selector: String, available: Vec<String> },
+    AndroidEmulatorPortsUnavailable,
+    AndroidEmulatorClosed { log: PathBuf },
+    AndroidBootTimeout,
+    AndroidInterrupted,
+    AndroidAppExited,
+    AndroidEmulatorControl(IoError),
+    AndroidSignalHandler(ctrlc::Error),
+    MacResourcesInvalid,
+    MacResourceInvalid { path: PathBuf },
+    LinuxAppImageTargetUnsupported { target: String },
+    LinuxRuntimeMissing { path: PathBuf },
+    LinuxImageError(String),
+    LinuxSigningInput(IoError),
+    CommandSpawn { program: std::ffi::OsString, source: IoError },
+    CommandFailed { program: std::ffi::OsString, output: std::process::Output },
+    CommandStatus { program: std::ffi::OsString, status: std::process::ExitStatus },
+    MissingEnvironment { name: &'static str },
+    MissingSetting { key: String },
+    InvalidBundleId { value: String },
+    PlistNotDictionary { path: PathBuf },
+    ArtifactNotProduced { package: String, target: Option<String> },
+    ReadFile { path: PathBuf, source: IoError },
     SetupRequired { error: Box<PistonError>, page: SetupPage },
     BuildError(String),
     CargoParseError(String),
     WriteFileError(String),
     FileFlushError(String),
     WriteImageError(ImageError),
-    SaveImageError(String),
-    ZigbuildMissingError(String),
-    HomebrewMissingError(String),
     ParseManifestError(String),
-    CreateManifestError(String),
     WriteManifestError(String),
-    AndroidConfigError(String),
-    ProtoLinkError(String),
     UnsupportedTargetError(String),
     XcodeInstallError(String),
-    XcodeSelectInstallError(String),
-    XcodeSelectPathingError(String),
     XcodeBuildError(String),
-    IOSSdkMissingError(String),
     ADBDevicesError(String),
     ParseUTF8Error(String),
     XcrunDevicectlError(String),
@@ -37,11 +277,9 @@ pub enum PistonError {
     IntoJSONError(String),
     OpenSSLKeyGenError(String),
     OpenSSLCSRError(String),
-    ReadCSRError(String),
     Base64DecodeError(String),
-    ASCClientParseEncodingKeyError(String),
     ASCClientJWTEncodeError(String),
-    ASCAuthenticationError(String),
+    ASCAuthenticationError(Box<PistonError>),
     WritePlUtilError(String),
     XcrunInstallError(String),
     XcrunLaunchError(String),
@@ -49,12 +287,6 @@ pub enum PistonError {
     DeviceProvisionError(String),
     SecurityFindIdentityError(String),
     PlutilConvertError(String),
-    ExtractAPKError(String),
-    InstallAPKError(String),
-    RunAPKError(String),
-    WhoAmIError(String),
-    KeyToolError(String),
-    APKSignerError(String),
     UnsupportedOSError { os: String, target: String },
     CopyFileError { input_path: PathBuf, output_path: PathBuf, source: IoError },
     LipoError { first_binary: PathBuf, second_binary: PathBuf, source: String },
@@ -68,151 +300,50 @@ pub enum PistonError {
     RenameFileError { path: PathBuf, source: IoError },
     CreateDirAllError { path: PathBuf, source: IoError },
     OpenImageError { path: PathBuf, source: ImageError },
-    ASCClientUreqError { endpoint: String, e: String },
     Generic(String),
-}
-
-impl fmt::Display for PistonError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::SetupRequired { error, .. } => std::fmt::Display::fmt(error, f),
-            Self::BuildError(err) => write!(f, "Failed to build the binary: {}", err),
-            Self::CargoParseError(err) => write!(f, "Could not read the Cargo project:\n{err}"),
-            Self::WriteFileError(err) => write!(f, "Failed to write file: {}", err),
-            Self::WriteImageError(err) => write!(f, "Failed to write image: {}", err),
-            Self::SaveImageError(err) => write!(f, "Failed to save image: {}", err),
-            Self::FileFlushError(err) => write!(f, "Failed to flush file: {}", err),
-            Self::ZigbuildMissingError(err) => {
-                write!(f, "Failed to find zigbuild path in .env file: {}", err)
-            }
-            Self::HomebrewMissingError(err) => {
-                write!(f, "Failed to find homebrew bin path in .env file: {}", err)
-            }
-            Self::ParseManifestError(err) => {
-                write!(f, "Failed to parse package.metadata.android value: {}", err)
-            }
-            Self::CreateManifestError(err) => {
-                write!(f, "Failed to create AndroidManifest.xml file: {}", err)
-            }
-            Self::WriteManifestError(err) => {
-                write!(f, "Failed to write AndroidManifest.xml contents: {}", err)
-            }
-            Self::AndroidConfigError(err) => {
-                write!(f, "Failed to read android config path from .env: {}", err)
-            }
-            Self::ProtoLinkError(err) => {
-                write!(f, "Failed to proto link android build directory: {}", err)
-            }
-            Self::UnsupportedTargetError(err) => {
-                write!(f, "User Specified Target is Unsupported: {}", err)
-            }
-            Self::XcodeInstallError(err) => write!(f, "Xcode Installation not Found: {}", err),
-            Self::XcodeSelectInstallError(err) => {
-                write!(f, "Xcode-select Installation verification failed: {}", err)
-            }
-            Self::XcodeSelectPathingError(err) => {
-                write!(f, "Xcode-select pathing does not match expected value: {}", err)
-            }
-            Self::XcodeBuildError(err) => {
-                write!(f, "Xcode could not complete the operation: {err}")
-            }
-            Self::IOSSdkMissingError(err) => {
-                write!(f, "IOS SDK missing from xcodebuild sdks: {}", err)
-            }
-            Self::ADBDevicesError(err) => {
-                write!(f, "Error Running 'ADB Devices', check installation and .env path: {}", err)
-            }
-            Self::ParseUTF8Error(err) => write!(f, "Error Parsing UTF8: {}", err),
-            Self::XcrunDevicectlError(err) => f.write_str(err),
-            Self::KeyChainUnlockError(err) => {
-                write!(f, "Failed to unlock the security keychain: {}", err)
-            }
-            Self::KeyChainImportError(err) => {
-                write!(f, "Failed to import profile to security keychain: {}", err)
-            }
-            Self::IntoJSONError(err) => write!(f, "Error converting into JSON: {}", err),
-            Self::OpenSSLKeyGenError(err) => {
-                write!(f, "Error Generating New Key with openssl: {}", err)
-            }
-            Self::OpenSSLCSRError(err) => write!(f, "Error Generating CSR with openssl: {}", err),
-            Self::ReadCSRError(err) => write!(f, "Error Reading CSR: {}", err),
-            Self::Base64DecodeError(err) => write!(f, "Error Decoding Base 64: {}", err),
-            Self::ASCClientParseEncodingKeyError(err) => {
-                write!(f, "Error parsing encoding key: {}", err)
-            }
-            Self::ASCAuthenticationError(err) => f.write_str(err),
-            Self::ASCClientJWTEncodeError(err) => write!(f, "Error encoding JWT: {}", err),
-            Self::WritePlUtilError(err) => write!(f, "Failed to write Plutil contents: {}", err),
-            Self::XcrunInstallError(err) => {
-                write!(f, "Error installing app bundle to target device via xcrun: {}", err)
-            }
-            Self::XcrunLaunchError(err) => {
-                write!(f, "Error launching app bundle on target device via xcrun: {}", err)
-            }
-            Self::CodesignError(err) => f.write_str(err),
-            Self::DeviceProvisionError(err) => {
-                write!(f, "Error provisioning target device with idp: {}", err)
-            }
-            Self::SecurityFindIdentityError(err) => write!(
-                f,
-                "Error checking for local identities with `security find-identity -v -p codesigning`: {}",
-                err
-            ),
-            Self::PlutilConvertError(err) => {
-                write!(f, "Error using plutil to convert filetype`: {}", err)
-            }
-            Self::ExtractAPKError(err) => {
-                write!(f, "Error extracting APK from AAB with bundletool: {}", err)
-            }
-            Self::InstallAPKError(err) => {
-                write!(f, "Error Installing APK with bundletool: {}", err)
-            }
-            Self::RunAPKError(err) => write!(f, "Error Running APK with ADB: {}", err),
-            Self::WhoAmIError(err) => write!(f, "Error running 'whoami': {}", err),
-            Self::KeyToolError(err) => write!(f, "Error running 'keytool': {}", err),
-            Self::APKSignerError(err) => write!(f, "Error running 'apksigner': {}", err),
-            Self::UnsupportedOSError { os, target, .. } => {
-                write!(f, "Host system: {:?} does not support the target: {:?}", os, target)
-            }
-            Self::LipoError { first_binary, second_binary, source } => write!(
-                f,
-                "Error making universal binary with Lipo first binary: {:?}, second binary: {:?}, source: {}",
-                first_binary, second_binary, source
-            ),
-            Self::CopyFileError { input_path, output_path, .. } => {
-                write!(f, "Failed to copy {:?} to {:?}", input_path, output_path)
-            }
-            Self::MacOSIconError { input_path, output_path, .. } => {
-                write!(f, "Failed to format icon {:?} to {:?}", input_path, output_path)
-            }
-            Self::ReadDirError { path, .. } => write!(f, "Failed to read directory {:?}", path),
-            Self::MapDirError { path, .. } => {
-                write!(f, "Failed to map directory contents {:?}", path)
-            }
-            Self::QueryProvisionError { path, .. } => {
-                write!(f, "Failed to query the security provision profile {:?}", path)
-            }
-            Self::RemoveSubdirError { path, .. } => {
-                write!(f, "Failed to remove subdirectory {:?}", path)
-            }
-            Self::RemoveFileError { path, .. } => write!(f, "Failed to remove file {:?}", path),
-            Self::CreateFileError { path, .. } => write!(f, "Failed to Create file {:?}", path),
-            Self::RenameFileError { path, .. } => write!(f, "Failed to Rename file {:?}", path),
-            Self::CreateDirAllError { path, .. } => {
-                write!(f, "Failed to create dir all {:?}", path)
-            }
-            Self::OpenImageError { path, .. } => write!(f, "Failed to open image {:?}", path),
-            Self::ASCClientUreqError { endpoint, e } => {
-                write!(f, "ASC API error at endpoint: {:?}, Error message: {}", endpoint, e)
-            }
-            Self::Generic(err) => f.write_str(err),
-        }
-    }
 }
 
 impl StdError for PistonError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::LinuxVmHomeAccess { source, .. } => Some(source),
+            Self::DeveloperStorageLock { source, .. } => Some(source.as_ref()),
+            Self::StoreTemporaryKey(source) => Some(source),
+            Self::StoreCredentialsInvalid(source) => Some(source),
+            Self::IosImageAssetCreate { source, .. } => Some(source),
+            Self::IosConfigInvalid(source) => Some(source),
+            Self::FileMetadata { source, .. } | Self::ManifestWrite { source, .. } => Some(source),
+            Self::SaveImage { source, .. } => Some(source),
+            Self::ManifestParse { source, .. } => Some(source),
+            Self::CommandWait { source, .. } | Self::SetPermissions { source, .. }
+            | Self::HostJavaMissing { source, .. } | Self::XcodeInstallMove { source, .. } => Some(source),
+            Self::LinuxVmLocked { source, .. } => Some(source.as_ref()),
+            Self::XcodeCatalogUnavailable { source } => Some(source.as_ref()),
+            Self::CommandLogged { error, .. } | Self::XcodeDiscovery { error, .. } => Some(error.as_ref()),
+            Self::LinuxVmSignalHandler(source) => Some(source),
+            Self::ApplePlistRead { source, .. } | Self::ApplePlistWrite { source, .. }
+            | Self::PushEntitlementsParse(source) => Some(source),
+            Self::ApplePlistJson(source) | Self::PushRegistrationInvalid(source)
+            | Self::PushCredentialsInvalid(source) => Some(source),
+            Self::ApplePlistInput(source) | Self::ApplePlistWait(source)
+            | Self::PushKeyRead { source, .. } => Some(source),
+            Self::PushKeyEncoding(source) | Self::PushKeySigning(source) => Some(source),
+            Self::StoreKeyInvalid { source, .. } => Some(source),
+            Self::StoreKeyUnreadable { source, .. } | Self::StoreResponseJson { source, .. }
+            | Self::StoreScreenshotFolder { source, .. }
+            | Self::StoreScreenshotFlush { source, .. } => Some(source),
+            Self::StoreKeySearchFallback(source) | Self::ASCAuthenticationError(source)
+            | Self::StoreScreenshotSync { source, .. } => Some(source.as_ref()),
+            Self::StoreConnectionFailure { source, .. } => Some(source),
+            Self::StoreHttpError { source, .. } => Some(source),
+            Self::StoreScreenshotDecode { source, .. }
+            | Self::StoreScreenshotOrientation { source, .. }
+            | Self::StoreScreenshotColorProfile { source, .. }
+            | Self::StoreScreenshotWrite { source, .. } => Some(source),
+            Self::AndroidEmulatorControl(source) | Self::LinuxSigningInput(source) => Some(source),
+            Self::AndroidSignalHandler(source) => Some(source),
+            Self::CommandSpawn { source, .. } | Self::ReadFile { source, .. } => Some(source),
+            Self::SetupRequired { error, .. } => Some(error.as_ref()),
             Self::CopyFileError { source, .. }
             | Self::MacOSIconError { source, .. }
             | Self::ReadDirError { source, .. }

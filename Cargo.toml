@@ -1,8 +1,8 @@
 [package]
 name = "cargo-piston"
 description = "Utility tool for streamlining the configuration of rust binaries for various operating systems"
-repository = "https://github.com/dav-anderson/cargo-piston"
-version = "0.5.5"
+repository = "https://github.com/CalebCouch/cargo-piston"
+version = "0.5.6"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 
@@ -29,6 +29,3 @@ air = "3.0.1"
 air_notifications = "0.1.1"
 air_server = "1.0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "time"] }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-security-framework = "3.6"

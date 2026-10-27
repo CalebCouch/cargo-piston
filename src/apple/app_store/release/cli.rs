@@ -1,11 +1,18 @@
 use crate::PistonError;
 use super::{AppStoreRelease, ScreenshotFamily, StoreScreenshot};
 
-pub struct ReleaseCli;
+pub struct Cli;
 
-impl ReleaseCli {
+impl Cli {
     pub fn validate(release: &AppStoreRelease, screenshots: &[StoreScreenshot]) -> Result<(), PistonError> {
-        for warning in release.validate(screenshots)? { eprintln!("{warning}"); }
+        let preserved = release.validate(screenshots)?;
+        if !preserved.is_empty() {
+            eprintln!(
+                "Keeping existing screenshot groups {}. These can override Apple's scaled \
+                 screenshots for those displays; review them in App Store Connect's Media Manager.",
+                preserved.join(", ")
+            );
+        }
         Ok(())
     }
     pub fn upload(release: &mut AppStoreRelease, screenshots: &[StoreScreenshot]) -> Result<(), PistonError> {

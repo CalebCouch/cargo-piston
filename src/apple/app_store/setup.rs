@@ -3,66 +3,58 @@ use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use crate::developer::Credentials;
 use crate::host::Host;
 use crate::manifest::Manifest;
 use crate::{PistonError, Result};
 use super::{AppStoreConnect, AscApiKey};
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct AccountSetup {
-    pub root: PathBuf,
-    pub manifest: Manifest,
-    pub settings: HashMap<String, String>,
-    pub explicit: bool,
+    root: PathBuf,
+    manifest: Manifest,
+    settings: HashMap<String, String>,
+    team: String,
+    store: Credentials,
+    runtime: tokio::runtime::Runtime,
 }
 
 impl AccountSetup {
-    pub fn new(root: &Path, reconfigure: bool) -> Result<Self> {
+    pub(crate) fn new(root: &Path, team: String, store: Credentials) -> Result<Self> {
         let root = fs::canonicalize(root)
-            .map_err(|error| PistonError::Generic(format!("Cannot locate project: {error}")))?;
+            .map_err(|source| PistonError::ReadFile { path: root.into(), source })?;
         let manifest = Manifest::new(&root.join("Cargo.toml"))?;
-        let path = root.join(".env");
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
-            Err(error) => {
-                return Err(PistonError::Generic(format!(
-                    "Cannot read {}: {error}",
-                    path.display()
-                )));
-            }
-        };
-        let mut settings: HashMap<String, String> = contents
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim().strip_prefix("export ").unwrap_or(line.trim());
-                if line.starts_with('#') { return None; }
-                let (key, value) = line.split_once('=')?;
-                let key = key.trim().to_ascii_lowercase();
-                if !["asc_key_id", "asc_issuer_id", "asc_key_path"].contains(&key.as_str()) {
-                    return None;
-                }
-                Some((key, value.trim().trim_matches(['\'', '"']).into()))
-            })
+        let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build()
+            .map_err(|error| PistonError::Generic(error.to_string()))?;
+        let settings = ["ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_PATH"].into_iter()
+            .filter_map(|name| env::var(name).ok().map(|value| (name.to_ascii_lowercase(), value)))
             .collect();
-        for name in ["ASC_KEY_ID", "ASC_ISSUER_ID", "ASC_KEY_PATH"] {
-            if let Ok(value) = env::var(name) { settings.insert(name.to_ascii_lowercase(), value); }
-        }
-        let explicit = !settings.is_empty();
-        if !explicit && !reconfigure {
-            settings = manifest
-                .settings(&["app_store_connect"])?
-                .into_iter()
-                .map(|(name, value)| (format!("asc_{name}"), value))
-                .collect();
-        }
-        Ok(Self { root, manifest, settings, explicit })
+        Ok(Self { root, manifest, settings, team, store, runtime })
+    }
+
+    fn load(&mut self, replace: bool) -> Result<Option<AscApiKey>> {
+        self.runtime.block_on(self.store.load(&self.team))?;
+        if replace { return Ok(None); }
+        self.store.get(&self.team, "app-store-connect")
+            .map(|bytes| serde_json::from_slice(bytes).map_err(PistonError::StoreCredentialsInvalid))
+            .transpose()
+    }
+
+    fn save(&mut self, key: &AscApiKey) -> Result<()> {
+        let bytes = serde_json::to_vec(key).unwrap();
+        self.runtime.block_on(self.store.save(&self.team, "app-store-connect", bytes))?;
+        self.remember()
+    }
+
+    fn remember(&self) -> Result<()> {
+        self.manifest.save(&["ios"], &[("team", &self.team)])
     }
 }
 
 impl AscApiKey {
-    fn configured(root: &Path, settings: &HashMap<String, String>, report: &mut dyn FnMut(String)) -> Result<Self> {
+    fn configured(root: &Path, settings: &HashMap<String, String>, report: &mut dyn FnMut(PistonError)) -> Result<Self> {
         let path = settings
             .get("asc_key_path")
             .filter(|path| !path.is_empty())
@@ -76,10 +68,7 @@ impl AscApiKey {
             .unwrap_or("")
             .to_owned();
         if !Self::valid_id(&key_id) {
-            return Err(PistonError::Generic(
-                "Provide a 10-character Team API Key ID or an AuthKey_<KEY_ID>.p8 file path."
-                    .into(),
-            ));
+            return Err(PistonError::StoreKeyIdInvalid);
         }
         let issuer = settings.get("asc_issuer_id").map(String::as_str).unwrap_or("");
         let parts: Vec<_> = issuer.split('-').collect();
@@ -88,9 +77,7 @@ impl AscApiKey {
                 part.len() == length && part.bytes().all(|byte| byte.is_ascii_hexdigit())
             })
         {
-            return Err(PistonError::Generic(
-                "Enter the Issuer ID shown above Team Keys (ASC_ISSUER_ID), in UUID format.".into(),
-            ));
+            return Err(PistonError::StoreIssuerInvalid);
         }
         let path = match path {
             Some(path) => path,
@@ -99,29 +86,16 @@ impl AscApiKey {
                 match paths.as_slice() {
                     [path] => path.clone(),
                     [] => {
-                        return Err(PistonError::Generic(format!(
-                            "Cannot find AuthKey_{key_id}.p8 using system search or the standard key folders. \
-                         Set ASC_KEY_PATH or use the interactive setup.",
-                        )));
+                        return Err(PistonError::StoreKeyMissing { key_id });
                     }
                     _ => {
-                        return Err(PistonError::Generic(format!(
-                            "Multiple files match Key ID {key_id}. Set ASC_KEY_PATH to choose one:\n{}",
-                            paths
-                                .iter()
-                                .map(|path| path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                        )));
+                        return Err(PistonError::StoreKeyAmbiguous { key_id, paths });
                     }
                 }
             }
         };
         let path = fs::canonicalize(&path).map_err(|error| {
-            PistonError::Generic(format!(
-                "Cannot read the API key at {}: {error}. Choose the downloaded .p8 file.",
-                path.display(),
-            ))
+            PistonError::StoreKeyUnreadable { path: path.clone(), source: error }
         })?;
         let mut settings = settings.clone();
         settings.insert("asc_key_id".into(), key_id.into());
@@ -145,7 +119,7 @@ impl AscApiKey {
         if let Some(relative) = value.strip_prefix("~/") {
             Ok(PathBuf::from(
                 env::var_os("HOME")
-                    .ok_or_else(|| PistonError::Generic("HOME is unavailable.".into()))?,
+                    .ok_or_else(|| PistonError::MissingEnvironment { name: "HOME" })?,
             )
             .join(relative))
         } else {
@@ -153,7 +127,7 @@ impl AscApiKey {
         }
     }
 
-    fn find_key_paths(root: &Path, key_id: &str, report: &mut dyn FnMut(String)) -> Result<Vec<PathBuf>> {
+    fn find_key_paths(root: &Path, key_id: &str, report: &mut dyn FnMut(PistonError)) -> Result<Vec<PathBuf>> {
         let mut folders = vec![root.join("private_keys")];
         if let Some(home) = env::var_os("HOME").map(PathBuf::from) {
             folders.extend(
@@ -166,7 +140,7 @@ impl AscApiKey {
         let mut candidates: Vec<_> = folders.into_iter().map(|folder| folder.join(&name)).collect();
         match Host::find_files(&name) {
             Ok(paths) => candidates.extend(paths),
-            Err(error) => report(format!("{error} Checking standard key folders directly.")),
+            Err(error) => report(PistonError::StoreKeySearchFallback(Box::new(error))),
         }
         let mut paths = Vec::new();
         for path in candidates {
@@ -174,17 +148,11 @@ impl AscApiKey {
                 Ok(path) => path,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                 Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
-                    report(format!(
-                        "Cannot search {}: permission denied. Supply the key file path if stored there.",
-                        path.parent().unwrap().display()
-                    ));
+                    report(PistonError::StoreKeySearchDenied { path: path.parent().unwrap().into() });
                     continue;
                 }
                 Err(error) => {
-                    return Err(PistonError::Generic(format!(
-                        "Cannot search {}: {error}",
-                        path.display(),
-                    )));
+                    return Err(PistonError::ReadFile { path, source: error });
                 }
             };
             if path.is_file() && !paths.contains(&path) { paths.push(path); }

@@ -2,9 +2,9 @@ use std::collections::HashMap;
 use crate::PistonError;
 use super::Devices;
 
-pub struct DevicesCli;
+pub struct Cli;
 
-impl DevicesCli {
+impl Cli {
     pub fn list(env_vars: HashMap<String, String>, silent: bool) -> Result<Devices, PistonError> {
         let devices = Devices::discover(env_vars)?;
         if !devices.android_available { println!("Android installation not found"); }

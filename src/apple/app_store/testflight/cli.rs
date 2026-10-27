@@ -1,21 +1,21 @@
 use std::thread;
 use std::time::{Duration, Instant};
-use crate::host::cli::HostCli;
+use crate::host;
 use crate::manifest::Manifest;
 use crate::{PistonError, Result};
 use super::{FlightStatus, TestFlight};
 
-pub struct TestFlightCli;
+pub struct Cli;
 
-impl TestFlightCli {
+impl Cli {
     pub fn wait(flight: &TestFlight, manifest: &Manifest) -> Result<()> {
         let start = Instant::now();
-        let mut compliance_opened = false;
+        let mut compliance_shown = false;
         let mut previous = String::new();
         println!(
-            "Waiting for TestFlight readiness. Status changes will appear below.\n\
-            Ctrl-C stops local monitoring; rerun the same deploy command to resume.\n{}",
-            flight.url()
+            "Waiting for TestFlight. Status changes will appear below.\n\n{}\n\n\
+             Ctrl-C stops monitoring. Rerun this deploy command to resume.\n",
+            host::Cli::link("TestFlight", &flight.url()),
         );
         loop {
             let FlightStatus { state, url } = flight.status()?;
@@ -46,39 +46,45 @@ impl TestFlightCli {
                 "READY_FOR_BETA_TESTING" | "IN_BETA_TESTING" => {
                     flight.record_state(manifest, "complete")?;
                     println!(
-                        "Deployment complete: version {} (build {}) is ready for internal TestFlight testing.\n{}\n\
-                        Existing groups with automatic distribution receive eligible builds. \
-                        Otherwise select an Internal Testing group and add this build in App Store Connect. \
-                        External testing requires its own group, beta information and Apple's beta review.",
-                        flight.version, flight.build_number, url
+                        "Deployment complete: version {} (build {}) is ready for internal testing.\n\n\
+                         {}\n\n\
+                         Internal testing: automatic groups receive eligible builds.\n\
+                         Otherwise add this build to an Internal Testing group.\n\n\
+                         External testing: choose a group, complete beta information,\n\
+                         and submit the build for Apple's beta review.",
+                        flight.version, flight.build_number, host::Cli::link("TestFlight build", &url),
                     );
                     return Ok(());
                 }
                 "MISSING_EXPORT_COMPLIANCE" => {
-                    if !compliance_opened {
+                    if !compliance_shown {
                         println!(
-                            "Action required: open {url}, click \"Provide Export Compliance \
-                            Information\", and answer the questions for this build. Piston will \
-                            continue automatically when Apple clears the build."
+                            "\nExport compliance needs your answers.\n\n\
+                             1. Open this build:\n   {}\n\n\
+                             2. Select \"Provide Export Compliance Information\".\n\
+                                Answer the questions for this build.\n\n\
+                             Piston will continue when Apple clears the build.\n",
+                            host::Cli::link("TestFlight build", &url),
                         );
-                        HostCli::open_url(&url);
-                        compliance_opened = true;
+                        compliance_shown = true;
                     }
                 }
                 "FAILED" | "INVALID" | "PROCESSING_EXCEPTION" | "EXPIRED" => {
                     flight.record_state(manifest, "failed")?;
-                    HostCli::open_url(&url);
                     return Err(PistonError::Generic(format!(
-                        "Apple reports {state} for version {} (build {}). Check {url}. \
-                         Resolve any reported issue, then rerun cargo piston deploy testflight. \
-                         Piston will choose a new build number without changing package.version.",
-                        flight.version, flight.build_number,
+                        "Apple reports {state} for version {} (build {}).\n\n\
+                         1. Check Apple's build details and resolve any reported issue:\n   {}\n\n\
+                         2. Rerun cargo piston deploy testflight.\n\n\
+                         Piston selects a new build number; package.version stays unchanged.",
+                        flight.version, flight.build_number, host::Cli::link("TestFlight build", &url),
                     )));
                 }
                 "NOT_VISIBLE" | "PROCESSING" | "IN_EXPORT_COMPLIANCE_REVIEW" => {}
                 _ => {
                     return Err(PistonError::Generic(format!(
-                        "Apple returned TestFlight state {state}. Check {url} before retrying.",
+                        "Apple returned TestFlight state {state}.\n\n\
+                         Check the build before retrying:\n{}",
+                        host::Cli::link("TestFlight build", &url),
                     )));
                 }
             }

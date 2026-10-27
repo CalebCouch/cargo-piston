@@ -3,15 +3,14 @@ use std::path::PathBuf;
 use crate::Result;
 use crate::dev::DevelopmentArgs;
 use crate::host::Host;
-use crate::host::platform::apple::cli::XcodeCli;
-use crate::macos::MacDevelopment;
-use crate::host::cli::HostCli;
+use crate::macos;
+use super::apple;
 
-impl HostCli {
-    pub fn develop(args: DevelopmentArgs) -> Result<()> { MacDevelopment::start(args) }
+impl super::Cli {
+    pub fn develop(args: DevelopmentArgs) -> Result<()> { macos::Cli::start(args) }
     pub fn develop_macos(args: DevelopmentArgs) -> Result<()> { Self::develop(args) }
     pub fn prepare_xcode(sdk: &str, minimum: u32) -> Result<PathBuf> {
-        XcodeCli::prepare(sdk, minimum)
+        apple::Cli::prepare(sdk, minimum)
     }
     pub fn run_local(release: bool, cwd: PathBuf, env_vars: HashMap<String, String>) -> Result<()> {
         let developer = Self::prepare_xcode("macosx", 0)?;

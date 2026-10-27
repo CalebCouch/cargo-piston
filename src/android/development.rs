@@ -25,81 +25,49 @@ pub struct AndroidDevelopment {
 }
 
 impl AndroidDevelopment {
-    pub fn start(args: DevelopmentArgs) -> Result<()> {
-        let mut session = AndroidDevelopment::new(&args)?;
-        println!("Preparing Android tools");
-        session.prepare()?;
-        println!("Selecting an Android device or emulator");
-        session.serial = if let Some(serial) = session.select_device(&args)? {
-            serial
-        } else {
-            println!("Opening an Android emulator");
-            session.start_emulator(args.device.as_deref())?
-        };
-        println!("Connecting to {}", session.serial);
-        session.wait_for_boot()?;
-        session.select_target()?;
-        println!(
-            "Building {} for {} ({})",
-            session.project.package.name,
-            session.serial,
-            session.project.args.cargo.target.as_ref().unwrap()
-        );
-        let library = session.compile()?;
-        println!("Packaging Android app with Maverick's activity");
-        let apk = session.package(&library)?;
-        session.install(&apk)?;
-        println!("Launching {}. App output follows; press Ctrl-C to stop.", session.package_id);
-        session.launch()
-    }
-
-    fn new(args: &DevelopmentArgs) -> Result<Self> {
+    pub(crate) fn new(args: &DevelopmentArgs) -> Result<Self> {
         if !args.app_args.is_empty() {
-            return Err(PistonError::Generic(
-                "Android NativeActivity does not accept desktop command-line arguments.".into(),
-            ));
+            return Err(PistonError::AndroidArgumentsUnsupported);
         }
         let project = Project::new(args.application.clone(), "android", true)?;
         let metadata = project.dependencies()?;
         let bridge = metadata.packages.iter().find(|package| package.name.as_str() == "maverick_os")
             .map(|package| package.manifest_path.parent().unwrap().as_std_path().join("android"))
             .filter(|path| path.join("bridge/build.gradle").is_file() && path.join("gradlew").is_file())
-            .ok_or_else(|| PistonError::Generic(
-                "The selected Maverick dependency needs its android/ Gradle bridge. \
-                 Use maverick_os 3.0.3 or later.".into(),
-            ))?;
-        let settings =
-            Manifest::new(project.package.manifest_path.as_std_path())?.settings(&["android"])?;
-        let sdk = match settings.get("sdk") {
-            Some(path) => PathBuf::from(path),
+            .ok_or(PistonError::AndroidBridgeMissing)?;
+        let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
+        let settings = manifest.settings(&["android"])?;
+        let package_id = match project.args.bundle_id.clone().or(settings.get("bundle_id").cloned()) {
+            Some(value) => value,
+            None => match manifest.setting(&["android", "bundle_id"])? {
+                Some(value) => return Err(PistonError::InvalidBundleId { value: value.to_string() }),
+                None => format!("dev.piston.{}", project.package.name.replace('-', "_")),
+            },
+        };
+        Self::validate_bundle_id(&package_id)?;
+        let sdk = match settings.get("sdk").map(PathBuf::from)
+            .filter(|path| Self::sdkmanager_path(path).is_ok())
+        {
+            Some(path) => path,
             None => Host::android_sdk()?,
         };
-        let java = match settings.get("java") {
-            Some(path) => PathBuf::from(path),
+        let java = match settings.get("java").map(PathBuf::from)
+            .filter(|path| path.join("bin/java").is_file() && path.join("bin/javac").is_file())
+        {
+            Some(path) => path,
             None => Host::android_java()?,
         };
-        let ndk =
-            settings.get("ndk").map(PathBuf::from).unwrap_or_else(|| sdk.join("ndk/29.0.14033849"));
-        let package_id =
-            project.args.bundle_id.clone().or(settings.get("bundle_id").cloned()).unwrap_or_else(
-                || format!("dev.piston.{}", project.package.name.replace('-', "_")),
-            );
-        if !package_id.contains('.')
-            || package_id.split('.').any(|part| {
-                part.is_empty()
-                    || !part.chars().next().unwrap().is_ascii_alphabetic()
-                    || !part
-                        .chars()
-                        .all(|character| character.is_ascii_alphanumeric() || character == '_')
-            })
-        {
-            return Err(PistonError::Generic(format!(
-                "Invalid Android application ID: {package_id}"
-            )));
-        }
+        let ndk = settings.get("ndk").map(PathBuf::from)
+            .filter(|path| Self::ndk_toolchain(path).is_some())
+            .unwrap_or_else(|| sdk.join("ndk/29.0.14033849"));
+        manifest.save(&["android"], &[
+            ("sdk", sdk.to_string_lossy().into_owned()),
+            ("java", java.to_string_lossy().into_owned()),
+            ("ndk", ndk.to_string_lossy().into_owned()),
+        ])?;
         let (cancel, interrupted) = std::sync::mpsc::sync_channel(1);
         ctrlc::set_handler(move || { let _ = cancel.try_send(()); })
-        .map_err(|error| PistonError::Generic(format!("Cannot watch Android shutdown: {error}")))?;
+            .map_err(PistonError::AndroidSignalHandler)?;
         Ok(Self {
             project,
             sdk,
@@ -114,24 +82,26 @@ impl AndroidDevelopment {
         })
     }
 
-    fn prepare(&self) -> Result<()> {
+    pub fn validate_bundle_id(value: &str) -> Result<()> {
+        if !value.contains('.') || value.split('.').any(|part| {
+            part.is_empty() || !part.chars().next().unwrap().is_ascii_alphabetic()
+                || !part.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || character == '_'
+                })
+        }) { return Err(PistonError::InvalidBundleId { value: value.into() }); }
+        Ok(())
+    }
+
+    pub fn prepare(&self) -> Result<()> {
         let mut packages = Vec::new();
         for (relative, package) in [
             ("platform-tools/adb", "platform-tools"),
             ("platforms/android-36/android.jar", "platforms;android-36"),
             ("build-tools/36.0.0/apksigner", "build-tools;36.0.0"),
         ] { if !self.sdk.join(relative).is_file() { packages.push(package); } }
-        if !self.ndk.is_dir() {
-            if self.ndk != self.sdk.join("ndk/29.0.14033849") {
-                return Err(PistonError::Generic(format!(
-                    "Configured Android NDK does not exist: {}",
-                    self.ndk.display()
-                )));
-            }
-            packages.push("ndk;29.0.14033849");
-        }
+        if Self::ndk_toolchain(&self.ndk).is_none() { packages.push("ndk;29.0.14033849"); }
         if !packages.is_empty() {
-            Project::run(self.sdkmanager()?.args(packages), "Installing Android SDK components")?;
+            Project::run(self.sdkmanager()?.args(packages))?;
         }
         if !Command::new("cargo")
             .args(["ndk", "--version"])
@@ -140,16 +110,13 @@ impl AndroidDevelopment {
             .status()
             .is_ok_and(|status| status.success())
         {
-            Project::run(
-                Command::new("cargo").args(["install", "cargo-ndk", "--locked"]),
-                "Installing Android Rust tooling",
-            )?;
+            Project::run(Command::new("cargo").args(["install", "cargo-ndk", "--locked"]))?;
         }
         Ok(())
     }
 
-    fn select_device(&self, args: &DevelopmentArgs) -> Result<Option<String>> {
-        let bytes = Project::output(self.adb().args(["devices", "-l"]), "Finding Android devices")?;
+    pub fn select_device(&mut self, args: &DevelopmentArgs) -> Result<bool> {
+        let bytes = Project::output(self.adb().args(["devices", "-l"]))?;
         let listing = String::from_utf8_lossy(&bytes);
         let mut devices = Vec::new();
         for line in listing.lines().skip(1) {
@@ -172,10 +139,9 @@ impl AndroidDevelopment {
                 }
             }
             if fields[1] != "device" {
-                return Err(PistonError::Generic(format!(
-                    "Android device {serial} is {}. Unlock it, enable USB debugging and accept this computer's debugging prompt.",
-                    fields[1]
-                )));
+                return Err(PistonError::AndroidDeviceUnavailable {
+                    serial: serial.into(), state: fields[1].into(),
+                });
             }
             devices.push(serial.to_owned());
         }
@@ -183,18 +149,15 @@ impl AndroidDevelopment {
             devices.retain(|serial| !serial.starts_with("emulator-"));
         }
         if devices.len() > 1 {
-            return Err(PistonError::Generic(format!(
-                "Multiple Android devices: {}. Select one with --device <serial>.",
-                devices.join(", ")
-            )));
+            return Err(PistonError::AndroidDevicesAmbiguous { serials: devices });
         }
-        Ok(devices.pop())
+        if let Some(serial) = devices.pop() { self.serial = serial; return Ok(true); }
+        Ok(false)
     }
 
-    fn select_target(&mut self) -> Result<()> {
+    pub fn select_target(&mut self) -> Result<()> {
         let bytes = Project::output(
             self.device_command().args(["shell", "getprop", "ro.product.cpu.abilist"]),
-            "Reading Android architecture",
         )?;
         let supported = String::from_utf8_lossy(&bytes);
         let supported: Vec<_> = supported.trim().split(',').collect();
@@ -217,18 +180,17 @@ impl AndroidDevelopment {
                         .is_none_or(|requested| requested == *target)
             })
             .ok_or_else(|| {
-                PistonError::UnsupportedTargetError(format!(
-                    "Requested Rust target cannot run on {}. Device ABIs: {}.",
-                    self.serial,
-                    supported.join(", ")
-                ))
+                PistonError::AndroidTargetIncompatible {
+                    serial: self.serial.clone(), target: self.project.args.cargo.target.clone(),
+                    abis: supported.iter().map(|abi| (*abi).into()).collect(),
+                }
             })?;
         self.project.args.cargo.target = Some(selected.0.into());
         self.abi = selected.1.into();
         Project::rust_target(selected.0)
     }
 
-    fn compile(&self) -> Result<PathBuf> {
+    pub fn compile(&self) -> Result<PathBuf> {
         let output = self.project.work.join("native");
         let mut command = Command::new("cargo");
         command.args(["ndk", "-t", &self.abi, "--platform", "30", "-o"]).arg(&output).arg("rustc");
@@ -238,7 +200,7 @@ impl AndroidDevelopment {
             .env("ANDROID_NDK_HOME", &self.ndk)
             .env("JAVA_HOME", &self.java);
         command.args(["--", "-C", "link-arg=-Wl,-z,max-page-size=16384"]);
-        Project::run(&mut command, "Building Android library")?;
+        Project::run(&mut command)?;
         let target = self
             .project
             .package
@@ -248,15 +210,15 @@ impl AndroidDevelopment {
             .unwrap();
         let library = output.join(&self.abi).join(format!("lib{}.so", target.name));
         if !library.is_file() {
-            return Err(PistonError::BuildError(format!(
-                "cargo-ndk produced no library at {}",
-                library.display()
-            )));
+            return Err(PistonError::ArtifactNotProduced {
+                package: self.project.package.name.to_string(),
+                target: self.project.args.cargo.target.clone(),
+            });
         }
         Ok(library)
     }
 
-    fn package(&self, library: &Path) -> Result<PathBuf> {
+    pub fn package(&self, library: &Path) -> Result<PathBuf> {
         let gradle = self.project.work.join("gradle");
         let source = gradle.join("app/src/main");
         let libraries = source.join("jniLibs").join(&self.abi);
@@ -264,17 +226,14 @@ impl AndroidDevelopment {
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
         fs::copy(library, libraries.join(library.file_name().unwrap()))
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
-        let prebuilt = fs::read_dir(self.ndk.join("toolchains/llvm/prebuilt"))
-            .map_err(|error| PistonError::Generic(error.to_string()))?
-            .filter_map(|entry| entry.ok())
-            .find(|entry| entry.path().join("bin/llvm-strip").is_file())
-            .ok_or_else(|| PistonError::Generic("The NDK contains no host toolchain.".into()))?
-            .path();
+        let prebuilt = Self::ndk_toolchain(&self.ndk)
+            .ok_or_else(|| PistonError::AndroidHostToolchainMissing {
+                path: self.ndk.join("toolchains/llvm/prebuilt"),
+            })?;
         Project::run(
             Command::new(prebuilt.join("bin/llvm-strip"))
                 .arg("--strip-debug")
                 .arg(libraries.join(library.file_name().unwrap())),
-            "Stripping packaged Android debug symbols",
         )?;
         let target = self.project.args.cargo.target.as_ref().unwrap();
         let cxx_target =
@@ -376,7 +335,6 @@ dependencies {{ implementation project(':bridge') }}
                 .args(["--no-daemon", "--console=plain", ":app:assembleDebug"])
                 .env("ANDROID_HOME", &self.sdk)
                 .env("JAVA_HOME", &self.java),
-            "Packaging Android app",
         )?;
         let apk = gradle.join("app/build/outputs/apk/debug/app-debug.apk");
         Project::run(
@@ -384,22 +342,17 @@ dependencies {{ implementation project(':bridge') }}
                 .arg("verify")
                 .arg(&apk)
                 .env("JAVA_HOME", &self.java),
-            "Verifying Android app",
         )?;
         Ok(apk)
     }
 
-    fn install(&self, apk: &Path) -> Result<()> {
-        Project::run(
-            self.device_command().args(["install", "-r", "-t"]).arg(apk),
-            "Installing Android app",
-        )
+    pub fn install(&self, apk: &Path) -> Result<()> {
+        Project::run(self.device_command().args(["install", "-r", "-t"]).arg(apk))
     }
 
-    fn launch(&mut self) -> Result<()> {
+    pub fn launch(&mut self) -> Result<()> {
         Project::output(
             self.device_command().args(["shell", "am", "force-stop", &self.package_id]),
-            "Stopping previous Android app",
         )?;
         let output = Project::output(
             self.device_command().args([
@@ -410,7 +363,6 @@ dependencies {{ implementation project(':bridge') }}
                 "-n",
                 &format!("{}/me.ramp.maverick.MaverickActivity", self.package_id),
             ]),
-            "Launching Android app",
         )?;
         if String::from_utf8_lossy(&output).contains("Error:") {
             return Err(PistonError::Generic(String::from_utf8_lossy(&output).into_owned()));
@@ -429,11 +381,8 @@ dependencies {{ implementation project(':bridge') }}
         if pid.is_empty() {
             Project::run(
                 self.device_command().args(["logcat", "-b", "crash", "-d", "-t", "100"]),
-                "Reading Android crash log",
             )?;
-            return Err(PistonError::Generic(
-                "Android app exited before log streaming began.".into(),
-            ));
+            return Err(PistonError::AndroidAppExited);
         }
         let mut logs = self
             .device_command()
@@ -450,7 +399,9 @@ dependencies {{ implementation project(':bridge') }}
                     return if status.success() {
                         Ok(())
                     } else {
-                        Err(PistonError::Generic("Android log connection ended.".into()))
+                        Err(PistonError::CommandStatus {
+                            program: self.sdk.join("platform-tools/adb").into_os_string(), status,
+                        })
                     };
                 }
                 let output = self
@@ -466,42 +417,12 @@ dependencies {{ implementation project(':bridge') }}
         result
     }
 
-    fn adb(&self) -> Command { Command::new(self.sdk.join("platform-tools/adb")) }
-    fn device_command(&self) -> Command {
-        let mut command = self.adb();
-        command.args(["-s", &self.serial]);
-        command
-    }
-
-    fn sdkmanager(&self) -> Result<Command> {
-        let root = self.sdk.join("cmdline-tools");
-        let tool = fs::read_dir(root)
-            .map_err(|error| {
-                PistonError::Generic(format!("Android command-line tools are missing: {error}"))
-            })?
-            .filter_map(|entry| entry.ok())
-            .map(|entry| entry.path().join("bin/sdkmanager"))
-            .find(|path| path.is_file())
-            .ok_or_else(|| {
-                PistonError::Generic(
-                    "Install Android SDK Command-line Tools in Android Studio's SDK Manager."
-                        .into(),
-                )
-            })?;
-        let mut command = Command::new(tool);
-        command.env("JAVA_HOME", &self.java).arg(format!("--sdk_root={}", self.sdk.display()));
-        Ok(command)
-    }
-
-    fn start_emulator(&mut self, selector: Option<&str>) -> Result<String> {
+    pub fn start_emulator(&mut self, selector: Option<&str>) -> Result<()> {
         let emulator = self.sdk.join("emulator/emulator");
         if !emulator.is_file() {
-            Project::run(self.sdkmanager()?.arg("emulator"), "Installing Android Emulator")?;
+            Project::run(self.sdkmanager()?.arg("emulator"))?;
         }
-        let output = Project::output(
-            Command::new(&emulator).arg("-list-avds"),
-            "Listing Android emulators",
-        )?;
+        let output = Project::output(Command::new(&emulator).arg("-list-avds"))?;
         let names: Vec<_> = String::from_utf8_lossy(&output)
             .lines()
             .map(str::to_owned)
@@ -510,10 +431,9 @@ dependencies {{ implementation project(':bridge') }}
         let name = match selector {
             Some(name) if names.iter().any(|value| value == name) => name.to_owned(),
             Some(name) => {
-                return Err(PistonError::Generic(format!(
-                    "No Android device or AVD matches {name}. Available AVDs: {}",
-                    names.join(", ")
-                )));
+                return Err(PistonError::AndroidEmulatorNotFound {
+                    selector: name.into(), available: names,
+                });
             }
             None if !names.is_empty() => names[0].clone(),
             None => {
@@ -523,13 +443,10 @@ dependencies {{ implementation project(':bridge') }}
                     "x86_64"
                 };
                 let package = format!("system-images;android-36;google_apis;{abi}");
-                Project::run(
-                    self.sdkmanager()?.arg(&package),
-                    "Installing Android emulator image",
-                )?;
+                Project::run(self.sdkmanager()?.arg(&package))?;
                 let sdkmanager = self.sdkmanager()?;
                 let avdmanager = Path::new(sdkmanager.get_program()).with_file_name("avdmanager");
-                let mut child = Command::new(avdmanager)
+                let mut child = Command::new(&avdmanager)
                     .args(["create", "avd", "--name", "piston", "--package", &package])
                     .env("JAVA_HOME", &self.java)
                     .env("ANDROID_HOME", &self.sdk)
@@ -542,8 +459,12 @@ dependencies {{ implementation project(':bridge') }}
                     .unwrap()
                     .write_all(b"no\n")
                     .map_err(|error| PistonError::Generic(error.to_string()))?;
-                if !child.wait().map_err(|error| PistonError::Generic(error.to_string()))?.success()
-                { return Err(PistonError::Generic("Cannot create the Android emulator.".into())); }
+                let status = child.wait().map_err(|error| PistonError::Generic(error.to_string()))?;
+                if !status.success() {
+                    return Err(PistonError::CommandStatus {
+                        program: avdmanager.into_os_string(), status,
+                    });
+                }
                 "piston".into()
             }
         };
@@ -553,9 +474,7 @@ dependencies {{ implementation project(':bridge') }}
                 std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok()
                     && std::net::TcpListener::bind(("127.0.0.1", *port + 1)).is_ok()
             })
-            .ok_or_else(|| {
-                PistonError::Generic("No free Android emulator console ports.".into())
-            })?;
+            .ok_or(PistonError::AndroidEmulatorPortsUnavailable)?;
         let log = fs::File::create(self.project.work.join("emulator.log"))
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
         self.emulator = Some(
@@ -566,14 +485,15 @@ dependencies {{ implementation project(':bridge') }}
                 .spawn()
                 .map_err(|error| PistonError::Generic(error.to_string()))?,
         );
-        Ok(format!("emulator-{port}"))
+        self.serial = format!("emulator-{port}");
+        Ok(())
     }
 
-    fn wait_for_boot(&mut self) -> Result<()> {
+    pub fn wait_for_boot(&mut self) -> Result<()> {
         let start = Instant::now();
         while start.elapsed() < Duration::from_secs(180) {
             if self.interrupted.try_recv().is_ok() {
-                return Err(PistonError::Generic("Android development interrupted.".into()));
+                return Err(PistonError::AndroidInterrupted);
             }
             if let Some(child) = &mut self.emulator {
                 if child
@@ -581,10 +501,9 @@ dependencies {{ implementation project(':bridge') }}
                     .map_err(|error| PistonError::Generic(error.to_string()))?
                     .is_some()
                 {
-                    return Err(PistonError::Generic(format!(
-                        "Android emulator closed before booting. See {}",
-                        self.project.work.join("emulator.log").display()
-                    )));
+                    return Err(PistonError::AndroidEmulatorClosed {
+                        log: self.project.work.join("emulator.log"),
+                    });
                 }
             }
             let output = self
@@ -597,21 +516,55 @@ dependencies {{ implementation project(':bridge') }}
             }
             std::thread::sleep(Duration::from_secs(1));
         }
-        Err(PistonError::Generic("Android did not finish booting within three minutes.".into()))
+        Err(PistonError::AndroidBootTimeout)
+    }
+    pub fn project(&self) -> &Project { &self.project }
+    pub fn serial(&self) -> &str { &self.serial }
+    pub fn package_id(&self) -> &str { &self.package_id }
+
+    pub fn stop(&mut self) -> Result<()> {
+        if let Some(emulator) = &mut self.emulator {
+            if emulator.try_wait().map_err(PistonError::AndroidEmulatorControl)?.is_none() {
+                emulator.kill().map_err(PistonError::AndroidEmulatorControl)?;
+            }
+            emulator.wait().map_err(PistonError::AndroidEmulatorControl)?;
+            self.emulator = None;
+        }
+        Ok(())
+    }
+}
+
+impl AndroidDevelopment {
+    fn adb(&self) -> Command { Command::new(self.sdk.join("platform-tools/adb")) }
+    fn device_command(&self) -> Command {
+        let mut command = self.adb();
+        command.args(["-s", &self.serial]);
+        command
+    }
+
+    fn sdkmanager(&self) -> Result<Command> {
+        let mut command = Command::new(Self::sdkmanager_path(&self.sdk)?);
+        command.env("JAVA_HOME", &self.java).arg(format!("--sdk_root={}", self.sdk.display()));
+        Ok(command)
+    }
+
+    fn sdkmanager_path(sdk: &Path) -> Result<PathBuf> {
+        let root = sdk.join("cmdline-tools");
+        fs::read_dir(&root)
+            .map_err(|source| PistonError::ReadDirError { path: root.clone(), source })?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path().join("bin/sdkmanager"))
+            .find(|path| path.is_file())
+            .ok_or(PistonError::AndroidSdkManagerMissing { path: root })
+    }
+
+    fn ndk_toolchain(ndk: &Path) -> Option<PathBuf> {
+        fs::read_dir(ndk.join("toolchains/llvm/prebuilt")).ok()?
+            .filter_map(|entry| entry.ok()).map(|entry| entry.path())
+            .find(|path| path.join("bin/clang").is_file() && path.join("bin/llvm-strip").is_file())
     }
 }
 
 impl Drop for AndroidDevelopment {
-    fn drop(&mut self) {
-        if let Some(emulator) = &mut self.emulator {
-            if emulator.try_wait().ok().flatten().is_none() {
-                if let Err(error) = emulator.kill() {
-                    eprintln!("Cannot stop Android emulator: {error}");
-                }
-            }
-            if let Err(error) = emulator.wait() {
-                eprintln!("Cannot wait for Android emulator: {error}");
-            }
-        }
-    }
+    fn drop(&mut self) { let _ = self.stop(); }
 }

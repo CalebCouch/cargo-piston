@@ -27,7 +27,6 @@ impl Simulator {
                 Command::new("xcodebuild")
                     .env("DEVELOPER_DIR", developer)
                     .args(["-downloadPlatform", "iOS"]),
-                "Installing the iOS Simulator runtime",
             )?;
             listing = Self::list(developer)?;
         }
@@ -62,13 +61,11 @@ impl Simulator {
         });
         if let Some((_, device)) = devices.pop() { return Ok(device); }
         if let Some(selector) = selector {
-            return Err(PistonError::Generic(format!(
-                "No connected iPhone or available Simulator matches {selector}. Use --simulator without --device to create one."
-            )));
+            return Err(PistonError::IosSimulatorNotFound { selector: selector.into() });
         }
         let runtimes = listing["runtimes"]
             .as_array()
-            .ok_or_else(|| PistonError::Generic("Simulator returned no runtimes.".into()))?;
+            .ok_or(PistonError::IosSimulatorRuntimesMissing)?;
         let runtime = runtimes
             .iter()
             .filter(|runtime| {
@@ -84,12 +81,7 @@ impl Simulator {
                     .collect::<Vec<_>>()
             })
             .and_then(|runtime| runtime["identifier"].as_str())
-            .ok_or_else(|| {
-                PistonError::Generic(
-                    "Xcode installed no usable iOS runtime. Open Xcode Settings > Components."
-                        .into(),
-                )
-            })?;
+            .ok_or(PistonError::IosSimulatorRuntimeUnavailable)?;
         let device_type = listing["devicetypes"]
             .as_array()
             .into_iter()
@@ -97,7 +89,7 @@ impl Simulator {
             .rev()
             .find(|value| value["productFamily"] == "iPhone")
             .and_then(|value| value["identifier"].as_str())
-            .ok_or_else(|| PistonError::Generic("Xcode returned no iPhone device types.".into()))?;
+            .ok_or(PistonError::IosSimulatorDeviceTypeMissing)?;
         let output = Project::output(
             IOSApplication::command(developer, "simctl").args([
                 "create",
@@ -105,7 +97,6 @@ impl Simulator {
                 device_type,
                 runtime,
             ]),
-            "Creating iOS Simulator",
         )?;
         Ok(Self {
             id: String::from_utf8_lossy(&output).trim().into(),
@@ -118,7 +109,6 @@ impl Simulator {
         if !self.booted {
             Project::output(
                 IOSApplication::command(developer, "simctl").args(["boot", &self.id]),
-                "Booting iOS Simulator",
             )?;
         }
         let app = developer.join("Applications/Simulator.app");
@@ -128,11 +118,9 @@ impl Simulator {
                 "-CurrentDeviceUDID",
                 &self.id,
             ]),
-            "Opening Simulator",
         )?;
         Project::run(
             IOSApplication::command(developer, "simctl").args(["bootstatus", &self.id, "-b"]),
-            "Waiting for Simulator",
         )
     }
 
@@ -141,11 +129,9 @@ impl Simulator {
             Command::new("codesign")
                 .args(["--force", "--sign", "-", "--timestamp=none"])
                 .arg(bundle),
-            "Signing simulator app",
         )?;
         Project::output(
             IOSApplication::command(developer, "simctl").args(["install", &self.id]).arg(bundle),
-            "Installing simulator app",
         )?;
         Ok(())
     }
@@ -161,14 +147,12 @@ impl Simulator {
                     identifier,
                 ])
                 .args(arguments),
-            "Running simulator app",
         )
     }
 
     fn list(developer: &Path) -> Result<Value> {
         let output = Project::output(
             IOSApplication::command(developer, "simctl").args(["list", "--json"]),
-            "Listing iOS Simulators",
         )?;
         serde_json::from_slice(&output)
             .map_err(|error| PistonError::IntoJSONError(error.to_string()))

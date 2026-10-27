@@ -9,6 +9,7 @@ use crate::project::Project;
 use crate::error::PistonError;
 
 pub mod cli;
+pub use cli::Cli;
 
 pub struct WindowsBuilder {
     release: bool,
@@ -138,12 +139,9 @@ impl WindowsBuilder {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
-            .map_err(|e| PistonError::BuildError(format!("Cargo build failed: {}", e)))?;
+            .map_err(|e| PistonError::CommandSpawn { program: "bash".into(), source: e })?;
         if !builder.status.success() {
-            return Err(PistonError::BuildError(format!(
-                "Cargo build failed: {}",
-                String::from_utf8_lossy(&builder.stderr)
-            )));
+            return Err(PistonError::CommandFailed { program: "bash".into(), output: builder });
         }
 
         Ok(())

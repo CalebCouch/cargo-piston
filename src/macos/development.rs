@@ -2,10 +2,6 @@ use plist::{Dictionary, Value};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use crate::apple::xcode::cli::SigningCli;
-use crate::apple::NotificationCli;
-use crate::dev::DevelopmentArgs;
-use crate::host::cli::HostCli;
 use crate::apple::{NotificationSetup, PushBuild, PushPlatform, PushSigning, XcodeSigning};
 use crate::manifest::Manifest;
 use crate::project::Project;
@@ -20,80 +16,61 @@ pub struct MacDevelopment {
 }
 
 impl MacDevelopment {
-    pub fn start(args: DevelopmentArgs) -> Result<()> {
-        let project = Project::new(args.application, "macos", false)?;
-        let developer = HostCli::prepare_xcode("macosx", 0)?;
-        let mut session = MacDevelopment::new(project, args.app_args, developer)?;
-        let manifest = Manifest::new(session.project.package.manifest_path.as_std_path())?;
-        if NotificationCli::enabled(&manifest)? {
-            let team = manifest.setting(&["macos", "team"])?;
-            let signing = SigningCli::development(
-                session
-                    .project
-                    .args
-                    .team
-                    .as_deref()
-                    .or(team.as_ref().and_then(toml_edit::Item::as_str)),
-                &session.developer,
-            )?;
-            let setup = session.notification_setup(signing.team())?;
-            let application = NotificationCli::configure(&setup)?;
-            session.notifications = Some(PushBuild { application, signing: setup.signing });
-        }
-        println!(
-            "Building {} for macOS ({})",
-            session.project.package.name,
-            session.project.args.cargo.target.as_ref().unwrap()
-        );
-        let executable =
-            session.project.compile(session.build_command(), |message| eprint!("{message}"))?;
-        let bundle = session.bundle(&executable)?;
-        println!(
-            "Opening {}. App output follows; press Ctrl-C to stop.",
-            session.project.package.name
-        );
-        session.launch(&bundle)
-    }
-
-    fn new(mut project: Project, app_args: Vec<String>, developer: PathBuf) -> Result<Self> {
+    pub(crate) fn new(mut project: Project, app_args: Vec<String>, developer: PathBuf) -> Result<Self> {
         let target = project.args.cargo.target.clone().unwrap_or(Project::host_target()?);
         if !matches!(target.as_str(), "aarch64-apple-darwin" | "x86_64-apple-darwin") {
-            return Err(PistonError::UnsupportedTargetError(format!(
-                "{target} is not a macOS target."
-            )));
+            return Err(PistonError::UnsupportedTargetError(target));
         }
         project.args.cargo.target = Some(target.clone());
         Project::rust_target(&target)?;
-        let settings = project.package.metadata.pointer("/piston/macos");
+        let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
+        let settings = manifest.settings(&["macos"])?;
         let bundle_id = project
             .args
             .bundle_id
             .clone()
-            .or_else(|| {
-                settings
-                    .and_then(|value| value.get("bundle_id"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .or_else(|| {
-                project
-                    .package
-                    .metadata
-                    .pointer("/piston/ios/bundle_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::to_owned)
-            })
+            .or_else(|| settings.get("bundle_id").cloned())
+            .or(manifest.setting(&["ios", "bundle_id"])?
+                .as_ref().and_then(toml_edit::Item::as_str).map(str::to_owned))
             .unwrap_or_else(|| format!("dev.piston.{}", project.package.name.replace('_', "-")));
         if !bundle_id.contains('.')
             || bundle_id.split('.').any(str::is_empty)
             || !bundle_id
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || ".-".contains(character))
-        { return Err(PistonError::Generic(format!("Invalid bundle identifier: {bundle_id}"))); }
+        { return Err(PistonError::InvalidBundleId { value: bundle_id }); }
         Ok(Self { project, developer, bundle_id, notifications: None, app_args })
     }
 
-    fn notification_setup(&self, team: &str) -> Result<NotificationSetup> {
+    pub fn project(&self) -> &Project { &self.project }
+    pub fn developer(&self) -> &Path { &self.developer }
+    pub fn notifications(&mut self, push: PushBuild) { self.notifications = Some(push); }
+
+    pub fn valid_setting(name: &str, value: &toml_edit::Item, root: &Path) -> bool {
+        if name == "resources" {
+            return value.as_array().is_some_and(|paths| paths.iter().all(|value| {
+                value.as_str().is_some_and(|path| {
+                    !path.is_empty() && root.join(path).exists()
+                        && root.join(path).file_name().is_some()
+                })
+            }));
+        }
+        let Some(value) = value.as_str() else { return false; };
+        match name {
+            "team" => value.len() == 10 && value.bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "bundle_id" => value.contains('.') && !value.split('.').any(str::is_empty)
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-".contains(character)
+                }),
+            "info_plist" | "entitlements" => !value.is_empty()
+                && Value::from_file(root.join(value))
+                    .is_ok_and(|value| value.as_dictionary().is_some()),
+            _ => unreachable!(),
+        }
+    }
+
+    pub fn notification_setup(&self, team: &str) -> Result<NotificationSetup> {
         let manifest = Manifest::new(self.project.package.manifest_path.as_std_path())?;
         manifest.save(&["macos"], &[("team", team)])?;
         NotificationSetup::new(
@@ -107,14 +84,14 @@ impl MacDevelopment {
         )
     }
 
-    fn build_command(&self) -> Command {
+    pub fn build_command(&self) -> Command {
         let mut command = self.project.build_command();
         command.env("DEVELOPER_DIR", &self.developer);
         if let Some(push) = &self.notifications { push.compile(&mut command); }
         command
     }
 
-    fn bundle(&self, executable: &Path) -> Result<PathBuf> {
+    pub fn bundle(&self, executable: &Path) -> Result<PathBuf> {
         let project = &self.project;
         let name = project.package.name.as_str();
         let bundle = project.work.join(format!("{name}.app"));
@@ -128,22 +105,20 @@ impl MacDevelopment {
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
         fs::copy(executable, &binary)
             .map_err(|error| PistonError::WriteFileError(error.to_string()))?;
-        let config = project.package.metadata.pointer("/piston/macos");
-        let source = project.args.info_plist.clone().or_else(|| {
-            config
-                .and_then(|value| value.get("info_plist"))
-                .and_then(serde_json::Value::as_str)
-                .map(PathBuf::from)
-        });
-        let mut info = if let Some(source) = source {
-            Value::from_file(project.root().join(source))
+        let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
+        let config = manifest.settings(&["macos"])?;
+        let source = project.args.info_plist.clone()
+            .or_else(|| config.get("info_plist").map(PathBuf::from));
+        let source = source.map(|path| project.root().join(path));
+        let mut info = if let Some(source) = &source {
+            Value::from_file(source)
                 .map_err(|error| PistonError::Generic(error.to_string()))?
         } else {
             Value::Dictionary(Dictionary::new())
         };
         let dict = info
             .as_dictionary_mut()
-            .ok_or_else(|| PistonError::Generic("Info.plist must be a dictionary.".into()))?;
+            .ok_or_else(|| PistonError::PlistNotDictionary { path: source.unwrap() })?;
         for (key, value) in [
             ("CFBundleIdentifier", self.bundle_id.clone()),
             ("CFBundleExecutable", name.into()),
@@ -200,24 +175,20 @@ impl MacDevelopment {
                     .arg(&iconset)
                     .arg("-o")
                     .arg(resource.join("AppIcon.icns")),
-                "Creating macOS icon",
             )?;
             dict.insert("CFBundleIconFile".into(), Value::String("AppIcon.icns".into()));
         }
-        if let Some(resources) =
-            config.and_then(|value| value.get("resources")).and_then(serde_json::Value::as_array)
+        if let Some(resources) = manifest.setting(&["macos", "resources"])?
+            .as_ref().and_then(toml_edit::Item::as_array)
         {
             for resource in resources {
-                let resource = resource.as_str().ok_or_else(|| {
-                    PistonError::Generic("macos.resources must contain paths.".into())
-                })?;
+                let resource = resource.as_str().ok_or(PistonError::MacResourcesInvalid)?;
                 let path = project.root().join(resource);
                 let name = path
                     .file_name()
-                    .ok_or_else(|| PistonError::Generic("Invalid resource path.".into()))?;
+                    .ok_or_else(|| PistonError::MacResourceInvalid { path: path.clone() })?;
                 Project::output(
                     Command::new("ditto").arg(&path).arg(contents.join("Resources").join(name)),
-                    "Copying macOS resource",
                 )?;
             }
         }
@@ -227,12 +198,7 @@ impl MacDevelopment {
             .args
             .entitlements
             .clone()
-            .or_else(|| {
-                config
-                    .and_then(|value| value.get("entitlements"))
-                    .and_then(serde_json::Value::as_str)
-                    .map(PathBuf::from)
-            })
+            .or_else(|| config.get("entitlements").map(PathBuf::from))
             .map(|path| project.root().join(path));
         if let Some(push) = &self.notifications {
             let entitlements = push.signing.entitlements(
@@ -254,12 +220,12 @@ impl MacDevelopment {
             if let Some(entitlements) = entitlements {
                 sign.arg("--entitlements").arg(entitlements);
             }
-            Project::output(sign.arg(&bundle), "Signing the local macOS app")?;
+            Project::output(sign.arg(&bundle))?;
             Ok(bundle)
         }
     }
 
-    fn launch(&self, bundle: &Path) -> Result<()> {
+    pub fn launch(&self, bundle: &Path) -> Result<()> {
         self.project.launch(
             &bundle.join("Contents/MacOS").join(self.project.package.name.as_str()),
             &self.app_args,

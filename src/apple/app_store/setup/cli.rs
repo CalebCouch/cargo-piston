@@ -1,49 +1,94 @@
+use std::collections::HashMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::Path;
-use crate::host::cli::HostCli;
+use crate::{developer, host};
+use crate::manifest::Manifest;
 use crate::{PistonError, Result};
 use super::{AccountSetup, AscApiKey};
 
-pub struct AccountCli;
+pub struct Cli;
 
-impl AccountCli {
-    pub fn from_project(root: &Path, reconfigure: bool) -> Result<AscApiKey> {
-        let AccountSetup { root, manifest, mut settings, explicit } =
-            AccountSetup::new(root, reconfigure)?;
+impl Cli {
+    pub fn from_project(root: &Path, requested_team: Option<&str>, reconfigure: bool) -> Result<(AscApiKey, String)> {
+        let manifest = Manifest::new(&root.join("Cargo.toml"))?;
+        let (store, team) = developer::Cli::credentials(&manifest, requested_team, false)?;
+        let mut setup = AccountSetup::new(root, team, store)?;
         let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
         if reconfigure && !interactive {
             return Err(PistonError::Generic(
-                "--setup requires an interactive terminal. For CI, set ASC_ISSUER_ID and either \
-                 ASC_KEY_ID or ASC_KEY_PATH in the environment."
-                    .into(),
+                "--setup needs an interactive terminal.\n\n\
+                 Rerun this deployment command in a terminal to replace the team's API key.".into(),
             ));
         }
-        if !reconfigure {
-            match AscApiKey::configured(&root, &settings, &mut |message| eprintln!("{message}")) {
-                Ok(key) => match key.authorize() {
-                    Ok(key) => return Ok(key),
-                    Err(PistonError::ASCAuthenticationError(error)) if interactive => {
-                        eprintln!("{error}")
-                    }
-                    Err(error) => return Err(error),
-                },
-                Err(error) if !interactive => {
-                    return Err(PistonError::Generic(format!(
-                        "{error}\nRun this deploy command in a terminal for guided account setup, or set \
-                     ASC_ISSUER_ID and either ASC_KEY_ID or ASC_KEY_PATH for CI.\n{}",
-                        Self::setup_help(),
-                    )));
+        eprintln!("Loading App Store Connect credentials from AIR for team {}", setup.team);
+        let saved = match setup.load(reconfigure) {
+            Ok(saved) => saved,
+            Err(error @ PistonError::StoreCredentialsInvalid(_)) if interactive => {
+                eprintln!("{error}");
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let mut settings = HashMap::new();
+        if let Some(key) = saved {
+            settings.insert("asc_issuer_id".into(), key.issuer_id().into());
+            settings.insert("asc_key_id".into(), key.key_id().into());
+            match key.authorize() {
+                Ok(key) => {
+                    setup.remember()?;
+                    return Ok((key, setup.team));
                 }
-                Err(error) if !settings.is_empty() => eprintln!("{error}"),
-                Err(_) => {}
+                Err(PistonError::ASCAuthenticationError(error)) if interactive => {
+                    eprintln!("{error}");
+                }
+                Err(error @ PistonError::StoreKeyInvalid { .. }) if interactive => {
+                    eprintln!("{error}");
+                }
+                Err(error) => return Err(error),
             }
         }
-        eprintln!("App Store Connect setup for {}\n{}", root.display(), Self::setup_help());
-        eprintln!("Enter q at any prompt to cancel. Private key contents are never requested.");
-        HostCli::open_url("https://appstoreconnect.apple.com/access/integrations/api");
+        settings.extend(std::mem::take(&mut setup.settings));
+        if !reconfigure && !settings.is_empty() {
+            match AscApiKey::configured(&setup.root, &settings, &mut |error| eprintln!("{error}"))
+                .and_then(AscApiKey::authorize)
+            {
+                Ok(key) => {
+                    setup.save(&key)?;
+                    eprintln!("App Store Connect credentials saved in AIR for team {}.", setup.team);
+                    return Ok((key, setup.team));
+                }
+                Err(error) if interactive => eprintln!("{error}"),
+                Err(error) => return Err(error),
+            }
+        }
+        if !interactive {
+            return Err(PistonError::Generic(
+                "App Store Connect credentials have not been set up.\n\n\
+                 Rerun this command in a terminal to import a Team API key.\n\
+                 For unattended setup, set ASC_ISSUER_ID and ASC_KEY_ID or ASC_KEY_PATH.".into(),
+            ));
+        }
+        eprintln!(
+            "\nApp Store Connect setup\n  Project: {}\n  Apple team: {}\n",
+            setup.root.display(), setup.team,
+        );
+        eprintln!("{}", host::Cli::link(
+            "Team API keys", "https://appstoreconnect.apple.com/access/integrations/api",
+        ));
+        eprintln!(
+            "\n1. Under Team Keys, create a key with Admin access.\n\
+             2. Copy the Issuer ID (the account) and Key ID (the key).\n\
+             3. Click Download API Key beside the key to save its .p8 file.\n\n\
+             Apple allows one download. If the button is missing, use your existing file.\n\
+             If the file is lost, create a new key. The Issuer ID is not stored in the file.\n\n\
+             Apple Developer Program membership and API access are required.\n\
+             If API access is disabled, ask the Account Holder to enable it.\n\n\
+             Keep the file outside your repository. Credentials are saved encrypted in AIR.\n\
+             Enter accepts a [default]; q cancels. Enter a file path, never private key contents."
+        );
         loop {
             let issuer = Self::prompt(
-                "Issuer ID (from Apple's Team Keys page)",
+                "Issuer ID",
                 settings.get("asc_issuer_id").map(String::as_str).unwrap_or(""),
             )?;
             settings.insert("asc_issuer_id".into(), issuer);
@@ -57,14 +102,12 @@ impl AccountCli {
                 if settings.get("asc_key_id") != Some(&input) { settings.remove("asc_key_path"); }
                 settings.insert("asc_key_id".into(), input);
             } else {
-                let path = AscApiKey::key_path(&root, &input)?;
+                let path = AscApiKey::key_path(&setup.root, &input)?;
                 let key_id = if let Some(key_id) = AscApiKey::id_from_path(&path) {
                     eprintln!("Using Key ID {key_id} from the filename.");
                     key_id.into()
                 } else {
-                    eprintln!(
-                        "This filename does not identify the key. Copy its Key ID from Team Keys."
-                    );
+                    eprintln!("The filename has no Key ID. Copy it from the Team Keys page.");
                     Self::prompt("Team API Key ID", "")?
                 };
                 settings.insert("asc_key_id".into(), key_id);
@@ -76,28 +119,25 @@ impl AccountCli {
                 continue;
             }
             if settings.get("asc_key_path").is_none_or(|path| path.is_empty()) {
-                let paths = AscApiKey::find_key_paths(&root, key_id, &mut |message| {
-                    eprintln!("{message}")
+                let paths = AscApiKey::find_key_paths(&setup.root, key_id, &mut |error| {
+                    eprintln!("{error}")
                 })?;
                 let path = match paths.as_slice() {
                     [] => {
                         eprintln!(
-                            "No AuthKey_{key_id}.p8 file was found using system search or the standard \
-                            key folders. In Apple's Team Keys list, click Download API Key beside \
-                            Key ID {key_id}, then enter the downloaded file's path. \
-                            You can keep this prompt open while downloading."
+                            "\nAuthKey_{key_id}.p8 was not found.\n\
+                             Download the file beside Key ID {key_id}, or locate your existing copy.\n\
+                             This prompt can stay open while you find it."
                         );
                         let input = Self::prompt(
                             "Path to the downloaded .p8 file",
                             &format!("~/Downloads/AuthKey_{key_id}.p8"),
                         )?;
-                        AscApiKey::key_path(&root, &input)?
+                        AscApiKey::key_path(&setup.root, &input)?
                     }
                     [path] => { eprintln!("Found API key: {}", path.display()); path.clone() }
                     _ => {
-                        eprintln!(
-                            "Several files match Key ID {key_id}. Choose the file for this app:"
-                        );
+                        eprintln!("\nSeveral files match Key ID {key_id}. Choose the file to use:");
                         for (index, path) in paths.iter().enumerate() {
                             eprintln!("  {}. {}", index + 1, path.display());
                         }
@@ -116,41 +156,32 @@ impl AccountCli {
                 settings.insert("asc_key_path".into(), path.to_string_lossy().into_owned());
             }
             loop {
-                eprintln!("Checking App Store Connect API access...");
-                match AscApiKey::configured(&root, &settings, &mut |message| eprintln!("{message}"))
+                eprintln!("\nChecking App Store Connect API access...");
+                match AscApiKey::configured(&setup.root, &settings, &mut |error| eprintln!("{error}"))
                     .and_then(AscApiKey::authorize)
                 {
                     Ok(key) => {
-                        manifest.save(
-                            &["app_store_connect"],
-                            &[
-                                ("issuer_id", key.issuer_id()),
-                                ("key_id", key.key_id()),
-                                ("key_path", &key.path().to_string_lossy()),
-                            ],
-                        )?;
-                        eprintln!("Account setup saved in {}.", manifest.path().display());
-                        if explicit {
-                            eprintln!(
-                                "Shell and .env values still override Cargo.toml. Update them \
-                                if you replaced credentials supplied there."
-                            );
-                        }
-                        return Ok(key);
+                        setup.save(&key)?;
+                        eprintln!(
+                            "\nApp Store Connect is ready.\n\
+                             Credentials saved in AIR for team {}.\n\
+                             Team selection saved in {}.",
+                            setup.team, setup.manifest.path().display(),
+                        );
+                        return Ok((key, setup.team));
                     }
-                    Err(error) => eprintln!("{error}\nAccount setup has not been saved."),
+                    Err(error) => eprintln!("\n{error}\n\nAccount setup has not been saved."),
                 }
-                let action =
-                    Self::prompt("Enter to edit credentials, r to retry the check", "edit")?;
+                let action = Self::prompt("Retry the check (r), or edit credentials", "edit")?;
                 if !action.eq_ignore_ascii_case("r") { break; }
             }
         }
     }
     fn prompt(label: &str, default: &str) -> Result<String> {
         loop {
-            eprint!("{label}");
+            eprint!("\n{label}");
             if !default.is_empty() { eprint!(" [{default}]"); }
-            eprint!(": ");
+            eprint!(" (q to cancel): ");
             io::stderr().flush().map_err(|error| PistonError::Generic(error.to_string()))?;
             let mut input = String::new();
             let count = io::stdin().read_line(&mut input).map_err(|error| {
@@ -164,21 +195,5 @@ impl AccountCli {
             if !default.is_empty() { return Ok(default.into()); }
             eprintln!("A value is required.");
         }
-    }
-    fn setup_help() -> &'static str {
-        "Piston needs an App Store Connect Team API key for automatic signing and uploads.\n\
-         Open https://appstoreconnect.apple.com/access/integrations/api . Under Team Keys, \
-         generate a key with Admin access. Enter the Issuer ID first, then either \
-         the Key ID or the downloaded .p8 file's path. Piston uses system search and checks \
-         standard key folders and Downloads by Key ID, or infers the Key ID from an AuthKey_<KEY_ID>.p8 filename. \
-         The Issuer ID is not in the private key; enter it once and Piston remembers it for this project.\n\
-         Click Download API Key beside that key to get the AuthKey_<KEY_ID>.p8 file. \
-         Check your browser's downloads for its location. Apple only permits one download: \
-         if the link is missing, locate the file you already downloaded. If it is lost, \
-         create a new Team Key and restart setup with the new Key ID and file.\n\
-         If API access is disabled, the Account Holder must enable it. Store distribution \
-         requires Apple Developer Program membership. Xcode's saved login alone is not API access.\n\
-         Keep the .p8 file outside your repository. Piston saves only its location and IDs \
-         in Cargo.toml under package.metadata.piston.app_store_connect. It does not copy the private key."
     }
 }

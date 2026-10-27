@@ -1,15 +1,16 @@
 mod android;
 mod apple;
 mod dev;
+mod developer;
 mod devices;
 mod error;
-mod project;
 use error::PistonError;
 mod host;
 mod ios;
 mod linux;
 mod macos;
 mod manifest;
+mod project;
 mod windows;
 
 mod cli;
