@@ -4,50 +4,50 @@ use super::{AppStoreRelease, ScreenshotFamily, StoreScreenshot};
 
 #[derive(Debug)]
 pub enum Error {
-    StoreCatalogEmpty,
-    StoreScreenshotsMissing,
-    StoreScreenshotGroupCount { group: String, count: usize, maximum: usize },
-    StoreScreenshotFileSize { path: PathBuf, size: u64, maximum: u64 },
-    StoreScreenshotSync {
+    CatalogEmpty,
+    ScreenshotsMissing,
+    ScreenshotGroupCount { group: String, count: usize, maximum: usize },
+    ScreenshotFileSize { path: PathBuf, size: u64, maximum: u64 },
+    ScreenshotSync {
         source: Box<dyn std::error::Error>,
         recovery: Vec<(String, Box<dyn std::error::Error>)>,
     },
-    StoreScreenshotGroupMismatch { images: Vec<(PathBuf, u32, u32)> },
-    StoreVersionNotEditable { version: String, state: String },
-    StoreUploadUrlsRejected,
-    StoreUploadOperationsMissing { image_id: String },
-    StoreUploadRangeInvalid,
-    StoreUploadRangeTooLarge,
-    StoreUploadRangeDiscontinuous,
-    StoreUploadRangeIncomplete,
-    StoreUploadInsecureUrl,
-    StoreUploadAuthorization,
-    StoreScreenshotUpload { image_id: String, status: Option<u16> },
-    StoreImageProcessingTimeout { image_id: String },
-    StoreImageSpecificationMismatch { image_id: String, group: String, spec: String },
-    StoreImageRejected { image_id: String, state: String, details: serde_json::Value },
-    StoreScreenshotOrder { group: String },
-    StoreCatalogFeatureMissing,
-    StoreCatalogPolicyMissing,
-    StoreCatalogSpecificationsMissing,
-    StoreCatalogCategoryRejected,
-    StoreCatalogDimensionsInvalid,
-    StoreCatalogSpecificationsUnavailable,
+    ScreenshotGroupMismatch { images: Vec<(PathBuf, u32, u32)> },
+    VersionNotEditable { version: String, state: String },
+    UploadUrlsRejected,
+    UploadOperationsMissing { image_id: String },
+    UploadRangeInvalid,
+    UploadRangeTooLarge,
+    UploadRangeDiscontinuous,
+    UploadRangeIncomplete,
+    UploadInsecureUrl,
+    UploadAuthorization,
+    ScreenshotUpload { image_id: String, status: Option<u16> },
+    ImageProcessingTimeout { image_id: String },
+    ImageSpecificationMismatch { image_id: String, group: String, spec: String },
+    ImageRejected { image_id: String, state: String, details: serde_json::Value },
+    ScreenshotOrder { group: String },
+    CatalogFeatureMissing,
+    CatalogPolicyMissing,
+    CatalogSpecificationsMissing,
+    CatalogCategoryRejected,
+    CatalogDimensionsInvalid,
+    CatalogSpecificationsUnavailable,
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::StoreCatalogEmpty => write!(f, "Apple returned an empty asset specification catalog."),
-            Self::StoreScreenshotsMissing => write!(f,
+            Self::CatalogEmpty => write!(f, "Apple returned an empty asset specification catalog."),
+            Self::ScreenshotsMissing => write!(f,
                 "Add at least one iPhone screenshot before deploying."),
-            Self::StoreScreenshotGroupCount { group, count, maximum } => write!(f,
+            Self::ScreenshotGroupCount { group, count, maximum } => write!(f,
                 "{group} has {count} screenshots; Apple allows at most {maximum}. \
                  Remove screenshots and rerun."),
-            Self::StoreScreenshotFileSize { path, size, maximum } => write!(f,
+            Self::ScreenshotFileSize { path, size, maximum } => write!(f,
                 "{} is {size} bytes; Apple requires a nonempty image of at most {maximum} bytes.",
                 path.display()),
-            Self::StoreScreenshotSync { source, recovery } => {
+            Self::ScreenshotSync { source, recovery } => {
                 writeln!(f, "Screenshot synchronization failed: {source}")?;
                 if recovery.is_empty() {
                     writeln!(f, "Previous screenshot placements and order were restored.")?;
@@ -59,7 +59,7 @@ impl std::fmt::Display for Error {
                 }
                 write!(f, "Original image assets remain in Asset Library.")
             }
-            Self::StoreScreenshotGroupMismatch { images } => {
+            Self::ScreenshotGroupMismatch { images } => {
                 write!(f, "These screenshots do not fit one Apple device display group:")?;
                 for (path, width, height) in images {
                     write!(f, " {} ({width}x{height})", path.display())?;
@@ -67,26 +67,26 @@ impl std::fmt::Display for Error {
                 write!(f, ". Capture this device family's screenshots \
                     at the same supported resolution, then rerun.")
             }
-            Self::StoreVersionNotEditable { version, state } => write!(f,
+            Self::VersionNotEditable { version, state } => write!(f,
                 "App Store version {version} is {state}, so Apple does not allow screenshot changes. \
                  Resolve its review state in App Store Connect, or increase package.version \
                  in Cargo.toml for a new release."),
-            Self::StoreUploadUrlsRejected => write!(f,
+            Self::UploadUrlsRejected => write!(f,
                 "Apple rejected freshly issued screenshot upload URLs. Check your network or proxy \
                  and retry later. Existing placements are unchanged."),
-            Self::StoreUploadOperationsMissing { image_id } => write!(f,
+            Self::UploadOperationsMissing { image_id } => write!(f,
                 "Apple supplied no upload operations for image {image_id}."),
-            Self::StoreUploadRangeInvalid => write!(f, "Apple returned an invalid upload byte range."),
-            Self::StoreUploadRangeTooLarge => write!(f,
+            Self::UploadRangeInvalid => write!(f, "Apple returned an invalid upload byte range."),
+            Self::UploadRangeTooLarge => write!(f,
                 "Apple's upload byte range exceeds the screenshot size."),
-            Self::StoreUploadRangeDiscontinuous => write!(f,
+            Self::UploadRangeDiscontinuous => write!(f,
                 "Apple's upload ranges overlap or leave a gap."),
-            Self::StoreUploadRangeIncomplete => write!(f,
+            Self::UploadRangeIncomplete => write!(f,
                 "Apple's upload ranges do not cover the screenshot."),
-            Self::StoreUploadInsecureUrl => write!(f, "Apple returned an insecure asset upload URL."),
-            Self::StoreUploadAuthorization => write!(f,
+            Self::UploadInsecureUrl => write!(f, "Apple returned an insecure asset upload URL."),
+            Self::UploadAuthorization => write!(f,
                 "Unexpected authorization header in asset upload instructions."),
-            Self::StoreScreenshotUpload { image_id, status } => {
+            Self::ScreenshotUpload { image_id, status } => {
                 write!(f, "Screenshot {image_id} upload failed (")?;
                 match status {
                     Some(status) => write!(f, "HTTP {status}")?,
@@ -95,27 +95,27 @@ impl std::fmt::Display for Error {
                 write!(f, "). Check your network and rerun cargo piston deploy to resume. \
                     Existing screenshot placements are unchanged.")
             }
-            Self::StoreImageProcessingTimeout { image_id } => write!(f,
+            Self::ImageProcessingTimeout { image_id } => write!(f,
                 "Apple is still processing screenshot {image_id}. Rerun cargo piston deploy later; \
                  it will reuse the uploaded image. Existing screenshot placements are unchanged."),
-            Self::StoreImageSpecificationMismatch { image_id, group, spec } => write!(f,
+            Self::ImageSpecificationMismatch { image_id, group, spec } => write!(f,
                 "Apple processed image {image_id} as specification {spec}, incompatible with {group}."),
-            Self::StoreImageRejected { image_id, state, details } => write!(f,
+            Self::ImageRejected { image_id, state, details } => write!(f,
                 "Apple image {image_id} is {state}: {details}. \
                  Check this image in App Store Connect's Asset Library."),
-            Self::StoreScreenshotOrder { group } => write!(f,
+            Self::ScreenshotOrder { group } => write!(f,
                 "Apple returned a different screenshot order for {group}."),
-            Self::StoreCatalogFeatureMissing => write!(f,
+            Self::CatalogFeatureMissing => write!(f,
                 "Apple's asset catalog has no App Store version feature."),
-            Self::StoreCatalogPolicyMissing => write!(f,
+            Self::CatalogPolicyMissing => write!(f,
                 "Apple's asset catalog has no screenshot policy."),
-            Self::StoreCatalogSpecificationsMissing => write!(f,
+            Self::CatalogSpecificationsMissing => write!(f,
                 "Apple's asset catalog has no screenshot specifications."),
-            Self::StoreCatalogCategoryRejected => write!(f,
+            Self::CatalogCategoryRejected => write!(f,
                 "Apple's screenshot catalog rejects screenshot image assets."),
-            Self::StoreCatalogDimensionsInvalid => write!(f,
+            Self::CatalogDimensionsInvalid => write!(f,
                 "Apple's screenshot specification has invalid dimensions."),
-            Self::StoreCatalogSpecificationsUnavailable => write!(f,
+            Self::CatalogSpecificationsUnavailable => write!(f,
                 "Apple returned no usable iPhone or iPad screenshot specifications."),
         }
     }
@@ -124,7 +124,7 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::StoreScreenshotSync { source, .. } => Some(source.as_ref()),
+            Self::ScreenshotSync { source, .. } => Some(source.as_ref()),
             _ => None,
         }
     }

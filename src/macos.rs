@@ -11,8 +11,6 @@ use crate::apple::{AppleSigning, AppleSigningTarget, AscApiKey};
 use crate::apple::{PushBuild, XcodeSigning};
 use crate::manifest::Manifest;
 
-mod development;
-pub use development::MacDevelopment;
 pub mod cli;
 pub use cli::Cli;
 
@@ -38,6 +36,30 @@ pub struct MacOSBuilder {
 }
 
 impl MacOSBuilder {
+    pub fn valid_setting(name: &str, value: &toml_edit::Item, root: &Path) -> bool {
+        if name == "resources" {
+            return value.as_array().is_some_and(|paths| paths.iter().all(|value| {
+                value.as_str().is_some_and(|path| {
+                    !path.is_empty() && root.join(path).exists()
+                        && root.join(path).file_name().is_some()
+                })
+            }));
+        }
+        let Some(value) = value.as_str() else { return false; };
+        match name {
+            "team" => value.len() == 10 && value.bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit()),
+            "bundle_id" => value.contains('.') && !value.split('.').any(str::is_empty)
+                && value.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || ".-".contains(character)
+                }),
+            "info_plist" | "entitlements" => !value.is_empty()
+                && plist::Value::from_file(root.join(value))
+                    .is_ok_and(|value| value.as_dictionary().is_some()),
+            _ => unreachable!(),
+        }
+    }
+
     fn new(release: bool, external: bool, target: String, cwd: PathBuf, env_vars: HashMap<String, String>, developer: PathBuf) -> Result<Self> {
         let cargo_path = env_vars.get("cargo_path").cloned().unwrap_or("cargo".to_string());
         let keystore_path = env_vars.get("keystore_path").cloned();
@@ -46,7 +68,7 @@ impl MacOSBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| Error::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParse(e.to_string()))?;
 
         let icon_path = Project::get_icon_path(&metadata, &cwd);
         let manifest = metadata.root_package().unwrap().manifest_path.clone().into_std_path_buf();
@@ -106,11 +128,11 @@ impl MacOSBuilder {
         let macos_path = contents_path.join("MacOS");
         let path = res_path.as_path();
         Project::empty_directory(path, &["assets"])?;
-        create_dir_all(path).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(path).map_err(|e| Error::CreateDirAll {
             path: self.output_path.clone(),
             source: e,
         })?;
-        create_dir_all(macos_path).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(macos_path).map_err(|e| Error::CreateDirAll {
             path: self.output_path.clone(),
             source: e,
         })?;
@@ -119,13 +141,13 @@ impl MacOSBuilder {
         let icon_path: PathBuf = res_path.join("macos_icon.icns");
         let plist_path: PathBuf = contents_path.join("Info.plist");
         if plist_path.exists() {
-            remove_file(&plist_path).map_err(|e| Error::RemoveFileError {
+            remove_file(&plist_path).map_err(|e| Error::RemoveFile {
                 path: plist_path.to_path_buf(),
                 source: e,
             })?;
         }
         let mut plist_file = File::create(&plist_path).map_err(|e| {
-            Error::CreateFileError { path: plist_path.to_path_buf(), source: e }
+            Error::CreateFile { path: plist_path.to_path_buf(), source: e }
         })?;
         let plist_content = format!(
             r#"
@@ -153,11 +175,11 @@ impl MacOSBuilder {
             </dict>
             </plist>
             "#,
-            &capitalized, &self.app_name, &self.bundle_id, &self.app_version, &self.app_version,
+            capitalized, self.app_name, self.bundle_id, self.app_version, self.app_version,
         );
         plist_file
             .write_all(plist_content.as_bytes())
-            .map_err(|e| Error::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFile(e.to_string()))?;
         let img_path = Path::new(&self.icon_path);
         Command::new("sips")
             .args([
@@ -169,7 +191,7 @@ impl MacOSBuilder {
                 &icon_path.display().to_string(),
             ])
             .output()
-            .map_err(|e| cli::Error::MacOSIconError {
+            .map_err(|e| Error::MacOSIcon {
                 input_path: img_path.to_path_buf(),
                 output_path: icon_path,
                 source: e,
@@ -238,7 +260,7 @@ impl MacOSBuilder {
     fn notarize(&self) -> Result<()> {
         let working_path = &self.output_path;
         let parent = working_path.parent().unwrap();
-        let zip_str = format!("{}.zip", &self.app_name);
+        let zip_str = format!("{}.zip", self.app_name);
         let zip_path = parent.join(zip_str);
 
         let zip = Command::new("ditto")
@@ -292,7 +314,7 @@ impl MacOSBuilder {
         let binary_target_path =
             self.output_path.join("Contents").join("MacOS").join(&self.app_name);
         if !self.release {
-            copy(&binary_path, &binary_target_path).map_err(|e| Error::CopyFileError {
+            copy(&binary_path, &binary_target_path).map_err(|e| Error::CopyFile {
                 input_path: binary_path.to_path_buf(),
                 output_path: binary_target_path.to_path_buf(),
                 source: e,
@@ -314,13 +336,13 @@ impl MacOSBuilder {
                 .arg("-output")
                 .arg(&binary_target_path)
                 .output()
-                .map_err(|e| cli::Error::LipoError {
+                .map_err(|e| Error::Lipo {
                     first_binary: binary_path.clone(),
                     second_binary: secondary_path.clone(),
                     source: e.to_string(),
                 })?;
             if !lipo.status.success() {
-                return Err(cli::Error::LipoError {
+                return Err(Error::Lipo {
                     first_binary: binary_path,
                     second_binary: secondary_path,
                     source: String::from_utf8_lossy(&lipo.stderr).to_string(),
@@ -331,7 +353,7 @@ impl MacOSBuilder {
         if let Some(notifications) = &self.notifications {
             let work = self.cwd.join("target/piston/macos").join(&self.app_name);
             create_dir_all(&work)
-                .map_err(|error| Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFile(error.to_string()))?;
             let settings = Manifest::new(&self.manifest)?.settings(&["macos"])?;
             let source =
                 settings.get("entitlements").map(|path| self.manifest.parent().unwrap().join(path));
@@ -340,7 +362,7 @@ impl MacOSBuilder {
                 .entitlements(source.as_deref(), &work.join("notifications.entitlements"))?;
             if self.release && !self.external {
                 let mut values = plist::Value::from_file(&entitlements)
-                    .map_err(|error| crate::apple::cli::Error::CodesignError(error.to_string()))?;
+                    .map_err(|error| crate::apple::cli::Error::Codesign(error.to_string()))?;
                 let values_dict = values.as_dictionary_mut().unwrap();
                 values_dict
                     .insert("com.apple.security.app-sandbox".into(), plist::Value::Boolean(true));
@@ -350,7 +372,7 @@ impl MacOSBuilder {
                 );
                 values
                     .to_file_xml(&entitlements)
-                    .map_err(|error| crate::apple::cli::Error::CodesignError(error.to_string()))?;
+                    .map_err(|error| crate::apple::cli::Error::Codesign(error.to_string()))?;
             }
             let signing = XcodeSigning::new(&notifications.signing.team, &self.developer);
             let signed = signing.sign_macos(
@@ -362,12 +384,12 @@ impl MacOSBuilder {
             )?;
             notifications.signing.verify(&signed)?;
             std::fs::remove_dir_all(&self.output_path)
-                .map_err(|error| Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFile(error.to_string()))?;
             let copy = Command::new("ditto")
                 .arg(&signed)
                 .arg(&self.output_path)
                 .output()
-                .map_err(|error| crate::apple::cli::Error::CodesignError(error.to_string()))?;
+                .map_err(|error| crate::apple::cli::Error::Codesign(error.to_string()))?;
             if !copy.status.success() {
                 return Err(Error::CommandFailed { program: "ditto".into(), output: copy }.into());
             }

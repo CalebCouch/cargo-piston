@@ -127,18 +127,16 @@ impl AndroidDevelopment {
             if fields.len() < 2 { continue; }
             let serial = fields[0];
             if args.simulator && !serial.starts_with("emulator-") { continue; }
-            if let Some(selector) = &args.device {
-                if selector != serial {
-                    if !serial.starts_with("emulator-") || fields[1] != "device" { continue; }
-                    let output = self
-                        .adb()
-                        .args(["-s", serial, "shell", "getprop", "ro.boot.qemu.avd_name"])
-                        .output()?;
-                    if !output.status.success()
-                        || String::from_utf8_lossy(&output.stdout).lines().next()
-                            != Some(selector.as_str())
-                    { continue; }
-                }
+            if let Some(selector) = &args.device && selector != serial {
+                if !serial.starts_with("emulator-") || fields[1] != "device" { continue; }
+                let output = self
+                    .adb()
+                    .args(["-s", serial, "shell", "getprop", "ro.boot.qemu.avd_name"])
+                    .output()?;
+                if !output.status.success()
+                    || String::from_utf8_lossy(&output.stdout).lines().next()
+                        != Some(selector.as_str())
+                { continue; }
             }
             if fields[1] != "device" {
                 return Err(Error::AndroidDeviceUnavailable {
@@ -225,9 +223,9 @@ impl AndroidDevelopment {
         let source = gradle.join("app/src/main");
         let libraries = source.join("jniLibs").join(&self.abi);
         fs::create_dir_all(&libraries)
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         fs::copy(library, libraries.join(library.file_name().unwrap()))
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let prebuilt = Self::ndk_toolchain(&self.ndk)
             .ok_or_else(|| Error::AndroidHostToolchainMissing {
                 path: self.ndk.join("toolchains/llvm/prebuilt"),
@@ -244,7 +242,7 @@ impl AndroidDevelopment {
             prebuilt.join("sysroot/usr/lib").join(cxx_target).join("libc++_shared.so"),
             libraries.join("libc++_shared.so"),
         )
-        .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+        .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let version = self.project.package.version.to_string();
         let lib = library.file_stem().unwrap().to_string_lossy();
         let lib = lib.strip_prefix("lib").unwrap_or(&lib);
@@ -271,14 +269,14 @@ impl AndroidDevelopment {
         )?;
         if let Some(icon) = crate::project::Project::find_icon(self.project.root()) {
             let image = image::open(&icon)
-                .map_err(|source| cli::Error::OpenImageError { path: icon, source })?;
+                .map_err(|source| cli::Error::OpenImage { path: icon, source })?;
             let path = source.join("res/drawable/icon.png");
             fs::create_dir_all(path.parent().unwrap())
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             image
                 .resize_exact(192, 192, image::imageops::FilterType::Lanczos3)
                 .save(&path)
-                .map_err(cli::Error::WriteImageError)?;
+                .map_err(cli::Error::WriteImage)?;
             let path = source.join("AndroidManifest.xml");
             let contents = fs::read_to_string(&path)?;
             Project::write(
@@ -299,7 +297,7 @@ project(':bridge').projectDir = file({})
             ),
         )?;
         let mut root_gradle = fs::read_to_string(self.bridge.join("build.gradle"))
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         root_gradle.push_str(&format!(
             "\nproject(':bridge') {{ layout.buildDirectory.set(file({})) }}\n",
             json!(gradle.join("bridge-build"))
@@ -466,7 +464,7 @@ dependencies {{ implementation project(':bridge') }}
             })
             .ok_or(Error::AndroidEmulatorPortsUnavailable)?;
         let log = fs::File::create(self.project.work.join("emulator.log"))
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         self.emulator = Some(
             Command::new(emulator)
                 .args(["-avd", &name, "-port", &port.to_string()])
@@ -484,12 +482,10 @@ dependencies {{ implementation project(':bridge') }}
             if self.interrupted.try_recv().is_ok() {
                 return Err(Error::AndroidInterrupted.into());
             }
-            if let Some(child) = &mut self.emulator {
-                if child.try_wait()?.is_some() {
-                    return Err(Error::AndroidEmulatorClosed {
-                        log: self.project.work.join("emulator.log"),
-                    }.into());
-                }
+            if let Some(child) = &mut self.emulator && child.try_wait()?.is_some() {
+                return Err(Error::AndroidEmulatorClosed {
+                    log: self.project.work.join("emulator.log"),
+                }.into());
             }
             let output = self
                 .device_command()
@@ -535,7 +531,7 @@ impl AndroidDevelopment {
     fn sdkmanager_path(sdk: &Path) -> Result<PathBuf> {
         let root = sdk.join("cmdline-tools");
         fs::read_dir(&root)
-            .map_err(|source| cli::Error::ReadDirError { path: root.clone(), source })?
+            .map_err(|source| cli::Error::ReadDir { path: root.clone(), source })?
             .filter_map(|entry| entry.ok())
             .map(|entry| entry.path().join("bin/sdkmanager"))
             .find(|path| path.is_file())

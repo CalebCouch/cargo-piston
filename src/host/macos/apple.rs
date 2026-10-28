@@ -26,7 +26,7 @@ impl Xcode {
         let output = Project::output(Command::new("sw_vers").arg("-productVersion"))?;
         let value = String::from_utf8_lossy(&output);
         let system = Self::version(value.trim()).ok_or_else(|| {
-            Error::XcodeSystemVersionInvalid { value: value.into_owned() }
+            Error::SystemVersionInvalid { value: value.into_owned() }
         })?;
         let silicon =
             Command::new("sysctl").args(["-n", "hw.optional.arm64"]).output().is_ok_and(|output| {
@@ -42,7 +42,7 @@ impl Xcode {
             String::from_utf8_lossy(&output.stdout).trim().to_string()
         };
         if !matches!(architecture.as_str(), "arm64" | "x86_64") {
-            return Err(Error::XcodeArchitectureUnsupported { architecture }.into());
+            return Err(Error::ArchitectureUnsupported { architecture }.into());
         }
         let home = env::var_os("HOME")
             .map(PathBuf::from)
@@ -54,7 +54,7 @@ impl Xcode {
         let developer = if let Some(path) = env::var_os("DEVELOPER_DIR") {
             let (version, path) = self.inspect(&PathBuf::from(path))?;
             if version[0] < minimum {
-                return Err(Error::XcodeSelectedTooOld { version, minimum }.into());
+                return Err(Error::SelectedTooOld { version, minimum }.into());
             }
             path
         } else {
@@ -65,7 +65,7 @@ impl Xcode {
 
     fn verify_sdk(&self, developer: &Path, sdk: &str, minimum: u32) -> Result<()> {
         let output = Command::new("xcrun")
-            .env("DEVELOPER_DIR", &developer)
+            .env("DEVELOPER_DIR", developer)
             .args(["--sdk", sdk, "--show-sdk-version"])
             .output()
             .map_err(|source| SharedError::CommandSpawn { program: "xcrun".into(), source })?;
@@ -73,7 +73,7 @@ impl Xcode {
         if !output.status.success()
             || Self::version(version.trim()).is_none_or(|version| version[0] < minimum)
         {
-            return Err(Error::XcodeSdkUnavailable {
+            return Err(Error::SdkUnavailable {
                 developer: developer.into(), sdk: sdk.into(), minimum, output,
             }.into());
         }
@@ -104,7 +104,7 @@ impl Xcode {
         let output = Project::output(Command::new("plutil")
             .args(["-convert", "json", "-o", "-"]).arg(path))?;
         serde_json::from_slice(&output)
-            .map_err(|error| SharedError::IntoJSONError(error.to_string()).into())
+            .map_err(|error| SharedError::IntoJSON(error.to_string()).into())
     }
 
     fn inspect(&self, path: &Path) -> Result<([u32; 3], PathBuf)> {
@@ -116,7 +116,7 @@ impl Xcode {
         let developer = fs::canonicalize(&path)
             .map_err(|source| SharedError::ReadFile { path, source })?;
         if !developer.join("usr/bin/xcodebuild").is_file() {
-            return Err(Error::XcodeIncomplete { developer }.into());
+            return Err(Error::Incomplete { developer }.into());
         }
         let contents = developer.parent().unwrap();
         let info = Self::plist(&contents.join("Info.plist"))?;
@@ -129,7 +129,7 @@ impl Xcode {
             || version.is_none()
             || required.is_none_or(|required| required > self.system)
         {
-            return Err(Error::XcodeIncompatible { developer }.into());
+            return Err(Error::Incompatible { developer }.into());
         }
         Ok((version.unwrap(), developer))
     }
@@ -148,7 +148,7 @@ impl Xcode {
                 Ok(entries) => {
                     for entry in entries {
                         let entry = entry
-                            .map_err(|source| SharedError::MapDirError { path: root.clone(), source })?;
+                            .map_err(|source| SharedError::MapDir { path: root.clone(), source })?;
                         let path = entry.path();
                         if path.join("Contents/Developer/usr/bin/xcodebuild").is_file() {
                             paths.push(path);
@@ -156,7 +156,7 @@ impl Xcode {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-                Err(source) => report(SharedError::ReadDirError { path: root, source }.into()),
+                Err(source) => report(SharedError::ReadDir { path: root, source }.into()),
             }
         }
         let spotlight = Command::new("mdfind")
@@ -180,7 +180,7 @@ impl Xcode {
             match self.inspect(&path) {
                 Ok(candidate) if candidate.0[0] >= minimum => candidates.push(candidate),
                 Ok(_) => {}
-                Err(error) => report(Error::XcodeDiscovery { path, error }.into()),
+                Err(error) => report(Error::Discovery { path, error }.into()),
             }
         }
         candidates.sort_by(|left, right| {
@@ -203,7 +203,7 @@ impl Xcode {
                 Ok(output) => {
                     let error = String::from_utf8_lossy(&output.stderr);
                     if error.to_lowercase().contains("license") { return Ok(Some(developer)); }
-                    report(Error::XcodeDiscovery {
+                    report(Error::Discovery {
                         path: developer.clone(),
                         error: Box::new(SharedError::CommandFailed {
                             program: developer.join("usr/bin/xcodebuild").into(), output,
@@ -211,7 +211,7 @@ impl Xcode {
                     }.into());
                 }
                 Err(error) => {
-                    report(Error::XcodeDiscovery {
+                    report(Error::Discovery {
                         path: developer.clone(),
                         error: Box::new(SharedError::CommandSpawn {
                             program: developer.join("usr/bin/xcodebuild").into(), source: error,
@@ -226,8 +226,8 @@ impl Xcode {
     fn latest(&self, sdk: &str, minimum: u32) -> Result<Release> {
         let releases: Vec<Value> = ureq::AgentBuilder::new().timeout(Duration::from_secs(15))
             .build().get("https://xcodereleases.com/data.json").call()
-            .map_err(|source| Error::XcodeCatalogUnavailable { source: Box::new(source) })?
-            .into_json().map_err(|error| SharedError::IntoJSONError(error.to_string()))?;
+            .map_err(|source| Error::CatalogUnavailable { source: Box::new(source) })?
+            .into_json().map_err(|error| SharedError::IntoJSON(error.to_string()))?;
         let mut candidates = Vec::new();
         for release in releases {
             if release.pointer("/version/release/release").and_then(Value::as_bool) != Some(true) {
@@ -287,13 +287,13 @@ impl Xcode {
         if let Some(release) = candidates.into_iter().next() { return Ok(release); }
         if let Some(required) = minimum_os {
             return Err(SharedError::SetupRequired {
-                error: Error::XcodeSystemTooOld { sdk: sdk.into(), minimum: required }.into(),
+                error: Error::SystemTooOld { sdk: sdk.into(), minimum: required }.into(),
                 page: SetupPage::Url(
                     "x-apple.systempreferences:com.apple.Software-Update-Settings.extension".into(),
                 ),
             }.into());
         }
-        Err(Error::XcodeReleaseUnavailable {
+        Err(Error::ReleaseUnavailable {
             architecture: self.architecture.clone(), sdk: sdk.into(),
         }.into())
     }
@@ -327,18 +327,18 @@ impl Xcode {
     fn install(&self, release: &Release, archive: &Path) -> Result<PathBuf> {
         let applications = self.home.join("Applications");
         fs::create_dir_all(&applications)
-            .map_err(|source| SharedError::CreateDirAllError { path: applications.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAll { path: applications.clone(), source })?;
         let destination =
             applications.join(format!("Xcode-{}-{}.app", release.name, release.build));
         if destination.exists() {
-            return Err(Error::XcodeDestinationExists { path: destination }.into());
+            return Err(Error::DestinationExists { path: destination }.into());
         }
         let stamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
         let staging = applications.join(format!(".piston-xcode-{}-{stamp}", std::process::id()));
         fs::create_dir(&staging)
-            .map_err(|source| SharedError::CreateDirAllError { path: staging.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAll { path: staging.clone(), source })?;
         Self::run(
-            Command::new("xip").arg("--expand").arg(&archive).current_dir(&staging),
+            Command::new("xip").arg("--expand").arg(archive).current_dir(&staging),
             "extract",
             &staging,
         )?;
@@ -351,11 +351,11 @@ impl Xcode {
         let (version, developer) = self.inspect(&app)?;
         let info = Self::plist(&developer.parent().unwrap().join("version.plist"))?;
         if version != release.version || info["ProductBuildVersion"] != release.build {
-            return Err(Error::XcodeArchiveMismatch {
+            return Err(Error::ArchiveMismatch {
                 version: release.name.clone(), build: release.build.clone(), staging,
             }.into());
         }
-        fs::rename(&app, &destination).map_err(|source| Error::XcodeInstallMove {
+        fs::rename(&app, &destination).map_err(|source| Error::InstallMove {
             destination: destination.clone(), staging, source,
         })?;
         Ok(destination.join("Contents/Developer"))
@@ -384,7 +384,7 @@ impl Xcode {
             .status()
             .map_err(|source| SharedError::CommandSpawn { program: "sudo".into(), source })?;
         if !status.success() || !self.license_accepted(developer)? {
-            return Err(Error::XcodeLicenseIncomplete.into());
+            return Err(Error::LicenseIncomplete.into());
         }
         Ok(())
     }
@@ -403,7 +403,7 @@ impl Xcode {
     fn install_components(&self, developer: &Path, elevated: bool) -> Result<()> {
         let logs = self.home.join("Library/Logs/Piston/Xcode");
         fs::create_dir_all(&logs)
-            .map_err(|source| SharedError::CreateDirAllError { path: logs.clone(), source })?;
+            .map_err(|source| SharedError::CreateDirAll { path: logs.clone(), source })?;
         let binary = developer.join("usr/bin/xcodebuild");
         if elevated {
             let status = Command::new("sudo")
@@ -411,7 +411,7 @@ impl Xcode {
                 .status()
                 .map_err(|source| SharedError::CommandSpawn { program: "sudo".into(), source })?;
             if !status.success() {
-                return Err(Error::XcodeAdministratorApprovalIncomplete.into());
+                return Err(Error::AdministratorApprovalIncomplete.into());
             }
             Self::run(
                 Command::new("sudo")
@@ -441,7 +441,7 @@ impl Xcode {
     fn run(command: &mut Command, stage: &str, directory: &Path) -> Result<()> {
         let log = directory.join(format!("{stage}.log"));
         let file = fs::File::create(&log)
-            .map_err(|source| SharedError::CreateFileError { path: log.clone(), source })?;
+            .map_err(|source| SharedError::CreateFile { path: log.clone(), source })?;
         let errors = file.try_clone()
             .map_err(|source| SharedError::ReadFile { path: log.clone(), source })?;
         let program = command.get_program().to_owned();

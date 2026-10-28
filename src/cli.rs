@@ -14,6 +14,8 @@ pub enum SetupPage { Url(String), XcodeAccounts(PathBuf), }
 #[derive(Debug)]
 pub enum Error {
     AppSelectionInvalid,
+    Lipo { first_binary: PathBuf, second_binary: PathBuf, source: String },
+    MacOSIcon { input_path: PathBuf, output_path: PathBuf, source: std::io::Error },
     AppPackageMissing,
     AppLibraryMissing,
     AppBinaryMissing,
@@ -37,22 +39,22 @@ pub enum Error {
     ArtifactNotProduced { package: String, target: Option<String> },
     ReadFile { path: PathBuf, source: std::io::Error },
     SetupRequired { error: Box<dyn std::error::Error>, page: SetupPage },
-    BuildError(String),
-    CargoParseError(String),
-    WriteFileError(String),
-    WriteImageError(image::ImageError),
-    UnsupportedTargetError(String),
-    ParseUTF8Error(String),
-    IntoJSONError(String),
-    CopyFileError { input_path: PathBuf, output_path: PathBuf, source: std::io::Error },
-    ReadDirError { path: PathBuf, source: std::io::Error },
-    MapDirError { path: PathBuf, source: std::io::Error },
-    RemoveSubdirError { path: PathBuf, source: std::io::Error },
-    RemoveFileError { path: PathBuf, source: std::io::Error },
-    CreateFileError { path: PathBuf, source: std::io::Error },
-    RenameFileError { path: PathBuf, source: std::io::Error },
-    CreateDirAllError { path: PathBuf, source: std::io::Error },
-    OpenImageError { path: PathBuf, source: image::ImageError },
+    Build(String),
+    CargoParse(String),
+    WriteFile(String),
+    WriteImage(image::ImageError),
+    UnsupportedTarget(String),
+    ParseUTF8(String),
+    IntoJSON(String),
+    CopyFile { input_path: PathBuf, output_path: PathBuf, source: std::io::Error },
+    ReadDir { path: PathBuf, source: std::io::Error },
+    MapDir { path: PathBuf, source: std::io::Error },
+    RemoveSubdir { path: PathBuf, source: std::io::Error },
+    RemoveFile { path: PathBuf, source: std::io::Error },
+    CreateFile { path: PathBuf, source: std::io::Error },
+    RenameFile { path: PathBuf, source: std::io::Error },
+    CreateDirAll { path: PathBuf, source: std::io::Error },
+    OpenImage { path: PathBuf, source: image::ImageError },
     CurrentDirectory(std::io::Error),
     EnvironmentFile(std::io::Error),
     Subcommand(cargo_subcommand::Error),
@@ -63,6 +65,13 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Lipo { first_binary, second_binary, source } => write!(
+                f, "Error making universal binary with Lipo first binary: {:?}, \
+                 second binary: {:?}, source: {}", first_binary, second_binary, source,
+            ),
+            Self::MacOSIcon { input_path, output_path, .. } => {
+                write!(f, "Failed to format icon {:?} to {:?}", input_path, output_path)
+            }
             Self::AppSelectionInvalid => write!(f,
                 "Select one app package; Android uses its cdylib, desktop and iOS use its binary."),
             Self::AppPackageMissing => write!(f,
@@ -118,8 +127,8 @@ impl fmt::Display for Error {
                 write!(f, "Could not read {}: {source}", path.display())
             }
             Self::SetupRequired { error, .. } => fmt::Display::fmt(error, f),
-            Self::BuildError(err) => write!(f, "Failed to build the binary: {}", err),
-            Self::CargoParseError(err) => {
+            Self::Build(err) => write!(f, "Failed to build the binary: {}", err),
+            Self::CargoParse(err) => {
                 write!(f, "Could not read the Cargo project:\n{err}")?;
                 if err.contains("Operation not permitted") || err.contains("Permission denied") {
                     write!(f, "\n\nAllow your terminal app to read the project folder. \
@@ -129,30 +138,30 @@ impl fmt::Display for Error {
                 }
                 Ok(())
             }
-            Self::WriteFileError(err) => write!(f, "Failed to write file: {}", err),
-            Self::WriteImageError(err) => write!(f, "Failed to write image: {}", err),
-            Self::UnsupportedTargetError(err) => {
+            Self::WriteFile(err) => write!(f, "Failed to write file: {}", err),
+            Self::WriteImage(err) => write!(f, "Failed to write image: {}", err),
+            Self::UnsupportedTarget(err) => {
                 write!(f, "User Specified Target is Unsupported: {}", err)
             }
-            Self::ParseUTF8Error(err) => write!(f, "Error Parsing UTF8: {}", err),
-            Self::IntoJSONError(err) => write!(f, "Error converting into JSON: {}", err),
-            Self::CopyFileError { input_path, output_path, .. } => {
+            Self::ParseUTF8(err) => write!(f, "Error Parsing UTF8: {}", err),
+            Self::IntoJSON(err) => write!(f, "Error converting into JSON: {}", err),
+            Self::CopyFile { input_path, output_path, .. } => {
                 write!(f, "Failed to copy {:?} to {:?}", input_path, output_path)
             }
-            Self::ReadDirError { path, .. } => write!(f, "Failed to read directory {:?}", path),
-            Self::MapDirError { path, .. } => {
+            Self::ReadDir { path, .. } => write!(f, "Failed to read directory {:?}", path),
+            Self::MapDir { path, .. } => {
                 write!(f, "Failed to map directory contents {:?}", path)
             }
-            Self::RemoveSubdirError { path, .. } => {
+            Self::RemoveSubdir { path, .. } => {
                 write!(f, "Failed to remove subdirectory {:?}", path)
             }
-            Self::RemoveFileError { path, .. } => write!(f, "Failed to remove file {:?}", path),
-            Self::CreateFileError { path, .. } => write!(f, "Failed to Create file {:?}", path),
-            Self::RenameFileError { path, .. } => write!(f, "Failed to Rename file {:?}", path),
-            Self::CreateDirAllError { path, .. } => {
+            Self::RemoveFile { path, .. } => write!(f, "Failed to remove file {:?}", path),
+            Self::CreateFile { path, .. } => write!(f, "Failed to Create file {:?}", path),
+            Self::RenameFile { path, .. } => write!(f, "Failed to Rename file {:?}", path),
+            Self::CreateDirAll { path, .. } => {
                 write!(f, "Failed to create dir all {:?}", path)
             }
-            Self::OpenImageError { path, .. } => write!(f, "Failed to open image {:?}", path),
+            Self::OpenImage { path, .. } => write!(f, "Failed to open image {:?}", path),
             Self::CurrentDirectory(source) => write!(f, "Error getting working directory: {source}"),
             Self::EnvironmentFile(source) => write!(f, "Error loading .env: {source}"),
             Self::Subcommand(source) => write!(f, "Error parsing subcommand: {source}"),
@@ -165,6 +174,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::MacOSIcon { source, .. } => Some(source),
             Self::FileMetadata { source, .. } => Some(source),
             Self::ManifestWrite { source, .. } => Some(source),
             Self::SaveImage { source, .. } => Some(source),
@@ -175,16 +185,16 @@ impl std::error::Error for Error {
             Self::CommandSpawn { source, .. } => Some(source),
             Self::ReadFile { source, .. } => Some(source),
             Self::SetupRequired { error, .. } => Some(error.as_ref()),
-            Self::CopyFileError { source, .. } => Some(source),
-            Self::ReadDirError { source, .. } => Some(source),
-            Self::MapDirError { source, .. } => Some(source),
-            Self::RemoveSubdirError { source, .. } => Some(source),
-            Self::RemoveFileError { source, .. } => Some(source),
-            Self::CreateFileError { source, .. } => Some(source),
-            Self::CreateDirAllError { source, .. } => Some(source),
-            Self::RenameFileError { source, .. } => Some(source),
-            Self::OpenImageError { source, .. } => Some(source),
-            Self::WriteImageError(source) => Some(source),
+            Self::CopyFile { source, .. } => Some(source),
+            Self::ReadDir { source, .. } => Some(source),
+            Self::MapDir { source, .. } => Some(source),
+            Self::RemoveSubdir { source, .. } => Some(source),
+            Self::RemoveFile { source, .. } => Some(source),
+            Self::CreateFile { source, .. } => Some(source),
+            Self::CreateDirAll { source, .. } => Some(source),
+            Self::RenameFile { source, .. } => Some(source),
+            Self::OpenImage { source, .. } => Some(source),
+            Self::WriteImage(source) => Some(source),
             Self::CurrentDirectory(source) | Self::EnvironmentFile(source) => Some(source),
             Self::Subcommand(source) => Some(source),
             _ => None,

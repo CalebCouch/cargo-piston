@@ -21,7 +21,7 @@ pub enum Error {
     LinuxVmDesktopTimeout,
     LinuxVmStopFailed { name: String, home: PathBuf },
     LinuxVmInterrupted,
-    WritePlUtilError(String),
+    WritePlUtil(String),
     Shutdown { source: Box<dyn std::error::Error>, cleanup: Box<dyn std::error::Error> },
 }
 
@@ -57,7 +57,7 @@ impl fmt::Display for Error {
                 "Could not stop VM {name}. Run limactl stop --force with LIMA_HOME={}",
                 home.display()),
             Self::LinuxVmInterrupted => write!(f, "Linux development interrupted."),
-            Self::WritePlUtilError(err) => write!(f, "Failed to write Plutil contents: {}", err),
+            Self::WritePlUtil(err) => write!(f, "Failed to write Plutil contents: {}", err),
             Self::Shutdown { source, cleanup } => write!(f, "{source}\n{cleanup}"),
         }
     }

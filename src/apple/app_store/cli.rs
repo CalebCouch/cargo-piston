@@ -15,7 +15,7 @@ pub enum Error {
     StoreResponseJson { method: String, path: String, source: std::io::Error },
     StoreRequestFailed { method: String, path: String, status: u16, response: serde_json::Value },
     StoreConnectionFailure { method: String, path: String, source: ureq::Transport },
-    StoreHttpError { method: &'static str, path: String, source: ureq::Error },
+    StoreHttp { method: &'static str, path: String, source: ureq::Error },
     StoreHttpStatus { method: &'static str, path: String, status: u16, response: String },
     StoreCertificateMissing { name: String },
     StoreVersionInvalid { version: String },
@@ -33,9 +33,9 @@ pub enum Error {
     StoreScreenshotDimensions { path: PathBuf, original: (u32, u32), accepted: Vec<(u32, u32)> },
     StoreScreenshotWrite { path: PathBuf, source: image::ImageError },
     StoreScreenshotFlush { path: PathBuf, source: std::io::Error },
-    Base64DecodeError(String),
-    ASCClientJWTEncodeError(String),
-    ASCAuthenticationError(Box<dyn std::error::Error>),
+    Base64Decode(String),
+    ASCClientJWTEncode(String),
+    ASCAuthentication(Box<dyn std::error::Error>),
 }
 
 impl std::fmt::Display for Error {
@@ -88,7 +88,7 @@ impl std::fmt::Display for Error {
                 "Could not reach App Store Connect for {method} {path}: {source}. Check your network \
                  and rerun. Apple may have received the request; \
                  check its status before retrying an upload."),
-            Self::StoreHttpError { method, path, source } => {
+            Self::StoreHttp { method, path, source } => {
                 write!(f, "App Store Connect {method} {path} failed: {source}")?;
                 if path == "/v1/bundleIds" && matches!(source, ureq::Error::Status(409, _)) {
                     write!(f, ". Choose a new, unique bundle ID in Cargo.toml.")?;
@@ -157,9 +157,9 @@ impl std::fmt::Display for Error {
                 "Cannot save prepared screenshot {}: {source}", path.display()),
             Self::StoreScreenshotFlush { path, source } => write!(f,
                 "Cannot finish prepared screenshot {}: {source}", path.display()),
-            Self::Base64DecodeError(err) => write!(f, "Error Decoding Base 64: {}", err),
-            Self::ASCAuthenticationError(err) => err.fmt(f),
-            Self::ASCClientJWTEncodeError(err) => write!(f, "Error encoding JWT: {}", err),
+            Self::Base64Decode(err) => write!(f, "Error Decoding Base 64: {}", err),
+            Self::ASCAuthentication(err) => err.fmt(f),
+            Self::ASCClientJWTEncode(err) => write!(f, "Error encoding JWT: {}", err),
         }
     }
 }
@@ -173,9 +173,9 @@ impl std::error::Error for Error {
             Self::StoreResponseJson { source, .. } => Some(source),
             Self::StoreScreenshotFolder { source, .. } => Some(source),
             Self::StoreScreenshotFlush { source, .. } => Some(source),
-            Self::ASCAuthenticationError(source) => Some(source.as_ref()),
+            Self::ASCAuthentication(source) => Some(source.as_ref()),
             Self::StoreConnectionFailure { source, .. } => Some(source),
-            Self::StoreHttpError { source, .. } => Some(source),
+            Self::StoreHttp { source, .. } => Some(source),
             Self::StoreScreenshotDecode { source, .. } => Some(source),
             Self::StoreScreenshotOrientation { source, .. } => Some(source),
             Self::StoreScreenshotColorProfile { source, .. } => Some(source),

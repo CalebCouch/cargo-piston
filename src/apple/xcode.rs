@@ -56,7 +56,7 @@ impl XcodeSigning {
         let archive = work.join(format!("{name}.xcarchive"));
         if release && archive.exists() {
             fs::remove_dir_all(&archive)
-                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         }
         let mut command = Command::new("xcrun");
         command
@@ -91,19 +91,19 @@ impl XcodeSigning {
             "manageAppVersionAndBuildNumber": false,
         });
         fs::write(&options, serde_json::to_vec(&settings).unwrap())
-            .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         let converted = Command::new("plutil")
             .args(["-convert", "xml1"])
             .arg(&options)
             .output()
-            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?;
         if !converted.status.success() {
             return Err(crate::cli::Error::CommandFailed { program: "plutil".into(), output: converted }.into());
         }
         let exported = work.join("export");
         if exported.exists() {
             fs::remove_dir_all(&exported)
-                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         }
         let mut command = Command::new("xcrun");
         command
@@ -121,10 +121,10 @@ impl XcodeSigning {
         if app.is_dir() { return Ok(app); }
 
         let packages = fs::read_dir(&exported)
-            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
+            .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?;
         let packages: Vec<_> = packages
             .into_iter()
             .filter(|path| path.extension().is_some_and(|ext| ext == "pkg"))
@@ -135,7 +135,7 @@ impl XcodeSigning {
         let expanded = work.join("expanded-package");
         if expanded.exists() {
             fs::remove_dir_all(&expanded)
-                .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         }
         let mut command = Command::new("pkgutil");
         command.arg("--expand-full").arg(package).arg(&expanded);
@@ -144,12 +144,12 @@ impl XcodeSigning {
         let mut apps = Vec::new();
         while let Some(directory) = directories.pop() {
             for entry in fs::read_dir(directory)
-                .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
+                .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?
             {
-                let entry = entry.map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
+                let entry = entry.map_err(|error| apple::cli::Error::Codesign(error.to_string()))?;
                 if !entry
                     .file_type()
-                    .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?
+                    .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?
                     .is_dir()
                 { continue; }
                 if entry.file_name() == std::ffi::OsStr::new(&format!("{name}.app")) {
@@ -193,15 +193,15 @@ impl XcodeSigning {
             return Err(cli::Error::SigningExecutableMissing { path: executable_path }.into());
         }
 
-        fs::create_dir_all(&work)
-            .map_err(|e| crate::cli::Error::CreateDirAllError { path: work.to_path_buf(), source: e })?;
-        let work = fs::canonicalize(&work).map_err(|e| {
+        fs::create_dir_all(work)
+            .map_err(|e| crate::cli::Error::CreateDirAll { path: work.to_path_buf(), source: e })?;
+        let work = fs::canonicalize(work).map_err(|e| {
             crate::cli::Error::ReadFile { path: work.to_path_buf(), source: e }
         })?;
         let project = work.join("Piston.xcodeproj");
         let schemes = project.join("xcshareddata/xcschemes");
         fs::create_dir_all(&schemes)
-            .map_err(|e| crate::cli::Error::CreateDirAllError { path: schemes.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateDirAll { path: schemes.clone(), source: e })?;
 
         let mut settings = json!({
             "ALWAYS_SEARCH_USER_PATHS": "NO",
@@ -232,7 +232,7 @@ impl XcodeSigning {
                 .arg("-archs")
                 .arg(&executable_path)
                 .output()
-                .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
+                .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?;
             if !architectures.status.success() {
                 return Err(crate::cli::Error::CommandFailed {
                     program: "/usr/bin/lipo".into(), output: architectures,
@@ -344,7 +344,7 @@ impl XcodeSigning {
         });
         let project_path = project.join("project.pbxproj");
         fs::write(&project_path, serde_json::to_vec_pretty(&project_data).unwrap())
-            .map_err(|e| crate::cli::Error::CreateFileError { path: project_path.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateFile { path: project_path.clone(), source: e })?;
         let output =
             Command::new("plutil").args(["-convert", "xml1"]).arg(&project_path).output().map_err(
                 |e| crate::cli::Error::CommandSpawn { program: "plutil".into(), source: e },
@@ -371,7 +371,7 @@ impl XcodeSigning {
   <LaunchAction buildConfiguration="{configuration}"/>
   <ArchiveAction buildConfiguration="{configuration}" revealArchiveInOrganizer="NO"/>
 </Scheme>
-"#)).map_err(|e| crate::cli::Error::CreateFileError { path: schemes.join("Piston.xcscheme"), source: e })?;
+"#)).map_err(|e| crate::cli::Error::CreateFile { path: schemes.join("Piston.xcscheme"), source: e })?;
 
         Ok(project)
     }
@@ -382,9 +382,9 @@ impl XcodeSigning {
         let name = bundle.file_stem().unwrap().to_str().unwrap();
         let log_path = work.join("xcodebuild.log");
         let log = File::create(&log_path)
-            .map_err(|e| crate::cli::Error::CreateFileError { path: log_path.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateFile { path: log_path.clone(), source: e })?;
         let stderr = log.try_clone().map_err(|e| {
-            crate::cli::Error::CreateFileError { path: log_path.clone(), source: e }
+            crate::cli::Error::CreateFile { path: log_path.clone(), source: e }
         })?;
         let derived_data = work.join("DerivedData");
         let status = Command::new("xcrun")
@@ -429,7 +429,7 @@ impl XcodeSigning {
             .args(["--verify", "--strict"])
             .arg(&signed_bundle)
             .output()
-            .map_err(|error| apple::cli::Error::CodesignError(error.to_string()))?;
+            .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?;
         if !verification.status.success() {
             return Err(cli::Error::SigningSignatureInvalid { output: verification, log: log_path }.into());
         }
@@ -440,9 +440,9 @@ impl XcodeSigning {
 impl XcodeSigning {
     fn run(&self, mut command: Command, log_path: &Path) -> Result<()> {
         let log = File::create(log_path)
-            .map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         let stderr =
-            log.try_clone().map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+            log.try_clone().map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         let status = command
             .stdout(Stdio::from(log))
             .stderr(Stdio::from(stderr))

@@ -12,7 +12,7 @@ pub enum Error {
     HostAndroidSdkMissing { path: PathBuf },
     HostJavaMissing { path: PathBuf, source: std::io::Error },
     HostBuildUnsupported,
-    UnsupportedOSError { os: String, target: String },
+    UnsupportedOS { os: String, target: String },
     MacDevelopmentUnsupported,
     NotificationSetupUnsupported,
     DevelopmentTargetInvalid,
@@ -31,7 +31,7 @@ impl fmt::Display for Error {
             Self::HostBuildUnsupported => {
                 write!(f, "Builds from Linux hosts are not implemented. Use a macOS host.")
             }
-            Self::UnsupportedOSError { os, target, .. } => {
+            Self::UnsupportedOS { os, target, .. } => {
                 write!(f, "Host system: {:?} does not support the target: {:?}", os, target)
             }
             Self::MacDevelopmentUnsupported => write!(f, "macOS development requires a Mac."),

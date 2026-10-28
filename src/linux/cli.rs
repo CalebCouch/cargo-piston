@@ -6,24 +6,24 @@ use super::{GPGSigner, LinuxBuilder};
 
 #[derive(Debug)]
 pub enum Error {
-    LinuxAppImageTargetUnsupported { target: String },
-    LinuxRuntimeMissing { path: PathBuf },
-    LinuxImageError(String),
-    LinuxSigningInput(std::io::Error),
+    AppImageTargetUnsupported { target: String },
+    RuntimeMissing { path: PathBuf },
+    Image(String),
+    SigningInput(std::io::Error),
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::LinuxAppImageTargetUnsupported { target } => write!(
+            Self::AppImageTargetUnsupported { target } => write!(
                 f, "Unsupported AppImage target: {target}. \
                     Supported architectures: x86_64, aarch64, arm, i686, ppc64le, riscv64.",
             ),
-            Self::LinuxRuntimeMissing { path } => {
+            Self::RuntimeMissing { path } => {
                 write!(f, "AppImage runtime not found at {}", path.display())
             }
-            Self::LinuxImageError(source) => write!(f, "Cannot package AppImage: {source}"),
-            Self::LinuxSigningInput(source) => {
+            Self::Image(source) => write!(f, "Cannot package AppImage: {source}"),
+            Self::SigningInput(source) => {
                 write!(f, "Cannot send the signing passphrase to GPG: {source}")
             }
         }
@@ -33,7 +33,7 @@ impl fmt::Display for Error {
 impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::LinuxSigningInput(source) => Some(source),
+            Self::SigningInput(source) => Some(source),
             _ => None,
         }
     }

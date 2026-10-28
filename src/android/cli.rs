@@ -29,8 +29,8 @@ pub enum Error {
     AndroidLaunchFailed { output: Vec<u8> },
     AndroidEmulatorControl(std::io::Error),
     AndroidSignalHandler(ctrlc::Error),
-    ParseManifestError(String),
-    WriteManifestError(String),
+    ParseManifest(String),
+    WriteManifest(String),
 }
 
 impl std::fmt::Display for Error {
@@ -91,10 +91,10 @@ impl std::fmt::Display for Error {
                 write!(f, "Cannot stop or wait for the Android emulator: {source}")
             }
             Self::AndroidSignalHandler(source) => write!(f, "Cannot watch Android shutdown: {source}"),
-            Self::ParseManifestError(err) => {
+            Self::ParseManifest(err) => {
                 write!(f, "Failed to parse package.metadata.android value: {}", err)
             }
-            Self::WriteManifestError(err) => {
+            Self::WriteManifest(err) => {
                 write!(f, "Failed to write AndroidManifest.xml contents: {}", err)
             }
         }

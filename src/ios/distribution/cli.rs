@@ -9,20 +9,20 @@ use super::IOSStore;
 
 #[derive(Debug)]
 pub enum Error {
-    IosArchiveMissing { path: PathBuf, log: PathBuf },
-    IosExportMissing { path: PathBuf, log: PathBuf },
-    IosDistributionFailed { log: PathBuf, output: String, status: ExitStatus },
+    ArchiveMissing { path: PathBuf, log: PathBuf },
+    ExportMissing { path: PathBuf, log: PathBuf },
+    DistributionFailed { log: PathBuf, output: String, status: ExitStatus },
 }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::IosArchiveMissing { path, log } => write!(f,
+            Self::ArchiveMissing { path, log } => write!(f,
                 "Xcode did not produce an application archive at {}. See {}.",
                 path.display(), log.display()),
-            Self::IosExportMissing { path, log } => write!(f,
+            Self::ExportMissing { path, log } => write!(f,
                 "Xcode did not export {}. See {}.", path.display(), log.display()),
-            Self::IosDistributionFailed { log, output, status } =>
+            Self::DistributionFailed { log, output, status } =>
                 Cli::failure(f, log, output, status),
         }
     }

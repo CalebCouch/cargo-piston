@@ -156,6 +156,6 @@ impl Simulator {
             IOSApplication::command(developer, "simctl").args(["list", "--json"]),
         )?;
         serde_json::from_slice(&output)
-            .map_err(|error| cli::Error::IntoJSONError(error.to_string()).into())
+            .map_err(|error| cli::Error::IntoJSON(error.to_string()).into())
     }
 }

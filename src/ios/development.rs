@@ -63,14 +63,14 @@ impl IOSDevelopment {
             .arg(bundle)
             .arg("--quiet")
             .output()
-            .map_err(|error| Error::XcrunInstallError(error.to_string()))?;
+            .map_err(|error| Error::XcrunInstall(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         Ok(())
     }
 
     pub fn launch(&self, identifier: &str, device: &IOSDevice, arguments: &[String]) -> Result<()> {
         let diagnostics = tempfile::tempdir()
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let lock_state = diagnostics.path().join("lock-state.json");
         let output = self.command("devicectl")
             .args([
@@ -78,12 +78,12 @@ impl IOSDevelopment {
                 "--quiet", "--timeout", "10", "--json-output",
             ])
             .arg(&lock_state).output()
-            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectl(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         let contents = fs::read(&lock_state)
             .map_err(|source| cli::Error::ReadFile { path: lock_state, source })?;
         let document: Value = serde_json::from_slice(&contents)
-            .map_err(|error| cli::Error::IntoJSONError(error.to_string()))?;
+            .map_err(|error| cli::Error::IntoJSON(error.to_string()))?;
         let locked = document.pointer("/result/passcodeRequired").and_then(Value::as_bool)
             .ok_or(Error::IosLockStateMissing)?;
         if locked { return Err(Error::IosDeviceLocked { name: device.name.clone() }.into()); }
@@ -96,7 +96,7 @@ impl IOSDevelopment {
                 "--terminate-existing", "--console", "--json-output",
             ])
             .arg(&launch_result).arg(identifier).arg("--").args(arguments).status()
-            .map_err(|error| Error::XcrunLaunchError(error.to_string()))?;
+            .map_err(|error| Error::XcrunLaunch(error.to_string()))?;
         if status.success() { return Ok(()); }
         if status.code() == Some(1) {
             let document = fs::read(&launch_result).ok()
@@ -143,7 +143,7 @@ impl IOSDevelopment {
             .args(["manage", "pair", "--device", &device.id, "--timeout", "60", "--json-output"])
             .arg(self.application.work().join("pairing.json"))
             .output()
-            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectl(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         let device = self.devices()?.into_iter().find(|current| current.udid == device.udid)
             .ok_or_else(|| Error::IosDeviceDisappeared { name: device.name.clone() })?;
@@ -165,7 +165,7 @@ impl IOSDevelopment {
             ])
             .arg(self.application.work().join("selected-device.json"))
             .output()
-            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectl(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         for attempt in 0..5 {
             let current = self
@@ -200,11 +200,11 @@ impl IOSDevelopment {
             .args(["list", "devices", "--timeout", "20", "--json-output"])
             .arg(&path)
             .output()
-            .map_err(|error| Error::XcrunDevicectlError(error.to_string()))?;
+            .map_err(|error| Error::XcrunDevicectl(error.to_string()))?;
         IOSApplication::check(output, "devicectl")?;
         let contents = fs::read(&path)?;
         let document: Value = serde_json::from_slice(&contents)
-            .map_err(|error| cli::Error::IntoJSONError(error.to_string()))?;
+            .map_err(|error| cli::Error::IntoJSON(error.to_string()))?;
         let values = document.pointer("/result/devices").and_then(Value::as_array)
             .ok_or(Error::IosDeviceListMissing)?;
         Ok(values.iter().filter_map(IOSDevice::read).collect())

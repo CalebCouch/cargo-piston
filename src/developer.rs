@@ -69,7 +69,8 @@ impl Credentials {
         Self::secure(&directory, true)?;
         let lock_path = directory.join("identities.lock");
         if lock_path.symlink_metadata().is_ok() { Self::secure(&lock_path, false)?; }
-        let lock = File::options().read(true).write(true).create(true).open(&lock_path).unwrap();
+        let lock = File::options().read(true).write(true).create(true).truncate(false)
+            .open(&lock_path).unwrap();
         Host::private_permissions(&lock_path, false).unwrap();
         lock.try_lock().map_err(|source| Error::DeveloperStorageLock {
             path: lock_path, source: Box::new(source),
@@ -81,7 +82,7 @@ impl Credentials {
                 serde_json::from_slice(&fs::read(&path).unwrap()).unwrap()
             }
             Err(error) if error.kind() == ErrorKind::NotFound => BTreeMap::new(),
-            Err(error) => Err(error).unwrap(),
+            Err(error) => panic!("Could not read developer identities: {error}"),
         };
         for (team, secret) in &identities { Self::validate_identity(team, secret, None)?; }
         Ok(Self {

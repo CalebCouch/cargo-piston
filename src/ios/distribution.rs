@@ -33,7 +33,7 @@ impl<'a> IOSStore<'a> {
         let name = bundle.file_stem().unwrap().to_str().unwrap();
         let work = self.application.work().join("store");
         let project = signing.project(
-            &bundle,
+            bundle,
             &work,
             self.application.entitlements().as_deref(),
             "Release",
@@ -41,7 +41,7 @@ impl<'a> IOSStore<'a> {
         let path = work.join(format!("{name}.xcarchive"));
         if path.exists() {
             fs::remove_dir_all(&path)
-                .map_err(|error| Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFile(error.to_string()))?;
         }
         let archive = IOSArchive { path, work, developer, team: signing.team().into() };
         let mut command = self.command(&archive);
@@ -59,7 +59,7 @@ impl<'a> IOSStore<'a> {
         if !archive.path.join("Info.plist").is_file()
             || !archive.path.join("Products/Applications").join(format!("{name}.app")).is_dir()
         {
-            return Err(cli::Error::IosArchiveMissing {
+            return Err(cli::Error::ArchiveMissing {
                 path: archive.path.clone(), log: archive.work.join("archive.log"),
             }.into());
         }
@@ -73,7 +73,7 @@ impl<'a> IOSStore<'a> {
         let output = self.export_archive(archive, "export")?;
         let ipa = output.join(format!("{name}.ipa"));
         if !ipa.is_file() {
-            return Err(cli::Error::IosExportMissing {
+            return Err(cli::Error::ExportMissing {
                 path: ipa, log: archive.work.join("export.log"),
             }.into());
         }
@@ -119,17 +119,17 @@ impl IOSStore<'_> {
         });
         let options_path = archive.work.join(format!("{destination}-options.plist"));
         fs::write(&options_path, serde_json::to_vec_pretty(&options).unwrap())
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         let output = Command::new("plutil")
             .args(["-convert", "xml1"])
             .arg(&options_path)
             .output()
-            .map_err(|error| crate::apple::cli::Error::PlutilConvertError(error.to_string()))?;
+            .map_err(|error| crate::apple::cli::Error::PlutilConvert(error.to_string()))?;
         IOSApplication::check(output, "plutil")?;
         let output = archive.work.join(destination);
         if output.exists() {
             fs::remove_dir_all(&output)
-                .map_err(|error| Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| Error::WriteFile(error.to_string()))?;
         }
         let mut command = self.command(archive);
         command
@@ -146,9 +146,9 @@ impl IOSStore<'_> {
 
     fn run(mut command: Command, log_path: &Path) -> Result<()> {
         let log = File::create(log_path)
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         let stderr = log.try_clone()
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         let status = command.stdout(Stdio::from(log)).stderr(Stdio::from(stderr)).status()
             .map_err(|source| Error::CommandLogged {
                 log: log_path.to_path_buf(), diagnostics: String::new(),
@@ -158,7 +158,7 @@ impl IOSStore<'_> {
         let output = fs::read_to_string(log_path).unwrap_or_default();
         let lower = output.to_lowercase();
         let push = lower.contains("push notifications") || lower.contains("aps-environment");
-        let error = cli::Error::IosDistributionFailed { log: log_path.to_path_buf(), output, status };
+        let error = cli::Error::DistributionFailed { log: log_path.to_path_buf(), output, status };
         Err(if push {
             Error::SetupRequired {
                 error: error.into(),

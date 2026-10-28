@@ -42,9 +42,9 @@ pub enum Error {
     IosResourceInvalid { path: PathBuf },
     IosResourceConflict { path: PathBuf },
     IosImageAssetCreate { path: PathBuf, source: std::io::Error },
-    XcrunDevicectlError(String),
-    XcrunInstallError(String),
-    XcrunLaunchError(String),
+    XcrunDevicectl(String),
+    XcrunInstall(String),
+    XcrunLaunch(String),
 }
 
 impl std::fmt::Display for Error {
@@ -118,11 +118,11 @@ impl std::fmt::Display for Error {
             Self::IosImageAssetCreate { path, source } => write!(f,
                 "Cannot create image asset {}; resource image names must be unique: {source}",
                 path.display()),
-            Self::XcrunDevicectlError(err) => f.write_str(err),
-            Self::XcrunInstallError(err) => {
+            Self::XcrunDevicectl(err) => f.write_str(err),
+            Self::XcrunInstall(err) => {
                 write!(f, "Error installing app bundle to target device via xcrun: {}", err)
             }
-            Self::XcrunLaunchError(err) => {
+            Self::XcrunLaunch(err) => {
                 write!(f, "Error launching app bundle on target device via xcrun: {}", err)
             }
         }

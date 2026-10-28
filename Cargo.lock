@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-piston"
-version = "0.5.7"
+version = "0.5.8"
 dependencies = [
  "air",
  "air_notifications",
@@ -609,7 +609,6 @@ dependencies = [
  "image",
  "jsonwebtoken",
  "plist",
- "regex",
  "serde",
  "serde_json",
  "sha2",

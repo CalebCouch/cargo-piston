@@ -107,17 +107,15 @@ impl Cli {
     pub fn credentials(manifest: &Manifest, requested_team: Option<&str>, select: bool) -> Result<(Credentials, String)> {
         let mut store = Credentials::new()?;
         let saved = manifest.settings(&["developer"])?;
-        if !select {
-            if let (Some(team), Some(identity)) = (saved.get("team"), saved.get("identity")) {
-                if requested_team.is_none_or(|requested| requested == team) {
-                    match store.identity(team, Some(identity)) {
-                        Ok(Some(_)) => return Ok((store, team.clone())),
-                        Ok(None) => (),
-                        Err(error) if matches!(error.downcast_ref::<Error>(),
-                            Some(Error::IdentityOwnerMismatch)) => (),
-                        Err(error) => return Err(error),
-                    }
-                }
+        if !select
+            && let (Some(team), Some(identity)) = (saved.get("team"), saved.get("identity"))
+            && requested_team.is_none_or(|requested| requested == team) {
+            match store.identity(team, Some(identity)) {
+                Ok(Some(_)) => return Ok((store, team.clone())),
+                Ok(None) => (),
+                Err(error) if matches!(error.downcast_ref::<Error>(),
+                    Some(Error::IdentityOwnerMismatch)) => (),
+                Err(error) => return Err(error),
             }
         }
         let identities: Vec<_> = store.identities().into_iter()

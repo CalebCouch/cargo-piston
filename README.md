@@ -88,7 +88,7 @@ out. The Android development path packages Maverick's Gradle bridge instead.
 Cargo piston is a global cargo crate. There are two ways you can install it. Choose option one unless you have a reason not to.
 
 1. Globally install the crate directly with
-`cargo install cargo-piston --locked`
+`cargo install cargo-piston --version 0.5.8 --locked`
 
 2. Or clone the source with `git clone https://github.com/CalebCouch/cargo-piston`
 and install it with `cargo install --locked --path </path/to/cargo-piston>`.
@@ -166,10 +166,24 @@ On macOS, `cargo piston dev linux` uses Lima and a dedicated desktop window. Pis
 installs Lima through Homebrew when needed, creates an Ubuntu VM, installs the
 guest build and desktop dependencies, copies the project and local dependencies,
 and builds inside Linux. The default VM uses two CPUs, 4 GiB RAM, and a sparse
-24 GiB disk. Setup provides 2 GiB of disk-backed swap for build memory peaks.
+64 GiB disk. This is a capacity limit; the disk consumes host space as data is written.
+Setup provides 2 GiB of disk-backed swap for build memory peaks.
 Rust `target` directories are excluded from source copies at every depth.
 Piston replaces its previous source copy and removes temporary transfer archives;
 the Linux Cargo build cache remains in the VM for later runs. Host folders are not mounted.
+
+Existing VMs keep their configured disk capacity. If a build reports `No space left
+on device`, check both the Mac's free space and the VM's disk capacity. With the VM
+stopped, grow its disk using the saved `lima` executable and `vm` name:
+
+```sh
+limactl edit --tty=false --disk=64 <vm-name>
+```
+
+Set `LIMA_HOME` to the project's saved `lima_home` value if it points outside the
+default `~/.lima`. Choose a larger size if the VM already has a 64 GiB disk. Growing the disk
+preserves its build cache and application data; rerun `cargo piston dev linux`
+afterward.
 
 Closing the window, stopping with Ctrl-C, or a build/run failure shuts down the
 VM started by that command. Piston refuses to take over an already-running VM.

@@ -41,7 +41,7 @@ impl LinuxBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| Error::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParse(e.to_string()))?;
 
         let icon_path = Project::get_icon_path(&metadata, &cwd);
         let assets = Project::get_assets_path(&metadata);
@@ -75,7 +75,7 @@ impl LinuxBuilder {
     fn pre_build(&self) -> Result<()> {
         let path = self.output_path.as_path();
         Project::empty_directory(path, &["assets"])?;
-        create_dir_all(path).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(path).map_err(|e| Error::CreateDirAll {
             path: self.output_path.clone(),
             source: e,
         })?;
@@ -85,62 +85,53 @@ impl LinuxBuilder {
     fn build(&self) -> Result<()> {
         self.toolchain.build(&self.target, self.release, &self.cwd)
     }
-}
 
-#[derive(Debug)]
-struct AppImage;
-impl AppImage {
-    /// Builds a complete, standalone AppImage and returns the path to the final file.
-    fn build(
-        app_name: String, runtime_path: Option<String>, target: String, binary_path: PathBuf,
-        output_dir: PathBuf, icon_path: PathBuf, description: Option<String>,
-        assets: Option<PathBuf>,
-    ) -> Result<PathBuf> {
-        let appimage_name = format!("{}.AppImage", app_name);
-        let final_appimage = output_dir.join(&appimage_name);
+    fn build_appimage(&self, binary_path: &Path) -> Result<PathBuf> {
+        let appimage_name = format!("{}.AppImage", self.app_name);
+        let final_appimage = self.output_path.join(&appimage_name);
 
         let mut fs = FilesystemWriter::default();
 
-        let appdir_prefix = format!("{}.AppDir", app_name);
+        let appdir_prefix = format!("{}.AppDir", self.app_name);
 
         fs.push_dir_all(
-            &format!("{appdir_prefix}/usr/bin"),
+            format!("{appdir_prefix}/usr/bin"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
         fs.push_dir_all(
-            &format!("{appdir_prefix}/usr/share/applications"),
+            format!("{appdir_prefix}/usr/share/applications"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
         fs.push_dir_all(
-            &format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps"),
+            format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
         {
-            let binary_data = fs::read(&binary_path).map_err(|e| {
-                Error::ReadFile { path: binary_path.clone(), source: e }
+            let binary_data = fs::read(binary_path).map_err(|e| {
+                Error::ReadFile { path: binary_path.to_path_buf(), source: e }
             })?;
 
             fs.push_file(
                 Cursor::new(binary_data),
-                &format!("{appdir_prefix}/usr/bin/{}", &app_name),
+                format!("{appdir_prefix}/usr/bin/{}", self.app_name),
                 NodeHeader { permissions: 0o755, ..NodeHeader::default() },
             )
-            .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+            .map_err(|e| cli::Error::Image(e.to_string()))?;
         }
 
-        let apprun_content = format!("#!/bin/sh\nexec \"$APPDIR/usr/bin/{}\" \"$@\"\n", app_name);
+        let apprun_content = format!("#!/bin/sh\nexec \"$APPDIR/usr/bin/{}\" \"$@\"\n", self.app_name);
         fs.push_file(
             Cursor::new(apprun_content.into_bytes()),
-            &format!("{appdir_prefix}/AppRun"),
+            format!("{appdir_prefix}/AppRun"),
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
         let desktop_content = format!(
             r#"[Desktop Entry]
@@ -149,69 +140,66 @@ Exec=AppRun
 Icon={}
 Type=Application
 Categories=Utility;
-Comment={}
+Comment=Rust application
 "#,
-            app_name,
-            app_name,
-            description.as_deref().unwrap_or("Rust application")
+            self.app_name, self.app_name,
         );
         fs.push_file(
             Cursor::new(desktop_content.into_bytes()),
-            &format!("{appdir_prefix}/{}.desktop", app_name),
+            format!("{appdir_prefix}/{}.desktop", self.app_name),
             NodeHeader { permissions: 0o644, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
         let icon_dest =
-            format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps/{}.png", app_name);
+            format!("{appdir_prefix}/usr/share/icons/hicolor/256x256/apps/{}.png", self.app_name);
 
         {
-            let file = fs::read(&icon_path).map_err(|e| {
-                Error::ReadFile { path: icon_path.clone(), source: e }
+            let file = fs::read(&self.icon_path).map_err(|e| {
+                Error::ReadFile { path: self.icon_path.clone().into(), source: e }
             })?;
 
-            let mut header = NodeHeader::default();
-            header.permissions = 0o644;
+            let header = NodeHeader {permissions: 0o644, ..NodeHeader::default()};
 
             fs.push_file(Cursor::new(file), &icon_dest, header).map_err(|e| {
-                cli::Error::LinuxImageError(e.to_string())
+                cli::Error::Image(e.to_string())
             })?;
         }
 
         let dir_icon = format!("{appdir_prefix}/.DirIcon");
-        let root_icon = format!("{appdir_prefix}/{}.png", app_name);
+        let root_icon = format!("{appdir_prefix}/{}.png", self.app_name);
 
         fs.push_symlink(
             icon_dest.clone(),
             &dir_icon,
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
         fs.push_symlink(
             icon_dest,
             &root_icon,
             NodeHeader { permissions: 0o755, ..NodeHeader::default() },
         )
-        .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+        .map_err(|e| cli::Error::Image(e.to_string()))?;
 
-        if let Some(assets) = &assets {
+        let assets = Path::new(&self.assets);
+        if assets.exists() {
             let base_dest = format!("{appdir_prefix}/assets");
 
             fs.push_dir_all(&base_dest, NodeHeader { permissions: 0o755, ..NodeHeader::default() })
-                .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+                .map_err(|e| cli::Error::Image(e.to_string()))?;
 
             Self::add_assets(&mut fs, assets, &base_dest)?;
         }
 
-        let squash_path = output_dir.join(format!("{}.squashfs", app_name));
+        let squash_path = self.output_path.join(format!("{}.squashfs", self.app_name));
         let mut squash_file = File::create(&squash_path)
-            .map_err(|source| Error::CreateFileError { path: squash_path.clone(), source })?;
+            .map_err(|source| Error::CreateFile { path: squash_path.clone(), source })?;
         fs.write(&mut squash_file)
-            .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+            .map_err(|e| cli::Error::Image(e.to_string()))?;
 
-        let binding = runtime_path.unwrap();
-        let runtime_dir = Path::new(&binding);
-        let runtime_filename = match target.as_str() {
+        let runtime_dir = Path::new(self.runtime_path.as_ref().unwrap());
+        let runtime_filename = match self.target.as_str() {
             t if t.starts_with("x86_64") => "runtime-x86_64",
             t if t.starts_with("aarch64") => "runtime-aarch64",
             t if t.starts_with("armv7") || t.starts_with("arm-") || t.starts_with("armv6") => {
@@ -221,28 +209,30 @@ Comment={}
             t if t.starts_with("ppc64le") => "runtime-ppc64le",
             t if t.starts_with("riscv64") => "runtime-riscv64",
             _ => {
-                return Err(cli::Error::LinuxAppImageTargetUnsupported { target }.into());
+                return Err(cli::Error::AppImageTargetUnsupported {
+                    target: self.target.clone(),
+                }.into());
             }
         };
         let runtime_path = runtime_dir.join(runtime_filename);
         if !runtime_path.exists() {
-            return Err(cli::Error::LinuxRuntimeMissing { path: runtime_path }.into());
+            return Err(cli::Error::RuntimeMissing { path: runtime_path }.into());
         }
 
         let mut runtime = File::open(&runtime_path)
             .map_err(|source| Error::ReadFile { path: runtime_path.clone(), source })?;
 
         let mut appimage_file = File::create(&final_appimage)
-            .map_err(|source| Error::CreateFileError { path: final_appimage.clone(), source })?;
+            .map_err(|source| Error::CreateFile { path: final_appimage.clone(), source })?;
 
-        io::copy(&mut runtime, &mut appimage_file).map_err(|source| Error::CopyFileError {
+        io::copy(&mut runtime, &mut appimage_file).map_err(|source| Error::CopyFile {
             input_path: runtime_path, output_path: final_appimage.clone(), source,
         })?;
 
         let mut squash = File::open(&squash_path)
             .map_err(|source| Error::ReadFile { path: squash_path.clone(), source })?;
 
-        io::copy(&mut squash, &mut appimage_file).map_err(|source| Error::CopyFileError {
+        io::copy(&mut squash, &mut appimage_file).map_err(|source| Error::CopyFile {
             input_path: squash_path.clone(), output_path: final_appimage.clone(), source,
         })?;
 
@@ -255,10 +245,10 @@ Comment={}
     }
 
     fn add_assets(fs: &mut FilesystemWriter, source_dir: &Path, dest_base: &str) -> Result<()> {
-        for entry in fs::read_dir(source_dir).map_err(|source| Error::ReadDirError {
+        for entry in fs::read_dir(source_dir).map_err(|source| Error::ReadDir {
             path: source_dir.into(), source,
         })? {
-            let entry = entry.map_err(|source| Error::MapDirError {
+            let entry = entry.map_err(|source| Error::MapDir {
                 path: source_dir.into(), source,
             })?;
             let path = entry.path();
@@ -271,7 +261,7 @@ Comment={}
                     &dest_path,
                     NodeHeader { permissions: 0o755, ..NodeHeader::default() },
                 )
-                .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+                .map_err(|e| cli::Error::Image(e.to_string()))?;
                 Self::add_assets(fs, &path, &dest_path)?;
             } else {
                 let data = fs::read(&path)
@@ -282,10 +272,27 @@ Comment={}
                     &dest_path,
                     NodeHeader { permissions: 0o644, ..NodeHeader::default() },
                 )
-                .map_err(|e| cli::Error::LinuxImageError(e.to_string()))?;
+                .map_err(|e| cli::Error::Image(e.to_string()))?;
             }
         }
         Ok(())
+    }
+
+    fn post_build(&self) -> Result<PathBuf> {
+        let binary_path = self.cwd.join("target").join(&self.target)
+            .join(if self.release { "release" } else { "debug" }).join(&self.app_name);
+        if self.appimage {
+            if self.runtime_path.is_none() {
+                return Err(Error::MissingSetting { key: "linux_runtime_path".into() }.into());
+            }
+            self.build_appimage(&binary_path)
+        } else {
+            let target_path = self.output_path.join(&self.app_name);
+            copy(&binary_path, &target_path).map_err(|source| Error::CopyFile {
+                input_path: binary_path, output_path: target_path.clone(), source,
+            })?;
+            Ok(target_path)
+        }
     }
 }
 
@@ -312,7 +319,7 @@ impl GPGSigner {
         })?;
         if let Some(pass) = key_pass {
             child.stdin.take().unwrap().write_all(pass.as_bytes())
-                .map_err(cli::Error::LinuxSigningInput)?;
+                .map_err(cli::Error::SigningInput)?;
         }
         let output = child.wait_with_output().map_err(|source| Error::CommandWait {
             program: command.get_program().into(), source,
@@ -323,29 +330,5 @@ impl GPGSigner {
             }.into());
         }
         Ok(sig_path)
-    }
-}
-
-impl LinuxBuilder {
-    fn post_build(&self) -> Result<PathBuf> {
-        let binary_path = self.cwd.join("target").join(&self.target)
-            .join(if self.release { "release" } else { "debug" }).join(&self.app_name);
-        let assets = PathBuf::from(&self.assets);
-        if self.appimage {
-            if self.runtime_path.is_none() {
-                return Err(Error::MissingSetting { key: "linux_runtime_path".into() }.into());
-            }
-            AppImage::build(
-                self.app_name.clone(), self.runtime_path.clone(), self.target.clone(),
-                binary_path, self.output_path.clone(), PathBuf::from(&self.icon_path), None,
-                assets.exists().then_some(assets),
-            )
-        } else {
-            let target_path = self.output_path.join(&self.app_name);
-            copy(&binary_path, &target_path).map_err(|source| Error::CopyFileError {
-                input_path: binary_path, output_path: target_path.clone(), source,
-            })?;
-            Ok(target_path)
-        }
     }
 }

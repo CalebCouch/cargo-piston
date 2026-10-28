@@ -48,7 +48,7 @@ impl AndroidBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| Error::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParse(e.to_string()))?;
 
         let lib_name = Project::get_lib_name(&metadata)?;
         let icon_path = Project::get_icon_path(&metadata, &cwd);
@@ -63,7 +63,7 @@ impl AndroidBuilder {
             .join("androidbuilder");
         Project::empty_directory(build_path.as_path(), &["assets"])?;
         create_dir_all(&build_path)
-            .map_err(|e| Error::CreateDirAllError { path: build_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: build_path.clone(), source: e })?;
         let manifest_path: PathBuf = build_path.join("AndroidManifest.xml");
         let resources_path: PathBuf = build_path.join("app").join("src").join("main").join("res");
         manifest.write_to(&manifest_path)?;
@@ -94,7 +94,7 @@ impl AndroidBuilder {
     fn pre_build(&self) -> Result<()> {
         let path = self.resources.as_path();
         Project::empty_directory(path, &[])?;
-        create_dir_all(&self.resources).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(&self.resources).map_err(|e| Error::CreateDirAll {
             path: self.resources.clone(),
             source: e,
         })?;
@@ -104,14 +104,14 @@ impl AndroidBuilder {
         let xxhdpi_path: PathBuf = self.resources.join("mipmap-xxhdpi");
         let xxxhdpi_path: PathBuf = self.resources.join("mipmap-xxxhdpi");
         create_dir_all(&hdpi_path)
-            .map_err(|e| Error::CreateDirAllError { path: hdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: hdpi_path.clone(), source: e })?;
         create_dir_all(&mdpi_path)
-            .map_err(|e| Error::CreateDirAllError { path: mdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: mdpi_path.clone(), source: e })?;
         create_dir_all(&xhdpi_path)
-            .map_err(|e| Error::CreateDirAllError { path: xhdpi_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: xhdpi_path.clone(), source: e })?;
         create_dir_all(&xxhdpi_path)
-            .map_err(|e| Error::CreateDirAllError { path: xxhdpi_path.clone(), source: e })?;
-        create_dir_all(&xxxhdpi_path).map_err(|e| Error::CreateDirAllError {
+            .map_err(|e| Error::CreateDirAll { path: xxhdpi_path.clone(), source: e })?;
+        create_dir_all(&xxxhdpi_path).map_err(|e| Error::CreateDirAll {
             path: xxxhdpi_path.clone(),
             source: e,
         })?;
@@ -144,7 +144,7 @@ impl AndroidBuilder {
         let base_dir = self.build_path.join("base");
         Project::empty_directory(&base_dir, &["assets"])?;
         create_dir_all(&base_dir)
-            .map_err(|e| Error::CreateDirAllError { path: base_dir.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: base_dir.clone(), source: e })?;
         self.link_manifest_and_resources(&resources, &base_dir)?;
         let assets_src = Path::new(&self.assets);
         let assets_base = &base_dir.join("assets");
@@ -247,7 +247,7 @@ impl AndroidBuilder {
     fn compile_resources(&self) -> Result<PathBuf> {
         let compiled_res = self.build_path.join("compiled_resources.zip");
         if compiled_res.exists() {
-            remove_file(&compiled_res).map_err(|e| Error::RemoveFileError {
+            remove_file(&compiled_res).map_err(|e| Error::RemoveFile {
                 path: compiled_res.to_path_buf(),
                 source: e,
             })?;
@@ -308,12 +308,12 @@ impl AndroidBuilder {
         if proto_manifest_root.exists() {
             let manifest_dir = base_dir.join("manifest");
             Project::empty_directory(&manifest_dir, &[])?;
-            create_dir_all(&manifest_dir).map_err(|e| Error::CreateDirAllError {
+            create_dir_all(&manifest_dir).map_err(|e| Error::CreateDirAll {
                 path: manifest_dir.clone(),
                 source: e,
             })?;
             rename(&proto_manifest_root, manifest_dir.join("AndroidManifest.xml")).map_err(
-                |e| Error::RenameFileError { path: proto_manifest_root.clone(), source: e },
+                |e| Error::RenameFile { path: proto_manifest_root.clone(), source: e },
             )?;
         } else {
             return Err(cli::Error::AndroidManifestMissing { path: proto_manifest_root }.into());
@@ -325,13 +325,13 @@ impl AndroidBuilder {
         let abi = match target {
             "aarch64-linux-android" => "arm64-v8a",
             _ => {
-                return Err(Error::UnsupportedTargetError(target.into()).into());
+                return Err(Error::UnsupportedTarget(target.into()).into());
             }
         };
         let lib_dir = base_dir.join("lib").join(abi);
         Project::empty_directory(&lib_dir, &[])?;
         create_dir_all(&lib_dir)
-            .map_err(|e| Error::CreateDirAllError { path: lib_dir.clone(), source: e })?;
+            .map_err(|e| Error::CreateDirAll { path: lib_dir.clone(), source: e })?;
 
         let lib_file = format!("lib{}.so", self.lib_name);
         let so_path = self
@@ -341,7 +341,7 @@ impl AndroidBuilder {
             .join(if self.release { "release" } else { "debug" })
             .join(&lib_file);
         copy(&so_path, lib_dir.join(&lib_file))
-            .map_err(|e| Error::CopyFileError {
+            .map_err(|e| Error::CopyFile {
                 input_path: so_path.clone(), output_path: lib_dir.join(&lib_file), source: e,
             })?;
 
@@ -351,14 +351,14 @@ impl AndroidBuilder {
     /* Retained until the photo picker moves into Maverick's Android integration.
     fn add_activity_dex(&self, base_dir: &Path) -> Result<()> {
         let dex_dir = base_dir.join("dex");
-        create_dir_all(&dex_dir).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(&dex_dir).map_err(|e| Error::CreateDirAll {
             path: dex_dir.clone(), source: e,
         })?;
 
         let dex_path =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("src/android_activity/classes.dex");
         copy(&dex_path, dex_dir.join("classes.dex")).map_err(|e| {
-            Error::BuildError(e.to_string())
+            Error::Build(e.to_string())
         })?;
 
         Ok(())
@@ -368,7 +368,7 @@ impl AndroidBuilder {
     fn zip_base(&self, base_dir: &Path) -> Result<()> {
         let zip_path = self.build_path.join("base.zip");
         if zip_path.exists() {
-            remove_file(&zip_path).map_err(|e| Error::RemoveFileError {
+            remove_file(&zip_path).map_err(|e| Error::RemoveFile {
                 path: zip_path.to_path_buf(),
                 source: e,
             })?;
@@ -389,7 +389,7 @@ impl AndroidBuilder {
 
     fn build_bundle(&self, base_zip: &Path, aab_path: &Path) -> Result<()> {
         if aab_path.exists() {
-            remove_file(&aab_path).map_err(|e| Error::RemoveFileError {
+            remove_file(aab_path).map_err(|e| Error::RemoveFile {
                 path: aab_path.to_path_buf(),
                 source: e,
             })?;
@@ -428,7 +428,7 @@ impl AndroidBuilder {
         );
 
         if let Some(parent) = Path::new(&keystore_path).parent() {
-            create_dir_all(parent).map_err(|e| Error::CreateDirAllError {
+            create_dir_all(parent).map_err(|e| Error::CreateDirAll {
                 path: parent.to_path_buf(),
                 source: e,
             })?;
@@ -440,13 +440,13 @@ impl AndroidBuilder {
             .arg("-genkeypair")
             .arg("-v")
             .arg("-keystore")
-            .arg(&keystore_path)
+            .arg(keystore_path)
             .arg("-storepass")
-            .arg(&pass)
+            .arg(pass)
             .arg("-keypass")
-            .arg(&pass)
+            .arg(pass)
             .arg("-alias")
-            .arg(&alias)
+            .arg(alias)
             .arg("-keyalg")
             .arg("RSA")
             .arg("-keysize")
@@ -547,17 +547,16 @@ impl AndroidBuilder {
 
     fn directory_names(path: &Path) -> Result<Vec<String>> {
         let entries = read_dir(path)
-            .map_err(|e| Error::ReadDirError { path: path.into(), source: e })?;
+            .map_err(|e| Error::ReadDir { path: path.into(), source: e })?;
         let mut names = Vec::new();
         for entry in entries {
             let entry =
-                entry.map_err(|e| Error::MapDirError { path: path.into(), source: e })?;
+                entry.map_err(|e| Error::MapDir { path: path.into(), source: e })?;
             let file_type = entry
                 .file_type()
-                .map_err(|e| Error::MapDirError { path: entry.path(), source: e })?;
-            if file_type.is_dir() {
-                if let Some(name) = entry.file_name().to_str() { names.push(name.to_string()); }
-            }
+                .map_err(|e| Error::MapDir { path: entry.path(), source: e })?;
+            if file_type.is_dir()
+                && let Some(name) = entry.file_name().to_str() { names.push(name.to_string()); }
         }
         Ok(names)
     }
@@ -578,16 +577,13 @@ impl AndroidRunner {
         let apk_path = cwd.join(format!("{}.apks", app_name));
         let bundle_cmd = format!(
             "java -jar {} build-apks --bundle={} --output={} --connected-device --overwrite --adb {}",
-            &bundletool_path,
-            &aab_path.display(),
-            &apk_path.display(),
-            &adb_path
+            bundletool_path, aab_path.display(), apk_path.display(), adb_path,
         );
 
         let output = Command::new("bash")
             .arg("-c")
             .arg(&bundle_cmd)
-            .env("JAVA_HOME", &java_path)
+            .env("JAVA_HOME", java_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
@@ -597,16 +593,13 @@ impl AndroidRunner {
         }
         let bundle_cmd = format!(
             "java -jar {} install-apks --apks={} --device-id={} --adb {}",
-            &bundletool_path,
-            &apk_path.display(),
-            device_id,
-            &adb_path,
+            bundletool_path, apk_path.display(), device_id, adb_path,
         );
 
         let output = Command::new("bash")
             .arg("-c")
             .arg(&bundle_cmd)
-            .env("JAVA_HOME", &java_path)
+            .env("JAVA_HOME", java_path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .output()
@@ -615,7 +608,7 @@ impl AndroidRunner {
             return Err(Error::CommandFailed { program: "bash".into(), output }.into());
         }
         let launch = format!("{}/android.app.NativeActivity", package);
-        let adb_cmd = format!("{} shell am start -n {}", &adb_path, &launch,);
+        let adb_cmd = format!("{} shell am start -n {}", adb_path, launch);
 
         let output = Command::new("bash")
             .arg("-c")
@@ -670,7 +663,7 @@ impl AndroidManifest {
             package.metadata.get("android").cloned().unwrap_or(Value::Object(Default::default()));
         let android_meta: AndroidMetadata =
             serde_json::from_value(android_meta_value).map_err(|e| {
-                cli::Error::ParseManifestError(e.to_string())
+                cli::Error::ParseManifest(e.to_string())
             })?;
         Ok(Self {
             package: android_meta.package.unwrap_or(format!("com.example.{}", crate_name)),
@@ -729,12 +722,12 @@ impl AndroidManifest {
 
     fn write_to(&self, dir: &Path) -> Result<()> {
         let file = File::create(dir).map_err(|e| {
-            Error::CreateFileError { path: dir.into(), source: e }
+            Error::CreateFile { path: dir.into(), source: e }
         })?;
 
         let mut writer = BufWriter::new(file);
         writer.write_all(self.to_xml().as_bytes()).map_err(|e| {
-            cli::Error::WriteManifestError(e.to_string())
+            cli::Error::WriteManifest(e.to_string())
         })?;
 
         Ok(())

@@ -41,7 +41,7 @@ impl Host {
 
     pub fn default_target() -> &'static str { "linux" }
     pub fn require_apple_tools(target: &str) -> Result<()> {
-        Err(Error::UnsupportedOSError { os: "linux".into(), target: target.into() }.into())
+        Err(Error::UnsupportedOS { os: "linux".into(), target: target.into() }.into())
     }
 
     pub fn find_files(_name: &str) -> Result<Vec<PathBuf>> { Ok(Vec::new()) }

@@ -10,15 +10,15 @@ use crate::cli::ApplicationArgs;
 pub enum Platform { Macos, Ios, Android, Linux, }
 
 #[derive(Debug)]
-pub enum Error { NotificationSetupPlatform, DevicePlatform, VirtualMachinePlatform }
+pub enum Error { NotificationSetup, Device, VirtualMachine }
 
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::NotificationSetupPlatform =>
+            Self::NotificationSetup =>
                 "Notification --setup requires macOS or a physical iOS device.",
-            Self::DevicePlatform => "Use --device or --simulator with dev ios or dev android.",
-            Self::VirtualMachinePlatform => "Use --vm, --lima, and --lima-home with dev linux.",
+            Self::Device => "Use --device or --simulator with dev ios or dev android.",
+            Self::VirtualMachine => "Use --vm, --lima, and --lima-home with dev linux.",
         })
     }
 }
@@ -62,17 +62,17 @@ impl Cli {
         if args.setup && (args.simulator
             || matches!(args.platform, Some(Platform::Android | Platform::Linux)))
         {
-            return Err(Error::NotificationSetupPlatform.into());
+            return Err(Error::NotificationSetup.into());
         }
         if (args.device.is_some() || args.simulator)
             && !matches!(args.platform, Some(Platform::Ios | Platform::Android))
         {
-            return Err(Error::DevicePlatform.into());
+            return Err(Error::Device.into());
         }
         if (args.vm.is_some() || args.lima.is_some() || args.lima_home.is_some())
             && !matches!(args.platform, Some(Platform::Linux))
         {
-            return Err(Error::VirtualMachinePlatform.into());
+            return Err(Error::VirtualMachine.into());
         }
         let manifest = Project::manifest(&args.application.cargo)?;
         let (_, team) = developer::Cli::credentials(&manifest, args.application.team.as_deref(), false)?;

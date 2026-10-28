@@ -46,12 +46,12 @@ impl IOSArtwork {
                 cli::Error::StoreScreenshotFolder { path: directory.clone(), source }
             })?;
             let entries = fs::read_dir(&directory).map_err(|source| {
-                crate::cli::Error::ReadDirError { path: directory.clone(), source }
+                crate::cli::Error::ReadDir { path: directory.clone(), source }
             })?;
             let mut paths = Vec::new();
             for entry in entries {
                 let entry = entry.map_err(|source| {
-                    crate::cli::Error::MapDirError { path: directory.clone(), source }
+                    crate::cli::Error::MapDir { path: directory.clone(), source }
                 })?;
                 if entry.file_name() == ".DS_Store" { continue; }
                 let path = entry.path();
@@ -101,7 +101,7 @@ impl IOSArtwork {
             }
             let directory = output.join(family.directory());
             fs::create_dir_all(&directory).map_err(|source| {
-                crate::cli::Error::CreateDirAllError { path: directory.clone(), source }
+                crate::cli::Error::CreateDirAll { path: directory.clone(), source }
             })?;
             let directory = fs::canonicalize(&directory).map_err(|source| {
                 crate::cli::Error::ReadFile { path: directory.clone(), source }
@@ -162,11 +162,11 @@ impl IOSArtwork {
         };
         if path.symlink_metadata().is_ok() {
             fs::remove_file(&path).map_err(|source| {
-                crate::cli::Error::RemoveFileError { path: path.clone(), source }
+                crate::cli::Error::RemoveFile { path: path.clone(), source }
             })?;
         }
         let file = File::create_new(&path).map_err(|source| {
-            crate::cli::Error::CreateFileError { path: path.clone(), source }
+            crate::cli::Error::CreateFile { path: path.clone(), source }
         })?;
         let mut writer = BufWriter::new(file);
         let mut encoder = PngEncoder::new(&mut writer);

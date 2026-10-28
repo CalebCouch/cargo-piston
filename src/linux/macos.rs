@@ -47,13 +47,12 @@ impl LinuxDevelopment {
         let name =
             args.vm.or(settings.get("vm").cloned()).unwrap_or_else(|| format!("piston-{identity}"));
         Self::validate_name(&name)?;
-        if args.lima_home.is_none() {
-            if let Some(value) = manifest.setting(&["linux", "lima_home"])? {
-                let path = value.as_str().ok_or_else(|| cli::Error::ManifestStringRequired {
-                    path: manifest.path().to_owned(), key: "linux.lima_home".into(),
-                })?;
-                Self::validate_home(Path::new(path))?;
-            }
+        if args.lima_home.is_none()
+            && let Some(value) = manifest.setting(&["linux", "lima_home"])? {
+            let path = value.as_str().ok_or_else(|| cli::Error::ManifestStringRequired {
+                path: manifest.path().to_owned(), key: "linux.lima_home".into(),
+            })?;
+            Self::validate_home(Path::new(path))?;
         }
         let lima = match args.lima {
             Some(path) => {
@@ -144,7 +143,7 @@ impl LinuxDevelopment {
         let pending_binary = binary.with_extension("pending");
         Project::write(&pending, include_str!("viewer.swift"))?;
         fs::create_dir_all(binary.parent().unwrap())
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         self.run(
             Command::new("xcrun")
                 .env("DEVELOPER_DIR", developer)
@@ -154,9 +153,9 @@ impl LinuxDevelopment {
                 .arg(&pending_binary),
         )?;
         fs::rename(&pending_binary, &binary)
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         fs::rename(&pending, &source)
-            .map_err(|error| Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| Error::WriteFile(error.to_string()))?;
         Ok(())
     }
 
@@ -173,7 +172,7 @@ impl LinuxDevelopment {
         ]));
         let mut contents = Vec::new();
         info.to_writer_xml(&mut contents)
-            .map_err(|error| cli::Error::WritePlUtilError(error.to_string()))?;
+            .map_err(|error| cli::Error::WritePlUtil(error.to_string()))?;
         Project::write(&self.project.work.join("Piston Linux.app/Contents/Info.plist"), contents)
     }
 
@@ -201,7 +200,7 @@ impl LinuxDevelopment {
                     "--vm-type=vz",
                     "--cpus=2",
                     "--memory=4",
-                    "--disk=24",
+                    "--disk=64",
                     "--mount-none",
                     "--containerd=none",
                     "--image-variant=minimal",
@@ -228,8 +227,9 @@ impl LinuxDevelopment {
 
     pub fn sync(&self) -> Result<()> {
         let metadata = self.project.dependencies()?;
-        let mut roots = BTreeSet::from([self.project.workspace.clone()]);
-        let mut manifests = BTreeSet::from([self.project.workspace.join("Cargo.toml")]);
+        let workspace = metadata.workspace_root.into_std_path_buf();
+        let mut roots = BTreeSet::from([workspace.clone()]);
+        let mut manifests = BTreeSet::from([workspace.join("Cargo.toml")]);
         for package in metadata.packages.iter().filter(|package| package.source.is_none()) {
             let manifest = package.manifest_path.clone().into_std_path_buf();
             roots.insert(manifest.parent().unwrap().to_owned());
@@ -250,7 +250,8 @@ impl LinuxDevelopment {
             ])
             .arg(format!(
                 "--exclude={}",
-                self.project.target_dir.strip_prefix("/").unwrap().display()
+                self.project.args.cargo.target_dir.as_ref().unwrap()
+                    .strip_prefix("/").unwrap().display()
             ))
             .args(["-C", "/"]);
         for root in &roots { tar.arg(root.strip_prefix("/").unwrap()); }
@@ -269,7 +270,7 @@ impl LinuxDevelopment {
             )),
         )?;
         fs::remove_file(&archive)
-            .map_err(|source| Error::RemoveFileError { path: archive, source })?;
+            .map_err(|source| Error::RemoveFile { path: archive, source })?;
         let config_roots: BTreeSet<_> =
             manifests.iter().map(|path| path.parent().unwrap().to_owned()).collect();
         for root in config_roots {
@@ -450,7 +451,7 @@ impl LinuxDevelopment {
 
     pub fn stop(&mut self) -> Result<()> {
         for child in [&mut self.viewer, &mut self.desktop].into_iter().flatten() {
-            if !child.try_wait().ok().flatten().is_some() { let _ = child.kill(); }
+            if child.try_wait().ok().flatten().is_none() { let _ = child.kill(); }
             let _ = child.wait();
         }
         if !self.owned { return Ok(()); }
@@ -555,16 +556,12 @@ impl LinuxDevelopment {
             for value in array.iter_mut() {
                 if let Some(table) = value.as_inline_table_mut() {
                     for (key, value) in table.iter_mut() {
-                        if key.get() == "path" {
-                            if let Some(path) =
-                                value.as_str().filter(|path| Path::new(path).is_absolute())
-                            {
-                                *value = Value::from(
-                                    root.join(path.trim_start_matches('/'))
-                                        .to_string_lossy()
-                                        .into_owned(),
-                                );
-                            }
+                        if key.get() == "path"
+                            && let Some(path) =
+                                value.as_str().filter(|path| Path::new(path).is_absolute()) {
+                            *value = Value::from(
+                                root.join(path.trim_start_matches('/')).to_string_lossy().into_owned(),
+                            );
                         }
                     }
                 }

@@ -68,7 +68,7 @@ impl AppStoreRelease {
             .client
             .list("/v1/appAssetLibraryRefData", &[("filter[features]", "APP_STORE_VERSIONS")])?;
         let attributes = catalog.first().map(|entry| &entry["attributes"]).ok_or_else(|| {
-            cli::Error::StoreCatalogEmpty
+            cli::Error::CatalogEmpty
         })?;
         release.groups = ScreenshotGroup::read(attributes)?;
         Ok(release)
@@ -92,7 +92,7 @@ impl AppStoreRelease {
     pub fn validate(&self, screenshots: &[StoreScreenshot]) -> Result<Vec<String>> {
         let mut preserved_groups = Vec::new();
         if screenshots.is_empty() {
-            return Err(cli::Error::StoreScreenshotsMissing.into());
+            return Err(cli::Error::ScreenshotsMissing.into());
         }
         let existing = if let Some(localization) = &self.localization_id {
             self.client.list(
@@ -119,7 +119,7 @@ impl AppStoreRelease {
             }
             preserved_groups.extend(preserved.into_iter().map(str::to_owned));
             if images.len() > group.max_count {
-                return Err(cli::Error::StoreScreenshotGroupCount {
+                return Err(cli::Error::ScreenshotGroupCount {
                     group: group.id.clone(), count: images.len(), maximum: group.max_count,
                 }.into());
             }
@@ -131,7 +131,7 @@ impl AppStoreRelease {
                     .len();
                 let spec = group.specs.iter().find(|spec| spec.accepts(image)).unwrap();
                 if size == 0 || size > spec.max_file_size {
-                    return Err(cli::Error::StoreScreenshotFileSize {
+                    return Err(cli::Error::ScreenshotFileSize {
                         path: image.source().into(), size, maximum: spec.max_file_size,
                     }.into());
                 }
@@ -156,7 +156,7 @@ impl AppStoreRelease {
                         .and_then(|current| self.sync_group(group, &images, &current, original));
                     if let Err(error) = restored { recovery.push((group.clone(), error)); }
                 }
-                return Err(cli::Error::StoreScreenshotSync {
+                return Err(cli::Error::ScreenshotSync {
                     source: error, recovery,
                 }.into());
             }
@@ -172,7 +172,7 @@ impl AppStoreRelease {
                 images.iter().all(|image| group.specs.iter().any(|spec| spec.accepts(image)))
             })
             .max_by(|left, right| left.display_size.total_cmp(&right.display_size))
-            .ok_or_else(|| cli::Error::StoreScreenshotGroupMismatch {
+            .ok_or_else(|| cli::Error::ScreenshotGroupMismatch {
                 images: images.iter().map(|image| {
                     (image.source().into(), image.width(), image.height())
                 }).collect(),
@@ -189,7 +189,7 @@ impl AppStoreRelease {
                 | "METADATA_REJECTED"
                 | "DEVELOPER_REJECTED"
         ) { return Ok(()); }
-        Err(cli::Error::StoreVersionNotEditable {
+        Err(cli::Error::VersionNotEditable {
             version: version["attributes"]["versionString"].as_str().unwrap_or("").into(), state,
         }.into())
     }
@@ -260,11 +260,9 @@ impl AppStoreRelease {
             })
             .collect();
         for asset in &matching {
-            match asset["attributes"]["state"].as_str() {
-                Some("PREPARE_FOR_SUBMISSION" | "APPROVED" | "UPLOAD_COMPLETE") => {
-                    return self.wait_image(&Self::string(asset, "id")?, group);
-                }
-                _ => {}
+            if let Some("PREPARE_FOR_SUBMISSION" | "APPROVED" | "UPLOAD_COMPLETE") =
+                asset["attributes"]["state"].as_str() {
+                return self.wait_image(&Self::string(asset, "id")?, group);
             }
         }
         let pending =
@@ -302,7 +300,7 @@ impl AppStoreRelease {
                 asset = self.reserve_image(image, bytes.len(), &reference)?;
             }
         }
-        Err(cli::Error::StoreUploadUrlsRejected.into())
+        Err(cli::Error::UploadUrlsRejected.into())
     }
 
     fn reserve_image(&self, image: &StoreScreenshot, size: usize, reference: &str) -> Result<Value> {
@@ -316,20 +314,20 @@ impl AppStoreRelease {
 
     fn transfer(&self, operations: &Value, bytes: &[u8], image_id: &str) -> Result<bool> {
         let operations = operations.as_array().ok_or_else(|| {
-            cli::Error::StoreUploadOperationsMissing { image_id: image_id.into() }
+            cli::Error::UploadOperationsMissing { image_id: image_id.into() }
         })?;
         let mut parts = Vec::new();
         for operation in operations {
             let offset = operation["offset"].as_u64();
             let length = operation["length"].as_u64();
             let Some((offset, length)) = offset.zip(length) else {
-                return Err(cli::Error::StoreUploadRangeInvalid.into());
+                return Err(cli::Error::UploadRangeInvalid.into());
             };
             let end = offset
                 .checked_add(length)
                 .filter(|end| *end <= bytes.len() as u64)
                 .ok_or_else(|| {
-                    cli::Error::StoreUploadRangeTooLarge
+                    cli::Error::UploadRangeTooLarge
                 })?;
             parts.push((offset as usize, end as usize, operation));
         }
@@ -337,24 +335,24 @@ impl AppStoreRelease {
         let mut expected = 0;
         for (start, end, _) in &parts {
             if *start != expected || end <= start {
-                return Err(cli::Error::StoreUploadRangeDiscontinuous.into());
+                return Err(cli::Error::UploadRangeDiscontinuous.into());
             }
             expected = *end;
         }
         if expected != bytes.len() {
-            return Err(cli::Error::StoreUploadRangeIncomplete.into());
+            return Err(cli::Error::UploadRangeIncomplete.into());
         }
         for (start, end, operation) in parts {
             let method = Self::string(operation, "method")?;
             let url = Self::string(operation, "url")?;
             if !url.starts_with("https://") {
-                return Err(cli::Error::StoreUploadInsecureUrl.into());
+                return Err(cli::Error::UploadInsecureUrl.into());
             }
             let mut request = self.client.http.request(&method, &url);
             for header in operation["requestHeaders"].as_array().into_iter().flatten() {
                 let name = Self::string(header, "name")?;
                 if name.eq_ignore_ascii_case("authorization") {
-                    return Err(cli::Error::StoreUploadAuthorization.into());
+                    return Err(cli::Error::UploadAuthorization.into());
                 }
                 request = request.set(&name, &Self::string(header, "value")?);
             }
@@ -366,7 +364,7 @@ impl AppStoreRelease {
                         ureq::Error::Status(status, _) => Some(status),
                         ureq::Error::Transport(_) => None,
                     };
-                    return Err(cli::Error::StoreScreenshotUpload {
+                    return Err(cli::Error::ScreenshotUpload {
                         image_id: image_id.into(), status,
                     }.into());
                 }
@@ -390,7 +388,7 @@ impl AppStoreRelease {
                 "PREPARE_FOR_SUBMISSION" | "APPROVED" => {
                     let spec = Self::string(attributes, "specId")?;
                     if !group.specs.iter().any(|candidate| candidate.id == spec) {
-                        return Err(cli::Error::StoreImageSpecificationMismatch {
+                        return Err(cli::Error::ImageSpecificationMismatch {
                             image_id: id.into(), group: group.id.clone(), spec,
                         }.into());
                     }
@@ -400,10 +398,10 @@ impl AppStoreRelease {
                     thread::sleep(Duration::from_secs(2))
                 }
                 "UPLOAD_COMPLETE" => {
-                    return Err(cli::Error::StoreImageProcessingTimeout { image_id: id.into() }.into());
+                    return Err(cli::Error::ImageProcessingTimeout { image_id: id.into() }.into());
                 }
                 _ => {
-                    return Err(cli::Error::StoreImageRejected {
+                    return Err(cli::Error::ImageRejected {
                         image_id: id.into(), state, details: attributes["stateDetails"].clone(),
                     }.into());
                 }
@@ -503,7 +501,7 @@ impl AppStoreRelease {
         if !actual.iter().map(|placement| &placement.id).eq(ordered.iter())
             || !actual.iter().filter_map(|placement| placement.image.as_ref()).eq(images.iter())
         {
-            return Err(cli::Error::StoreScreenshotOrder { group: group.into() }.into());
+            return Err(cli::Error::ScreenshotOrder { group: group.into() }.into());
         }
         Ok(())
     }
@@ -545,13 +543,13 @@ impl ScreenshotGroup {
             .into_iter()
             .flatten()
             .find(|feature| feature["featureId"] == "APP_STORE_VERSIONS")
-            .ok_or(cli::Error::StoreCatalogFeatureMissing)?;
+            .ok_or(cli::Error::CatalogFeatureMissing)?;
         let policy = feature["placementPolicies"]
             .as_array()
             .into_iter()
             .flatten()
             .find(|policy| policy["placementType"] == "APP_SCREENSHOT")
-            .ok_or(cli::Error::StoreCatalogPolicyMissing)?;
+            .ok_or(cli::Error::CatalogPolicyMissing)?;
         let mut limits = BTreeMap::new();
         for limit in policy["groupLimits"].as_array().into_iter().flatten() {
             let count = limit["maxCount"].as_u64().ok_or_else(|| {
@@ -568,14 +566,14 @@ impl ScreenshotGroup {
             .into_iter()
             .flatten()
             .find(|placement| placement["placementTypeId"] == "APP_SCREENSHOT")
-            .ok_or(cli::Error::StoreCatalogSpecificationsMissing)?;
+            .ok_or(cli::Error::CatalogSpecificationsMissing)?;
         if !placement["acceptsAssetCategories"]
             .as_array()
             .into_iter()
             .flatten()
             .any(|category| category == "APP_SCREENSHOTS_AND_PREVIEWS")
         {
-            return Err(cli::Error::StoreCatalogCategoryRejected.into());
+            return Err(cli::Error::CatalogCategoryRejected.into());
         }
         let mut groups = Vec::new();
         for group in attributes["placementProfileGroups"].as_array().into_iter().flatten() {
@@ -629,7 +627,7 @@ impl ScreenshotGroup {
                 let Some((width, height)) =
                     width.zip(height).filter(|(width, height)| *width > 0 && *height > 0)
                 else {
-                    return Err(cli::Error::StoreCatalogDimensionsInvalid.into());
+                    return Err(cli::Error::CatalogDimensionsInvalid.into());
                 };
                 let max_file_size = spec["maxFileSize"].as_u64().ok_or_else(|| {
                     app_store::cli::Error::StoreResponseField { field: "imageSpecs.maxFileSize".into() }
@@ -653,7 +651,7 @@ impl ScreenshotGroup {
             groups.push(Self { id, family, display_size, max_count: *count, specs });
         }
         if groups.is_empty() {
-            return Err(cli::Error::StoreCatalogSpecificationsUnavailable.into());
+            return Err(cli::Error::CatalogSpecificationsUnavailable.into());
         }
         Ok(groups)
     }

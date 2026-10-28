@@ -70,7 +70,7 @@ impl AscApiKey {
         let key = jsonwebtoken::EncodingKey::from_ec_pem(self.priv_key.as_bytes())
             .map_err(|source| cli::Error::StoreKeyInvalid { key_id: self.key_id.clone(), source })?;
         jsonwebtoken::encode(&header, &claims, &key)
-            .map_err(|error| cli::Error::ASCClientJWTEncodeError(error.to_string()).into())
+            .map_err(|error| cli::Error::ASCClientJWTEncode(error.to_string()).into())
     }
 }
 
@@ -117,12 +117,10 @@ impl AppStoreConnect {
                 latest = Some((numeric, number.to_string()));
             }
         }
-        if let Some((numeric, latest)) = latest {
-            if requested <= numeric {
-                return Err(cli::Error::StoreReleaseExists {
-                    requested: version.into(), released: latest,
-                }.into());
-            }
+        if let Some((numeric, latest)) = latest && requested <= numeric {
+            return Err(cli::Error::StoreReleaseExists {
+                requested: version.into(), released: latest,
+            }.into());
         }
         let mut highest = previous.and_then(|number| Self::version_number(number).ok())
             .unwrap_or([0; 3])[0];
@@ -203,7 +201,7 @@ impl AppStoreConnect {
                         method: method.into(), path: path.into(), status, response,
                     };
                     return Err(if status == 401 {
-                        cli::Error::ASCAuthenticationError(Box::new(error))
+                        cli::Error::ASCAuthentication(Box::new(error))
                     } else {
                         error
                     }.into());
@@ -226,18 +224,19 @@ impl AppStoreConnect {
             .set("Authorization", &format!("Bearer {}", self.token))
             .query("filter[certificateType]", "DISTRIBUTION")
             .call()
-            .map_err(|e| cli::Error::StoreHttpError {
+            .map_err(|e| cli::Error::StoreHttp {
                 method: "GET", path: "/v1/certificates".into(), source: e,
             })?;
 
         let json: serde_json::Value =
-            list_resp.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+            list_resp.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
-        Ok(json["data"].as_array().and_then(|certificates| certificates.first()).map(|certificate| {
-            certificate["attributes"]["name"].as_str().map(str::to_owned).ok_or_else(|| {
-                cli::Error::StoreResponseField { field: "certificates.name".into() }
-            })
-        }).transpose()?)
+        json["data"].as_array().and_then(|certificates| certificates.first())
+            .map(|certificate| -> Result<String> {
+                certificate["attributes"]["name"].as_str().map(str::to_owned).ok_or_else(|| {
+                    cli::Error::StoreResponseField { field: "certificates.name".into() }.into()
+                })
+            }).transpose()
     }
 
     pub fn create_distribution_certificate(&self, csr_content: &str) -> Result<(String, Vec<u8>)> {
@@ -252,12 +251,12 @@ impl AppStoreConnect {
             .set("Authorization", &format!("Bearer {}", self.token))
             .set("Content-Type", "application/json")
             .send_json(&body)
-            .map_err(|e| cli::Error::StoreHttpError {
+            .map_err(|e| cli::Error::StoreHttp {
                 method: "POST", path: "/v1/certificates".into(), source: e,
             })?;
 
         let json: serde_json::Value =
-            create_resp.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+            create_resp.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
         let cert_name = json["data"]["attributes"]["name"].as_str().ok_or_else(|| {
             cli::Error::StoreResponseField { field: "certificates.name".into() }
@@ -269,7 +268,7 @@ impl AppStoreConnect {
 
         let cert_der = BASE64_STANDARD
             .decode(cert_b64)
-            .map_err(|e| cli::Error::Base64DecodeError(e.to_string()))?;
+            .map_err(|e| cli::Error::Base64Decode(e.to_string()))?;
 
         Ok((cert_name, cert_der))
     }
@@ -280,12 +279,12 @@ impl AppStoreConnect {
                 .set("Authorization", &format!("Bearer {}", self.token))
                 .query("filter[udid]", device_id)
                 .call()
-                .map_err(|e| cli::Error::StoreHttpError {
+                .map_err(|e| cli::Error::StoreHttp {
                     method: "GET", path: "/v1/devices".into(), source: e,
                 })?;
 
             let json: serde_json::Value =
-                check.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                check.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
             if let Some(existing) = json["data"].as_array().and_then(|a| a.first()) {
                 existing["id"].as_str().unwrap().to_string()
@@ -301,12 +300,12 @@ impl AppStoreConnect {
                     .set("Authorization", &format!("Bearer {}", self.token))
                     .set("Content-Type", "application/json")
                     .send_json(&body)
-                    .map_err(|e| cli::Error::StoreHttpError {
+                    .map_err(|e| cli::Error::StoreHttp {
                         method: "POST", path: "/v1/devices".into(), source: e,
                     })?;
 
                 let json: serde_json::Value =
-                    resp.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                    resp.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
                 json["data"]["id"].as_str().unwrap().to_string()
             }
@@ -316,12 +315,12 @@ impl AppStoreConnect {
                 .set("Authorization", &format!("Bearer {}", self.token))
                 .query("filter[identifier]", bundle_id)
                 .call()
-                .map_err(|e| cli::Error::StoreHttpError {
+                .map_err(|e| cli::Error::StoreHttp {
                     method: "GET", path: "/v1/bundleIds".into(), source: e,
                 })?;
 
             let json: serde_json::Value =
-                check.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                check.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
             if let Some(existing) = json["data"].as_array().and_then(|a| a.first()) {
                 existing["id"].as_str().unwrap().to_string()
@@ -341,7 +340,7 @@ impl AppStoreConnect {
                     .set("Authorization", &format!("Bearer {}", self.token))
                     .set("Content-Type", "application/json")
                     .send_json(&body)
-                    .map_err(|e| cli::Error::StoreHttpError {
+                    .map_err(|e| cli::Error::StoreHttp {
                         method: "POST", path: "/v1/bundleIds".into(), source: e,
                     })?;
 
@@ -349,9 +348,8 @@ impl AppStoreConnect {
 
                 if (200..300).contains(&status) {
                     let json: serde_json::Value =
-                        resp.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
-                    let id = json["data"]["id"].as_str().unwrap().to_string();
-                    id
+                        resp.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
+                    json["data"]["id"].as_str().unwrap().to_string()
                 } else {
                     let error_body = resp.into_string().unwrap_or_default();
                     return Err(cli::Error::StoreHttpStatus {
@@ -373,12 +371,12 @@ impl AppStoreConnect {
             ))
             .set("Authorization", &format!("Bearer {}", self.token))
             .call()
-            .map_err(|e| cli::Error::StoreHttpError {
+            .map_err(|e| cli::Error::StoreHttp {
                 method: "GET", path: format!("/v1/bundleIds/{bundle_resource_id}/profiles"), source: e,
             })?;
 
             let json: serde_json::Value =
-                check.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                check.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
             if let Some(existing) = json["data"].as_array().and_then(|arr| {
                 arr.iter()
@@ -397,12 +395,12 @@ impl AppStoreConnect {
                     .set("Authorization", &format!("Bearer {}", self.token))
                     .query("filter[certificateType]", "DISTRIBUTION")
                     .call()
-                    .map_err(|e| cli::Error::StoreHttpError {
+                    .map_err(|e| cli::Error::StoreHttp {
                         method: "GET", path: "/v1/certificates".into(), source: e,
                     })?;
 
                 let cert_json: serde_json::Value =
-                    cert_list.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                    cert_list.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
                 let certificate_internal_id = cert_json["data"]
                     .as_array()
@@ -445,7 +443,7 @@ impl AppStoreConnect {
                         }.into());
                     }
                     Err(e) => {
-                        return Err(cli::Error::StoreHttpError {
+                        return Err(cli::Error::StoreHttp {
                             method: "POST", path: "/v1/profiles".into(), source: e,
                         }.into());
                     }
@@ -453,7 +451,7 @@ impl AppStoreConnect {
 
                 let json: serde_json::Value = create_resp
                     .into_json()
-                    .map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+                    .map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
                 json["data"]["id"].as_str().unwrap().to_string()
             }
@@ -463,12 +461,12 @@ impl AppStoreConnect {
             ureq::get(&format!("https://api.appstoreconnect.apple.com/v1/profiles/{}", profile_id))
                 .set("Authorization", &format!("Bearer {}", self.token))
                 .call()
-                .map_err(|e| cli::Error::StoreHttpError {
+                .map_err(|e| cli::Error::StoreHttp {
                     method: "GET", path: format!("/v1/profiles/{profile_id}"), source: e,
                 })?;
 
         let dl_json: serde_json::Value =
-            dl_resp.into_json().map_err(|e| crate::cli::Error::IntoJSONError(e.to_string()))?;
+            dl_resp.into_json().map_err(|e| crate::cli::Error::IntoJSON(e.to_string()))?;
 
         let b64 = dl_json["data"]["attributes"]["profileContent"]
             .as_str()
@@ -476,7 +474,7 @@ impl AppStoreConnect {
 
         let profile_data = BASE64_STANDARD
             .decode(b64)
-            .map_err(|e| cli::Error::Base64DecodeError(e.to_string()))?;
+            .map_err(|e| cli::Error::Base64Decode(e.to_string()))?;
 
         Ok((profile_name, profile_data))
     }

@@ -36,9 +36,9 @@ impl AppleSigning {
             let check = Command::new("security")
                 .args(["find-identity", "-v", "-p", "codesigning"])
                 .output()
-                .map_err(|e| cli::Error::SecurityFindIdentityError(e.to_string()))?;
+                .map_err(|e| cli::Error::SecurityFindIdentity(e.to_string()))?;
             if !check.status.success() {
-                return Err(cli::Error::SecurityFindIdentityError(
+                return Err(cli::Error::SecurityFindIdentity(
                     String::from_utf8_lossy(&check.stderr).trim().to_string(),
                 ).into());
             }
@@ -51,9 +51,9 @@ impl AppleSigning {
         let unlocked = Command::new("security")
             .args(["unlock-keychain", &keychain_path])
             .output()
-            .map_err(|error| cli::Error::KeyChainUnlockError(error.to_string()))?;
+            .map_err(|error| cli::Error::KeyChainUnlock(error.to_string()))?;
         if !unlocked.status.success() {
-            return Err(cli::Error::KeyChainUnlockError(
+            return Err(cli::Error::KeyChainUnlock(
                 String::from_utf8_lossy(&unlocked.stderr).trim().to_string(),
             ).into());
         }
@@ -67,7 +67,7 @@ impl AppleSigning {
                 .map_err(|e| crate::cli::Error::CommandSpawn { program: "security".into(), source: e })?;
 
             if !check.status.success() {
-                return Err(cli::Error::SecurityFindIdentityError(
+                return Err(cli::Error::SecurityFindIdentity(
                     String::from_utf8_lossy(&check.stderr).trim().to_string(),
                 ).into());
             }
@@ -84,7 +84,7 @@ impl AppleSigning {
         }
 
         let temporary =
-            tempfile::tempdir().map_err(|error| crate::cli::Error::WriteFileError(error.to_string()))?;
+            tempfile::tempdir().map_err(|error| crate::cli::Error::WriteFile(error.to_string()))?;
         let key_path = temporary.path().join("key.pem");
         let csr_path = temporary.path().join("request.csr");
 
@@ -93,9 +93,9 @@ impl AppleSigning {
             .arg(&key_path)
             .arg("2048")
             .output()
-            .map_err(|error| cli::Error::OpenSSLKeyGenError(error.to_string()))?;
+            .map_err(|error| cli::Error::OpenSSLKeyGen(error.to_string()))?;
         if !generated.status.success() {
-            return Err(cli::Error::OpenSSLKeyGenError(
+            return Err(cli::Error::OpenSSLKeyGen(
                 String::from_utf8_lossy(&generated.stderr).into_owned(),
             ).into());
         }
@@ -107,9 +107,9 @@ impl AppleSigning {
             .arg(&csr_path)
             .args(["-subj", "/CN=Distribution Certificate"])
             .output()
-            .map_err(|error| cli::Error::OpenSSLCSRError(error.to_string()))?;
+            .map_err(|error| cli::Error::OpenSSLCSR(error.to_string()))?;
         if !generated.status.success() {
-            return Err(cli::Error::OpenSSLCSRError(
+            return Err(cli::Error::OpenSSLCSR(
                 String::from_utf8_lossy(&generated.stderr).into_owned(),
             ).into());
         }
@@ -121,7 +121,7 @@ impl AppleSigning {
 
         let cer_path = temporary.path().join("certificate.cer");
         fs::write(&cer_path, cert_der)
-            .map_err(|e| crate::cli::Error::CreateFileError { path: cer_path.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::CreateFile { path: cer_path.clone(), source: e })?;
 
         let import_key = Command::new("security")
             .arg("import")
@@ -131,7 +131,7 @@ impl AppleSigning {
             .map_err(|e| crate::cli::Error::CommandSpawn { program: "security".into(), source: e })?;
 
         if !import_key.status.success() {
-            return Err(cli::Error::KeyChainImportError(
+            return Err(cli::Error::KeyChainImport(
                 String::from_utf8_lossy(&import_key.stderr).trim().to_string(),
             ).into());
         }
@@ -144,7 +144,7 @@ impl AppleSigning {
             .map_err(|e| crate::cli::Error::CommandSpawn { program: "security".into(), source: e })?;
 
         if !import_cert.status.success() {
-            return Err(cli::Error::KeyChainImportError(
+            return Err(cli::Error::KeyChainImport(
                 String::from_utf8_lossy(&import_cert.stderr).trim().to_string(),
             ).into());
         }
@@ -154,7 +154,7 @@ impl AppleSigning {
             .output()
             .map_err(|e| crate::cli::Error::CommandSpawn { program: "security".into(), source: e })?;
         if !check.status.success() {
-            return Err(cli::Error::SecurityFindIdentityError(
+            return Err(cli::Error::SecurityFindIdentity(
                 String::from_utf8_lossy(&check.stderr).trim().to_string(),
             ).into());
         }
@@ -168,61 +168,14 @@ impl AppleSigning {
         Ok((team_id, cert_name))
     }
 
-    pub fn provision_ios_device(
-        &self, device_id: &str, bundle_id: &str, app_name: &str, certificate_id: &str,
-        app_bundle_path: &PathBuf, ideviceprovision_path: &str, provision_cache: &PathBuf,
-    ) -> Result<()> {
-        let app_store = AppStoreConnect::new(&self.api_key)?;
-        let (profile_name, profile_data) =
-            app_store.ios_ad_hoc_profile(device_id, bundle_id, app_name, certificate_id)?;
-
-        let profile_path = format!("{}.mobileprovision", profile_name);
-        fs::write(&profile_path, profile_data)
-            .map_err(|e| crate::cli::Error::CreateFileError { path: (&profile_path).into(), source: e })?;
-
-        let _ = fs::create_dir_all(provision_cache);
-        let cached_profile = provision_cache.join(format!("{}.mobileprovision", profile_name));
-        let _ = fs::copy(&profile_path, &cached_profile);
-
-        let embedded_path = format!("{}/embedded.mobileprovision", app_bundle_path.display());
-        fs::copy(&profile_path, &embedded_path)
-            .map_err(|e| crate::cli::Error::CopyFileError {
-                input_path: (&profile_path).into(), output_path: (&embedded_path).into(), source: e,
-            })?;
-
-        let install = Command::new(ideviceprovision_path)
-            .args(["install", &embedded_path, "--udid", device_id])
-            .output()
-            .map_err(|e| {
-                crate::cli::Error::CommandSpawn { program: ideviceprovision_path.into(), source: e }
-            })?;
-
-        if !install.status.success() {
-            return Err(cli::Error::DeviceProvisionError(
-                String::from_utf8_lossy(&install.stderr).trim().to_string(),
-            ).into());
-        }
-
-        Self::ensure_entitlements(app_bundle_path)?;
-
-        let _ = Command::new("xattr")
-            .args(["-cr", app_bundle_path.to_str().unwrap()])
-            .status()
-            .map_err(|e| crate::cli::Error::CommandSpawn { program: "xattr".into(), source: e })?;
-
-        let _ = fs::remove_file(profile_path);
-
-        Ok(())
-    }
-
     // Distribution capabilities are not yet added to the minimal entitlements file.
-    pub fn is_device_provisioned(app_bundle_path: &PathBuf, device_id: &str, idp_path: &str, provision_cache: &PathBuf) -> Result<bool> {
+    pub fn is_device_provisioned(app_bundle_path: &Path, device_id: &str, idp_path: &str, provision_cache: &PathBuf) -> Result<bool> {
         let entries = fs::read_dir(provision_cache)
-            .map_err(|e| crate::cli::Error::ReadDirError { path: provision_cache.clone(), source: e })?;
+            .map_err(|e| crate::cli::Error::ReadDir { path: provision_cache.clone(), source: e })?;
 
         let mut profile_files = vec![];
         for entry in entries {
-            let entry = entry.map_err(|e| crate::cli::Error::MapDirError {
+            let entry = entry.map_err(|e| crate::cli::Error::MapDir {
                 path: provision_cache.to_path_buf(),
                 source: e,
             })?;
@@ -236,7 +189,7 @@ impl AppleSigning {
             let output = Command::new("security")
                 .args(["cms", "-D", "-i", profile_path.to_str().unwrap()])
                 .output()
-                .map_err(|e| cli::Error::QueryProvisionError {
+                .map_err(|e| cli::Error::QueryProvision {
                     path: profile_path.to_path_buf(),
                     source: e,
                 })?;
@@ -258,7 +211,7 @@ impl AppleSigning {
                 if installed.contains(target) {
                     let target_path = app_bundle_path.join("embedded.mobileprovision");
                     fs::copy(&profile_path, &target_path).map_err(|e| {
-                        crate::cli::Error::CopyFileError {
+                        crate::cli::Error::CopyFile {
                             input_path: profile_path,
                             output_path: target_path,
                             source: e,
@@ -273,7 +226,7 @@ impl AppleSigning {
         Ok(false)
     }
 
-    pub fn sign_app_bundle(app_bundle_path: &PathBuf, security_profile: &str, target: AppleSigningTarget) -> Result<()> {
+    pub fn sign_app_bundle(app_bundle_path: &Path, security_profile: &str, target: AppleSigningTarget) -> Result<()> {
         let bundle_path = app_bundle_path.display().to_string();
 
         let code_signature_dir = app_bundle_path.join("_CodeSignature");
@@ -324,7 +277,7 @@ impl AppleSigning {
             .map_err(|e| crate::cli::Error::CommandSpawn { program: "codesign".into(), source: e })?;
 
         if !status.status.success() {
-            return Err(cli::Error::CodesignError(
+            return Err(cli::Error::Codesign(
                 String::from_utf8_lossy(&status.stderr).trim().to_string(),
             ).into());
         }
@@ -332,7 +285,7 @@ impl AppleSigning {
         Ok(())
     }
 
-    fn ensure_entitlements(app_bundle_path: &PathBuf) -> Result<()> {
+    pub fn ensure_entitlements(app_bundle_path: &Path) -> Result<()> {
         let embedded = app_bundle_path.join("embedded.mobileprovision");
         let app_bundle_parent = app_bundle_path.parent().unwrap();
         let entitlements_path = app_bundle_parent.join("entitlements.plist");
@@ -345,7 +298,7 @@ impl AppleSigning {
             </plist>"#;
 
             fs::write(&entitlements_path, content.trim()).map_err(|e| {
-                crate::cli::Error::CreateFileError { path: entitlements_path.clone(), source: e }
+                crate::cli::Error::CreateFile { path: entitlements_path.clone(), source: e }
             })?;
 
             return Ok(());

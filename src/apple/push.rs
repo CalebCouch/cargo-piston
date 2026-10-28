@@ -50,7 +50,7 @@ impl PushSigning {
         let output = work.join("notification-verification");
         if output.exists() {
             std::fs::remove_dir_all(&output)
-                .map_err(|source| crate::cli::Error::RemoveSubdirError { path: output.clone(), source })?;
+                .map_err(|source| crate::cli::Error::RemoveSubdir { path: output.clone(), source })?;
         }
         let extracted = Command::new("ditto")
             .args(["-x", "-k"])
@@ -62,10 +62,10 @@ impl PushSigning {
             return Err(crate::cli::Error::CommandFailed { program: "ditto".into(), output: extracted }.into());
         }
         let apps = std::fs::read_dir(output.join("Payload"))
-            .map_err(|source| crate::cli::Error::ReadDirError { path: output.join("Payload"), source })?
+            .map_err(|source| crate::cli::Error::ReadDir { path: output.join("Payload"), source })?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|source| crate::cli::Error::MapDirError { path: output.join("Payload"), source })?;
+            .map_err(|source| crate::cli::Error::MapDir { path: output.join("Payload"), source })?;
         let apps: Vec<_> = apps
             .into_iter()
             .filter(|path| path.extension().is_some_and(|value| value == "app"))
@@ -76,7 +76,7 @@ impl PushSigning {
             Err(cli::Error::PushIpaApplicationCount { count: apps.len() }.into())
         };
         std::fs::remove_dir_all(&output)
-            .map_err(|source| crate::cli::Error::RemoveSubdirError { path: output.clone(), source })?;
+            .map_err(|source| crate::cli::Error::RemoveSubdir { path: output.clone(), source })?;
         result
     }
 

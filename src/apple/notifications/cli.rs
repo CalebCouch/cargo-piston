@@ -20,13 +20,13 @@ pub enum Error {
     PushKeySigning(jsonwebtoken::errors::Error),
     PushIdentityMissing { team: String },
     PushSetupTimeout,
-    PushLocationError(String),
-    PushContractError(String),
-    PushInboxError(String),
+    PushLocation(String),
+    PushContract(String),
+    PushInbox(String),
     PushRegistrationInvalid(serde_json::Error),
     PushLocationMismatch,
-    PushConnectionError(String),
-    PushInitializationError(String),
+    PushConnection(String),
+    PushInitialization(String),
     PushUpdateDenied,
     PushCredentialsUnconfirmed,
     PushCredentialsInvalid(serde_json::Error),
@@ -86,21 +86,21 @@ impl std::fmt::Display for Error {
                 f, "Notification setup timed out before confirmation. Check your connection \
                  and rerun; Piston will resume the same registration.",
             ),
-            Self::PushLocationError(source) => {
+            Self::PushLocation(source) => {
                 write!(f, "Cannot create notification location: {source}")
             }
-            Self::PushContractError(source) => {
+            Self::PushContract(source) => {
                 write!(f, "Cannot create notification contract: {source}")
             }
-            Self::PushInboxError(source) => write!(f, "Cannot create deployment inbox: {source}"),
+            Self::PushInbox(source) => write!(f, "Cannot create deployment inbox: {source}"),
             Self::PushRegistrationInvalid(source) => write!(
                 f, "Invalid notification registration in the developer contract: {source}. Restore its backup.",
             ),
             Self::PushLocationMismatch => {
                 write!(f, "The saved notification location does not match this app.")
             }
-            Self::PushConnectionError(source) => write!(f, "Cannot connect to AIR: {source}"),
-            Self::PushInitializationError(source) => {
+            Self::PushConnection(source) => write!(f, "Cannot connect to AIR: {source}"),
+            Self::PushInitialization(source) => {
                 write!(f, "Cannot initialize notification contract: {source}")
             }
             Self::PushUpdateDenied => write!(
@@ -168,9 +168,8 @@ impl Cli {
         let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
         let environment = if setup.signing.sandbox { "development" } else { "production" };
         println!("Checking {environment} notifications for {}", setup.signing.topic);
-        if !replace {
-            if let Some(application) = setup.configure(None, &mut store)? { return Ok(application); }
-        }
+        if !replace
+            && let Some(application) = setup.configure(None, &mut store)? { return Ok(application); }
         if !interactive {
             return Err(Error::SetupIncomplete {
                 topic: setup.signing.topic.clone(), sandbox: setup.signing.sandbox,

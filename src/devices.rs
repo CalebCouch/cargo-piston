@@ -45,7 +45,7 @@ impl Devices {
             .output()
             .map_err(|e| Error::ADBDevicesError(e.to_string()))?;
         let stdout = str::from_utf8(&output.stdout)
-            .map_err(|e| SharedError::ParseUTF8Error(e.to_string()))?;
+            .map_err(|e| SharedError::ParseUTF8(e.to_string()))?;
         Ok(stdout
             .lines()
             .skip(1)

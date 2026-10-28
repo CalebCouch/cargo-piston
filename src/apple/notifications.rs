@@ -144,7 +144,7 @@ struct Registration {
 impl Registration {
     async fn new(team: &str, secret: &Secret, init: &(String, bool), store: &mut Credentials) -> Result<Self> {
         let location = Instance::<NotificationApplication>::generate_location(secret, init)
-            .map_err(|error| cli::Error::PushLocationError(format!("{error:?}")))?;
+            .map_err(|error| cli::Error::PushLocation(format!("{error:?}")))?;
         let account = format!("application:{}", Id::hash(&location));
         if let Some(bytes) = store.get(team, &account) {
             let registration: Self = serde_json::from_slice(bytes)
@@ -155,10 +155,10 @@ impl Registration {
             return Ok(registration);
         }
         let instance = Instance::receive(secret.clone(), location).map_err(|error| {
-            cli::Error::PushContractError(format!("{error:?}"))
+            cli::Error::PushContract(format!("{error:?}"))
         })?;
         let inbox = Inbox::new(secret.clone()).map_err(|error| {
-            cli::Error::PushInboxError(format!("{error:?}"))
+            cli::Error::PushInbox(format!("{error:?}"))
         })?;
         let registration = Self { team: team.into(), instance, inbox, shared: None };
         registration.save(store).await?;
@@ -174,11 +174,11 @@ impl Registration {
         let identity = resolver.resolve(self.instance.location().server, None).await;
         let client = Client::new((*identity).clone(), "wss")
             .await
-            .map_err(|error| cli::Error::PushConnectionError(error.to_string()))?;
+            .map_err(|error| cli::Error::PushConnection(error.to_string()))?;
         self.synchronize(&client, &mut resolver, &secret, store).await?;
         if self.instance.confirmed().is_none() {
             self.instance = Instance::new(secret.clone(), init).map_err(|error| {
-                cli::Error::PushInitializationError(format!("{error:?}"))
+                cli::Error::PushInitialization(format!("{error:?}"))
             })?;
             self.synchronize(&client, &mut resolver, &secret, store).await?;
         }
@@ -230,7 +230,7 @@ impl Registration {
             match self.instance.response(resolver, response).await {
                 Output::Init(_) if initializing => {
                     self.instance = Instance::receive(secret.clone(), *self.instance.location())
-                        .map_err(|error| cli::Error::PushContractError(format!("{error:?}")))?;
+                        .map_err(|error| cli::Error::PushContract(format!("{error:?}")))?;
                     initializing = false;
                     request = Some(self.instance.start());
                     continue;

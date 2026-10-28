@@ -38,7 +38,7 @@ impl IOSApplication {
         command.no_deps();
         if let Some(path) = &args.cargo.manifest_path {
             let path = fs::canonicalize(path)
-                .map_err(|error| cli::Error::CargoParseError(error.to_string()))?;
+                .map_err(|error| cli::Error::CargoParse(error.to_string()))?;
             command.manifest_path(&path).current_dir(path.parent().unwrap());
             args.cargo.manifest_path = Some(path);
         }
@@ -47,16 +47,16 @@ impl IOSApplication {
         if args.offline { options.push("--offline".into()); }
         command.other_options(options);
         let metadata = command.exec()
-            .map_err(|error| cli::Error::CargoParseError(error.to_string()))?;
+            .map_err(|error| cli::Error::CargoParse(error.to_string()))?;
         let mut locate = Command::new(env::var_os("CARGO").unwrap_or_else(|| "cargo".into()));
         locate.args(["locate-project", "--message-format", "plain"]);
         if let Some(path) = &args.cargo.manifest_path { locate.arg("--manifest-path").arg(path); }
         let manifest =
-            locate.output().map_err(|error| cli::Error::CargoParseError(error.to_string()))?;
+            locate.output().map_err(|error| cli::Error::CargoParse(error.to_string()))?;
         let manifest = Self::check(manifest, "cargo")?;
         let manifest = PathBuf::from(String::from_utf8_lossy(&manifest).trim());
         let manifest = fs::canonicalize(manifest)
-            .map_err(|error| cli::Error::CargoParseError(error.to_string()))?;
+            .map_err(|error| cli::Error::CargoParse(error.to_string()))?;
         let package = if let Some(name) = args.cargo.package.first() {
             metadata.packages.iter().find(|package| package.name.as_str() == name)
         } else {
@@ -103,7 +103,7 @@ impl IOSApplication {
         };
         let work = target_dir.join("piston").join("ios").join(package.name.as_str());
         fs::create_dir_all(&work)
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         Ok(Self { args, package, config, work, notifications: None })
     }
 
@@ -254,7 +254,8 @@ impl IOSApplication {
     }
 
     pub fn build(&mut self, developer: &Path, team: &str, report: &mut dyn FnMut(&str)) -> Result<(PathBuf, String)> {
-        let executable = self.compile(&self.target().to_string(), developer, report)?;
+        let target = self.target().to_owned();
+        let executable = self.compile(&target, developer, report)?;
         self.bundle(&executable, team, developer, None)
     }
 
@@ -262,7 +263,7 @@ impl IOSApplication {
         let source = Project::find_icon(self.package.manifest_path.parent().unwrap().as_std_path())
             .ok_or(Error::IosStoreIconMissing)?;
         let icon = image::open(&source)
-            .map_err(|error| cli::Error::OpenImageError { path: source.clone(), source: error })?;
+            .map_err(|error| cli::Error::OpenImage { path: source.clone(), source: error })?;
         if icon.width() != icon.height()
             || icon.width() < 1024
             || icon.to_rgba16().pixels().any(|pixel| pixel.0[3] != u16::MAX)
@@ -270,7 +271,7 @@ impl IOSApplication {
             return Err(Error::IosStoreIconInvalid { path: source }.into());
         }
         let normalized = self.work.join("store-icon.png");
-        icon.to_rgb8().save(&normalized).map_err(cli::Error::WriteImageError)?;
+        icon.to_rgb8().save(&normalized).map_err(cli::Error::WriteImage)?;
         let executable = self.compile("aarch64-apple-ios", developer, report)?;
         Ok(self.bundle(&executable, team, developer, Some(&normalized))?.0)
     }
@@ -324,13 +325,13 @@ impl IOSApplication {
         let installed = Command::new("rustup")
             .args(["target", "list", "--installed"])
             .output()
-            .map_err(|error| cli::Error::BuildError(error.to_string()))?;
+            .map_err(|error| cli::Error::Build(error.to_string()))?;
         let installed = Self::check(installed, "rustup")?;
         if !String::from_utf8_lossy(&installed).lines().any(|line| line == target) {
             let output = Command::new("rustup")
                 .args(["target", "add", target])
                 .output()
-                .map_err(|error| cli::Error::BuildError(error.to_string()))?;
+                .map_err(|error| cli::Error::Build(error.to_string()))?;
             Self::check(output, "rustup")?;
         }
         Ok(())
@@ -356,7 +357,7 @@ impl IOSApplication {
         command.env_remove("RAMP_NOTIFICATION_APPLICATION");
         if let Some(notifications) = &self.notifications { notifications.compile(&mut command); }
         let mut child =
-            command.spawn().map_err(|error| cli::Error::BuildError(error.to_string()))?;
+            command.spawn().map_err(|error| cli::Error::Build(error.to_string()))?;
         let mut executable = None;
         for message in Message::parse_stream(BufReader::new(child.stdout.take().unwrap())) {
             match message {
@@ -375,7 +376,7 @@ impl IOSApplication {
                 _ => {}
             }
         }
-        let status = child.wait().map_err(|error| cli::Error::BuildError(error.to_string()))?;
+        let status = child.wait().map_err(|error| cli::Error::Build(error.to_string()))?;
         if !status.success() {
             return Err(cli::Error::CommandStatus { program: "cargo".into(), status }.into());
         }
@@ -415,20 +416,20 @@ impl IOSApplication {
         let bundle = self.work.join("staging").join(format!("{slug}.app"));
         if bundle.exists() {
             fs::remove_dir_all(&bundle)
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         }
         fs::create_dir_all(&bundle)
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let source = self.args.info_plist.as_ref().or(self.config.info_plist.as_ref());
         let mut plist = if let Some(path) = source {
             let output = Command::new("plutil")
                 .args(["-convert", "json", "-o", "-"])
                 .arg(self.project_path(path))
                 .output()
-                .map_err(|error| crate::apple::cli::Error::PlutilConvertError(error.to_string()))?;
+                .map_err(|error| crate::apple::cli::Error::PlutilConvert(error.to_string()))?;
             let bytes = Self::check(output, "plutil")?;
             serde_json::from_slice::<Value>(&bytes)
-                .map_err(|error| cli::Error::IntoJSONError(error.to_string()))?
+                .map_err(|error| cli::Error::IntoJSON(error.to_string()))?
         } else {
             json!({})
         };
@@ -477,7 +478,7 @@ impl IOSApplication {
             "UIInterfaceOrientationLandscapeRight"
         ]));
         fs::copy(executable, bundle.join(&slug))
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         for resource in &self.config.resources {
             let source = self.project_path(resource);
             let name = source.file_name().ok_or_else(|| Error::IosResourceInvalid {
@@ -504,7 +505,7 @@ impl IOSApplication {
             } else {
                 Command::new("ditto").arg(&source).arg(bundle.join(name)).output()
             }
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             Self::check(output, if storyboard { "ibtool" } else { "ditto" })?;
         }
         let icon = icon.map(Path::to_path_buf).or_else(|| {
@@ -516,12 +517,12 @@ impl IOSApplication {
         }
         let plist_path = bundle.join("Info.plist");
         fs::write(&plist_path, serde_json::to_vec_pretty(&plist).unwrap())
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let output = Command::new("plutil")
             .args(["-convert", "xml1"])
             .arg(&plist_path)
             .output()
-            .map_err(|error| crate::apple::cli::Error::PlutilConvertError(error.to_string()))?;
+            .map_err(|error| crate::apple::cli::Error::PlutilConvert(error.to_string()))?;
         Self::check(output, "plutil")?;
         Ok((bundle, identifier))
     }
@@ -530,10 +531,10 @@ impl IOSApplication {
         let catalog = self.work.join("Assets.xcassets");
         if catalog.exists() {
             fs::remove_dir_all(&catalog)
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         }
         fs::create_dir_all(&catalog)
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
         let mut populated = false;
         for resource in &self.config.resources {
             let source = self.project_path(resource);
@@ -548,23 +549,23 @@ impl IOSApplication {
             })?;
             let filename = source.file_name().unwrap();
             fs::copy(&source, set.join(filename))
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             let contents = json!({
                 "images": [{"idiom": "universal", "filename": filename.to_string_lossy()}],
                 "info": {"version": 1, "author": "xcode"},
             });
             fs::write(set.join("Contents.json"), serde_json::to_vec_pretty(&contents).unwrap())
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             populated = true;
         }
         if let Some(source) = icon {
-            let image = image::open(source).map_err(|error| cli::Error::OpenImageError {
+            let image = image::open(source).map_err(|error| cli::Error::OpenImage {
                 path: source.to_path_buf(),
                 source: error,
             })?;
             let app_icon = catalog.join("AppIcon.appiconset");
             fs::create_dir_all(&app_icon)
-                .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+                .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             let mut images = Vec::new();
             for (idiom, size, scale, pixels) in [
                 ("iphone", "20", 2, 40),
@@ -590,7 +591,7 @@ impl IOSApplication {
                 image
                     .resize_exact(pixels, pixels, image::imageops::FilterType::Lanczos3)
                     .save(app_icon.join(&filename))
-                    .map_err(cli::Error::WriteImageError)?;
+                    .map_err(cli::Error::WriteImage)?;
                 images.push(json!({
                     "idiom": idiom, "size": format!("{size}x{size}"),
                     "scale": format!("{scale}x"), "filename": filename,
@@ -601,7 +602,7 @@ impl IOSApplication {
                 app_icon.join("Contents.json"),
                 serde_json::to_vec_pretty(&contents).unwrap(),
             )
-            .map_err(|error| cli::Error::WriteFileError(error.to_string()))?;
+            .map_err(|error| cli::Error::WriteFile(error.to_string()))?;
             populated = true;
         }
         if !populated { return Ok(json!({})); }
@@ -636,10 +637,10 @@ impl IOSApplication {
             .args(["-convert", "json", "-o", "-"])
             .arg(&partial)
             .output()
-            .map_err(|error| crate::apple::cli::Error::PlutilConvertError(error.to_string()))?;
+            .map_err(|error| crate::apple::cli::Error::PlutilConvert(error.to_string()))?;
         let bytes = Self::check(output, "plutil")?;
         serde_json::from_slice(&bytes)
-            .map_err(|error| cli::Error::IntoJSONError(error.to_string()).into())
+            .map_err(|error| cli::Error::IntoJSON(error.to_string()).into())
     }
 
     fn project_path(&self, path: &Path) -> PathBuf {

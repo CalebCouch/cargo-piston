@@ -102,7 +102,7 @@ impl Cli {
                 }
                 Err(error) if interactive && matches!(
                     error.downcast_ref::<app_store::cli::Error>(),
-                    Some(app_store::cli::Error::ASCAuthenticationError(_)
+                    Some(app_store::cli::Error::ASCAuthentication(_)
                         | app_store::cli::Error::StoreKeyInvalid { .. }),
                 ) => {
                     eprintln!("{error}");
@@ -173,7 +173,7 @@ impl Cli {
                 settings.insert("asc_key_path".into(), path.to_string_lossy().into_owned());
             }
             let key_id = &settings["asc_key_id"];
-            if !AscApiKey::valid_id(&key_id) {
+            if !AscApiKey::valid_id(key_id) {
                 eprintln!("A Team API Key ID must contain 10 letters or digits.");
                 continue;
             }

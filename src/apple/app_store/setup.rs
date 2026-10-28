@@ -98,7 +98,7 @@ impl AscApiKey {
             app_store::cli::Error::StoreKeyUnreadable { path: path.clone(), source: error }
         })?;
         let mut settings = settings.clone();
-        settings.insert("asc_key_id".into(), key_id.into());
+        settings.insert("asc_key_id".into(), key_id);
         settings.insert("asc_key_path".into(), path.to_string_lossy().into_owned());
         let key = Self::from_hm(&settings)?;
         key.token()?;

@@ -24,15 +24,15 @@ pub enum Error {
     PushProfileTopicMismatch { topic: String },
     PushProfileExpired,
     PlistNotDictionary { path: PathBuf },
-    KeyChainUnlockError(String),
-    KeyChainImportError(String),
-    OpenSSLKeyGenError(String),
-    OpenSSLCSRError(String),
-    CodesignError(String),
-    DeviceProvisionError(String),
-    SecurityFindIdentityError(String),
-    PlutilConvertError(String),
-    QueryProvisionError { path: PathBuf, source: std::io::Error },
+    KeyChainUnlock(String),
+    KeyChainImport(String),
+    OpenSSLKeyGen(String),
+    OpenSSLCSR(String),
+    Codesign(String),
+    DeviceProvision(String),
+    SecurityFindIdentity(String),
+    PlutilConvert(String),
+    QueryProvision { path: PathBuf, source: std::io::Error },
 }
 
 impl std::fmt::Display for Error {
@@ -105,29 +105,29 @@ impl std::fmt::Display for Error {
             Self::PlistNotDictionary { path } => {
                 write!(f, "{} must contain a property-list dictionary.", path.display())
             }
-            Self::KeyChainUnlockError(err) => {
+            Self::KeyChainUnlock(err) => {
                 write!(f, "Failed to unlock the security keychain: {}", err)
             }
-            Self::KeyChainImportError(err) => {
+            Self::KeyChainImport(err) => {
                 write!(f, "Failed to import profile to security keychain: {}", err)
             }
-            Self::OpenSSLKeyGenError(err) => {
+            Self::OpenSSLKeyGen(err) => {
                 write!(f, "Error Generating New Key with openssl: {}", err)
             }
-            Self::OpenSSLCSRError(err) => write!(f, "Error Generating CSR with openssl: {}", err),
-            Self::CodesignError(err) => f.write_str(err),
-            Self::DeviceProvisionError(err) => {
+            Self::OpenSSLCSR(err) => write!(f, "Error Generating CSR with openssl: {}", err),
+            Self::Codesign(err) => f.write_str(err),
+            Self::DeviceProvision(err) => {
                 write!(f, "Error provisioning target device with idp: {}", err)
             }
-            Self::SecurityFindIdentityError(err) => write!(
+            Self::SecurityFindIdentity(err) => write!(
                 f,
                 "Error checking for local identities with `security find-identity -v -p codesigning`: {}",
                 err
             ),
-            Self::PlutilConvertError(err) => {
+            Self::PlutilConvert(err) => {
                 write!(f, "Error using plutil to convert filetype`: {}", err)
             }
-            Self::QueryProvisionError { path, .. } => {
+            Self::QueryProvision { path, .. } => {
                 write!(f, "Failed to query the security provision profile {:?}", path)
             }
         }
@@ -143,7 +143,7 @@ impl std::error::Error for Error {
             Self::ApplePlistJson(source) => Some(source),
             Self::ApplePlistInput(source) => Some(source),
             Self::ApplePlistWait(source) => Some(source),
-            Self::QueryProvisionError { source, .. } => Some(source),
+            Self::QueryProvision { source, .. } => Some(source),
             _ => None,
         }
     }

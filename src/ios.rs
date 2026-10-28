@@ -2,12 +2,13 @@ use cargo_metadata::{Metadata, MetadataCommand};
 use std::collections::HashMap;
 use std::fs::{self, File, copy, create_dir_all, remove_file};
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use crate::Result;
 use crate::cli::Error;
 use crate::project::Project;
 use crate::apple::{AppleSigning, AppleSigningTarget, AscApiKey};
+use crate::apple::app_store::AppStoreConnect;
 use crate::devices::IOSDevice;
 use crate::host::Host;
 pub use crate::cli::ApplicationArgs;
@@ -56,7 +57,7 @@ impl IOSBuilder {
         let metadata: Metadata = MetadataCommand::new()
             .current_dir(&cwd)
             .exec()
-            .map_err(|e| Error::CargoParseError(e.to_string()))?;
+            .map_err(|e| Error::CargoParse(e.to_string()))?;
 
         let icon_path = Project::get_icon_path(&metadata, &cwd);
         let manifest = metadata.root_package().unwrap().manifest_path.clone().into_std_path_buf();
@@ -98,7 +99,7 @@ impl IOSBuilder {
 
         if bundle_path.as_path().exists() { let _ = fs::remove_dir_all(bundle_path); }
 
-        create_dir_all(bundle_path).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(bundle_path).map_err(|e| Error::CreateDirAll {
             path: bundle_path.to_path_buf(),
             source: e,
         })?;
@@ -109,7 +110,7 @@ impl IOSBuilder {
 
         if appicon_path.exists() { let _ = fs::remove_dir_all(&appicon_path); }
 
-        create_dir_all(&appicon_path).map_err(|e| Error::CreateDirAllError {
+        create_dir_all(&appicon_path).map_err(|e| Error::CreateDirAll {
             path: self.output_path.clone(),
             source: e,
         })?;
@@ -121,13 +122,13 @@ impl IOSBuilder {
 
         let contents_path: PathBuf = appicon_path.join("Contents.json");
         if contents_path.exists() {
-            remove_file(&contents_path).map_err(|e| Error::RemoveFileError {
+            remove_file(&contents_path).map_err(|e| Error::RemoveFile {
                 path: contents_path.clone(),
                 source: e,
             })?;
         }
         let mut contents_file = File::create(&contents_path)
-            .map_err(|e| Error::CreateFileError { path: contents_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateFile { path: contents_path.clone(), source: e })?;
 
         let json_contents = r#"{
     "images": [
@@ -139,7 +140,7 @@ impl IOSBuilder {
 
         contents_file
             .write_all(json_contents.trim().as_bytes())
-            .map_err(|e| Error::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFile(e.to_string()))?;
 
         let assets_output = bundle_path.join("Assets.car");
         let status = Command::new("xcrun")
@@ -167,13 +168,13 @@ impl IOSBuilder {
 
         let plist_path: PathBuf = bundle_path.join("Info.plist");
         if plist_path.exists() {
-            remove_file(&plist_path).map_err(|e| Error::RemoveFileError {
+            remove_file(&plist_path).map_err(|e| Error::RemoveFile {
                 path: plist_path.clone(),
                 source: e,
             })?;
         }
         let mut plist_file = File::create(&plist_path)
-            .map_err(|e| Error::CreateFileError { path: plist_path.clone(), source: e })?;
+            .map_err(|e| Error::CreateFile { path: plist_path.clone(), source: e })?;
 
         let plist_content = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -243,14 +244,14 @@ impl IOSBuilder {
 
         plist_file
             .write_all(plist_content.trim().as_bytes())
-            .map_err(|e| Error::WriteFileError(e.to_string()))?;
+            .map_err(|e| Error::WriteFile(e.to_string()))?;
 
         let output = Command::new("plutil")
             .args(["-convert", "binary1", &plist_path.display().to_string()])
             .output()
-            .map_err(|e| crate::apple::cli::Error::PlutilConvertError(e.to_string()))?;
+            .map_err(|e| crate::apple::cli::Error::PlutilConvert(e.to_string()))?;
         if !output.status.success() {
-            return Err(crate::apple::cli::Error::PlutilConvertError(
+            return Err(crate::apple::cli::Error::PlutilConvert(
                 String::from_utf8_lossy(&output.stderr).to_string(),
             ).into());
         }
@@ -280,13 +281,46 @@ impl IOSBuilder {
 
         Ok(())
     }
-}
 
-impl IOSBuilder {
+    fn provision_device(&self, device: &IOSDevice, certificate_id: &str, provision_cache: &Path) -> Result<()> {
+        let app_store = AppStoreConnect::new(self.asc_api_key.as_ref().unwrap())?;
+        let (profile_name, profile_data) = app_store.ios_ad_hoc_profile(
+            &device.id, &self.bundle_id, &self.app_name, certificate_id,
+        )?;
+        let profile_path = format!("{}.mobileprovision", profile_name);
+        fs::write(&profile_path, profile_data)
+            .map_err(|source| Error::CreateFile { path: (&profile_path).into(), source })?;
+
+        let _ = fs::create_dir_all(provision_cache);
+        let cached_profile = provision_cache.join(format!("{}.mobileprovision", profile_name));
+        let _ = fs::copy(&profile_path, &cached_profile);
+        let embedded_path = self.output_path.join("embedded.mobileprovision");
+        fs::copy(&profile_path, &embedded_path).map_err(|source| Error::CopyFile {
+            input_path: (&profile_path).into(), output_path: embedded_path.clone(), source,
+        })?;
+
+        let provision_tool = self.idp_path.as_ref().unwrap();
+        let install = Command::new(provision_tool)
+            .arg("install").arg(&embedded_path).args(["--udid", &device.id])
+            .output().map_err(|source| Error::CommandSpawn {
+                program: provision_tool.into(), source,
+            })?;
+        if !install.status.success() {
+            return Err(crate::apple::cli::Error::DeviceProvision(
+                String::from_utf8_lossy(&install.stderr).trim().to_string(),
+            ).into());
+        }
+        AppleSigning::ensure_entitlements(&self.output_path)?;
+        let _ = Command::new("xattr").arg("-cr").arg(&self.output_path)
+            .status().map_err(|source| Error::CommandSpawn { program: "xattr".into(), source })?;
+        let _ = fs::remove_file(profile_path);
+        Ok(())
+    }
+
     fn post_build(&mut self) -> Result<()> {
         let provision_cache = self.cwd.join("target").join("ios-cache").join("profiles");
         if !provision_cache.exists() {
-            create_dir_all(&provision_cache).map_err(|e| Error::CreateDirAllError {
+            create_dir_all(&provision_cache).map_err(|e| Error::CreateDirAll {
                 path: provision_cache.to_path_buf(),
                 source: e,
             })?;
@@ -299,7 +333,7 @@ impl IOSBuilder {
             .join(&self.app_name);
         let capitalized = Project::capitalize_first(&self.app_name);
         let bundle_path = self.output_path.join(&capitalized);
-        copy(&binary_path, &bundle_path).map_err(|e| Error::CopyFileError {
+        copy(&binary_path, &bundle_path).map_err(|e| Error::CopyFile {
             input_path: binary_path.clone(),
             output_path: bundle_path.clone(),
             source: e,
@@ -332,37 +366,29 @@ impl IOSBuilder {
                     &provision_cache,
                 )?;
                 if !provisioned {
-                    asc_client.provision_ios_device(
-                        target_id,
-                        &self.bundle_id,
-                        &self.app_name,
-                        &security_profile,
-                        output_path,
-                        idp_path,
-                        &provision_cache,
-                    )?;
+                    self.provision_device(device, &security_profile, &provision_cache)?;
                 }
             }
             AppleSigning::sign_app_bundle(output_path, &security_profile, AppleSigningTarget::Ios)?;
             let parent = output_path.parent().unwrap();
-            let ipa_path = parent.join(format!("{}.ipa", &capitalized));
+            let ipa_path = parent.join(format!("{}.ipa", capitalized));
             self.ipa_path = Some(ipa_path.clone());
             if ipa_path.as_path().exists() {
-                remove_file(&ipa_path).map_err(|e| Error::RemoveFileError {
+                remove_file(&ipa_path).map_err(|e| Error::RemoveFile {
                     path: ipa_path.to_path_buf(),
                     source: e,
                 })?;
             }
             let payload_path = parent.join("Payload");
             if payload_path.exists() { let _ = fs::remove_dir_all(&payload_path); }
-            create_dir_all(&payload_path).map_err(|e| Error::CreateDirAllError {
+            create_dir_all(&payload_path).map_err(|e| Error::CreateDirAll {
                 path: payload_path.to_path_buf(),
                 source: e,
             })?;
-            let dest = payload_path.join(format!("{}.app", &capitalized));
+            let dest = payload_path.join(format!("{}.app", capitalized));
             let status =
                 Command::new("cp").arg("-r").arg(output_path).arg(&dest).output().map_err(|e| {
-                    Error::CopyFileError {
+                    Error::CopyFile {
                         input_path: output_path.to_path_buf(),
                         output_path: dest.clone(),
                         source: e,
@@ -397,7 +423,7 @@ impl IOSRunner {
     //TODO this is currently broken
     fn deploy_usb(device_id: &str, output_path: &str, bundle_id: &str, developer: &std::path::Path) -> Result<()> {
         let _ = Command::new("xcrun")
-            .env("DEVELOPER_DIR", &developer)
+            .env("DEVELOPER_DIR", developer)
             .args([
                 "devicectl",
                 "device",
@@ -410,22 +436,22 @@ impl IOSRunner {
             ])
             .output();
         let output = Command::new("xcrun")
-            .env("DEVELOPER_DIR", &developer)
+            .env("DEVELOPER_DIR", developer)
             .args(["devicectl", "device", "install", "app", "--device", device_id, output_path])
             .output()
-            .map_err(|e| cli::Error::XcrunInstallError(e.to_string()))?;
+            .map_err(|e| cli::Error::XcrunInstall(e.to_string()))?;
         if !output.status.success() {
-            return Err(cli::Error::XcrunInstallError(
+            return Err(cli::Error::XcrunInstall(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ).into());
         }
         let output = Command::new("xcrun")
-            .env("DEVELOPER_DIR", &developer)
+            .env("DEVELOPER_DIR", developer)
             .args(["devicectl", "device", "process", "launch", "--device", device_id, bundle_id])
             .output()
-            .map_err(|e| cli::Error::XcrunLaunchError(e.to_string()))?;
+            .map_err(|e| cli::Error::XcrunLaunch(e.to_string()))?;
         if !output.status.success() {
-            return Err(cli::Error::XcrunLaunchError(
+            return Err(cli::Error::XcrunLaunch(
                 String::from_utf8_lossy(&output.stderr).trim().to_string(),
             ).into());
         }
