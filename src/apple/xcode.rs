@@ -1,9 +1,13 @@
+use plist::{Dictionary, Value as Plist};
 use serde_json::{Value, json};
 use std::fs::{self, File};
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::SystemTime;
 use crate::apple;
+use crate::apple::AppleSigningTarget;
+use crate::project::Project;
 use crate::Result;
 
 pub mod cli;
@@ -48,6 +52,251 @@ impl XcodeSigning {
     }
 
     pub fn team(&self) -> &str { &self.team }
+
+    pub fn verify_distribution(&self, bundle: &Path, target: AppleSigningTarget, identifier: &str) -> Result<()> {
+        let (oid, info_path, profile_path, executable_path) = match target {
+            AppleSigningTarget::Ios => (
+                "1.2.840.113635.100.6.1.4", "Info.plist", "embedded.mobileprovision", "",
+            ),
+            AppleSigningTarget::MacAppStore => (
+                "1.2.840.113635.100.6.1.7", "Contents/Info.plist",
+                "Contents/embedded.provisionprofile", "Contents/MacOS",
+            ),
+            AppleSigningTarget::MacExternal => (
+                "1.2.840.113635.100.6.1.13", "Contents/Info.plist",
+                "Contents/embedded.provisionprofile", "Contents/MacOS",
+            ),
+        };
+        let requirement = format!(
+            "=anchor apple generic and certificate leaf[field.{oid}] exists \
+             and certificate leaf[subject.OU] = \"{}\"", self.team,
+        );
+        let verified = Command::new("codesign")
+            .args(["--verify", "--strict", "--all-architectures", "-R", &requirement])
+            .arg(bundle).output().map_err(|source| crate::cli::Error::CommandSpawn {
+                program: "codesign".into(), source,
+            })?;
+        if !verified.status.success() {
+            return Err(cli::Error::DistributionSignature {
+                bundle: bundle.into(), output: verified,
+            }.into());
+        }
+        let info_path = bundle.join(info_path);
+        let info = Plist::from_file(&info_path).map_err(|source| {
+            cli::Error::DistributionPlist { path: info_path.clone(), source }
+        })?;
+        let info = info.as_dictionary().ok_or_else(|| cli::Error::DistributionField {
+            path: info_path.clone(), key: "dictionary",
+        })?;
+        if info.get("CFBundleIdentifier").and_then(Plist::as_string) != Some(identifier) {
+            return Err(cli::Error::DistributionIdentifier {
+                bundle: bundle.into(), expected: identifier.into(),
+            }.into());
+        }
+        let executable = info.get("CFBundleExecutable").and_then(Plist::as_string)
+            .filter(|value| !value.is_empty())
+            .ok_or(cli::Error::DistributionField {
+                path: info_path, key: "CFBundleExecutable",
+            })?;
+        let profile_path = bundle.join(profile_path);
+        let profile = match fs::metadata(&profile_path) {
+            Ok(_) => {
+                let decoded = Project::output(
+                    Command::new("security").args(["cms", "-D", "-i"]).arg(&profile_path),
+                )?;
+                Some(Plist::from_reader(Cursor::new(decoded)).map_err(|source| {
+                    cli::Error::DistributionPlist { path: profile_path.clone(), source }
+                })?)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if matches!(target, AppleSigningTarget::Ios) {
+                    return Err(cli::Error::DistributionProfileMissing {
+                        identifier: identifier.into(),
+                    }.into());
+                }
+                None
+            }
+            Err(source) => {
+                return Err(crate::cli::Error::ReadFile { path: profile_path, source }.into());
+            }
+        };
+        let profile = profile.as_ref().map(|profile| profile.as_dictionary()
+            .ok_or(cli::Error::DistributionField {
+                path: profile_path, key: "dictionary",
+            })).transpose()?;
+        let architectures = Project::output(Command::new("/usr/bin/lipo").arg("-archs")
+            .arg(bundle.join(executable_path).join(executable)))?;
+        if architectures.is_empty() {
+            return Err(cli::Error::DistributionField {
+                path: bundle.into(), key: "architectures",
+            }.into());
+        }
+        for architecture in String::from_utf8_lossy(&architectures).split_whitespace() {
+            let signed = Project::output(Command::new("codesign")
+                .args(["--display", "--entitlements", "-", "--xml", "--arch", architecture])
+                .arg(bundle))?;
+            let signed = if signed.is_empty() {
+                Plist::Dictionary(Dictionary::new())
+            } else {
+                Plist::from_reader(Cursor::new(signed)).map_err(|source| {
+                    cli::Error::DistributionPlist { path: bundle.into(), source }
+                })?
+            };
+            let signed = signed.as_dictionary().ok_or_else(|| cli::Error::DistributionField {
+                path: bundle.into(), key: "entitlements dictionary",
+            })?;
+            let allowed = profile.map(|profile| profile.get("Entitlements")
+                .and_then(Plist::as_dictionary).ok_or_else(|| cli::Error::DistributionProfileInvalid {
+                    identifier: identifier.into(), key: "Entitlements",
+                })).transpose()?;
+            for entitlements in std::iter::once(signed).chain(allowed) {
+                for key in ["get-task-allow", "com.apple.security.get-task-allow"] {
+                    if entitlements.get(key).is_some_and(|value| value.as_boolean() != Some(false)) {
+                        return Err(cli::Error::DistributionDebugEntitlement {
+                            identifier: identifier.into(), key,
+                        }.into());
+                    }
+                }
+                for key in ["aps-environment", "com.apple.developer.aps-environment"] {
+                    if entitlements.get(key).is_some_and(|value| value.as_string() != Some("production")) {
+                        return Err(cli::Error::DistributionEnvironment {
+                            identifier: identifier.into(), key, expected: "production",
+                        }.into());
+                    }
+                }
+            }
+            let cloud_key = "com.apple.developer.icloud-container-environment";
+            let cloud = signed.contains_key(cloud_key)
+                || signed.get("com.apple.developer.icloud-container-identifiers")
+                    .and_then(Plist::as_array).is_some_and(|values| !values.is_empty())
+                || signed.get("com.apple.developer.icloud-services").and_then(Plist::as_array)
+                    .is_some_and(|values| values.iter()
+                        .any(|value| value.as_string() == Some("CloudKit")));
+            if cloud && signed.get(cloud_key).and_then(Plist::as_string) != Some("Production") {
+                return Err(cli::Error::DistributionEnvironment {
+                    identifier: identifier.into(), key: cloud_key, expected: "Production",
+                }.into());
+            }
+            if let Some(profile) = profile {
+                let allowed = allowed.unwrap();
+                if profile.contains_key("ProvisionedDevices") {
+                    return Err(cli::Error::DistributionProfileInvalid {
+                        identifier: identifier.into(), key: "ProvisionedDevices",
+                    }.into());
+                }
+                if !matches!(target, AppleSigningTarget::MacExternal)
+                    && profile.get("ProvisionsAllDevices")
+                        .is_some_and(|value| value.as_boolean() != Some(false)) {
+                    return Err(cli::Error::DistributionProfileInvalid {
+                        identifier: identifier.into(), key: "ProvisionsAllDevices",
+                    }.into());
+                }
+                if !profile.get("TeamIdentifier").and_then(Plist::as_array)
+                    .is_some_and(|values| values.iter()
+                        .any(|value| value.as_string() == Some(&self.team)))
+                    || signed.get("com.apple.developer.team-identifier").and_then(Plist::as_string)
+                        != Some(&self.team) {
+                    return Err(cli::Error::DistributionProfileInvalid {
+                        identifier: identifier.into(), key: "TeamIdentifier",
+                    }.into());
+                }
+                let key = match target {
+                    AppleSigningTarget::Ios => "application-identifier",
+                    AppleSigningTarget::MacAppStore | AppleSigningTarget::MacExternal => {
+                        "com.apple.application-identifier"
+                    }
+                };
+                let application = signed.get(key).and_then(Plist::as_string);
+                if !profile.get("ApplicationIdentifierPrefix").and_then(Plist::as_array)
+                    .is_some_and(|values| values.iter().filter_map(Plist::as_string)
+                        .any(|prefix| application == Some(format!("{prefix}.{identifier}").as_str())))
+                    || !allowed.get(key).and_then(Plist::as_string).is_some_and(|allowed| {
+                        application.is_some_and(|application| match allowed.strip_suffix('*') {
+                            Some(prefix) => application.starts_with(prefix),
+                            None => application == allowed,
+                        })
+                    }) {
+                    return Err(cli::Error::DistributionProfileInvalid {
+                        identifier: identifier.into(), key,
+                    }.into());
+                }
+                if profile.get("ExpirationDate").and_then(Plist::as_date).map(SystemTime::from)
+                    .is_none_or(|expires| expires <= SystemTime::now()) {
+                    return Err(cli::Error::DistributionProfileInvalid {
+                        identifier: identifier.into(), key: "ExpirationDate",
+                    }.into());
+                }
+                for key in ["aps-environment", "com.apple.developer.aps-environment"] {
+                    if signed.contains_key(key)
+                        && allowed.get(key).and_then(Plist::as_string) != Some("production") {
+                        return Err(cli::Error::DistributionEnvironment {
+                            identifier: identifier.into(), key, expected: "production",
+                        }.into());
+                    }
+                }
+                if cloud
+                    && !allowed.get(cloud_key).is_some_and(|value| {
+                        value.as_string() == Some("Production")
+                            || value.as_array().is_some_and(|values| values.iter()
+                                .any(|value| value.as_string() == Some("Production")))
+                    }) {
+                    return Err(cli::Error::DistributionEnvironment {
+                        identifier: identifier.into(), key: cloud_key, expected: "Production",
+                    }.into());
+                }
+            } else {
+                if matches!(target, AppleSigningTarget::Ios) || cloud
+                    || [
+                        "aps-environment", "com.apple.developer.aps-environment",
+                        "com.apple.developer.ubiquity-kvstore-identifier",
+                        "com.apple.developer.ubiquity-container-identifiers",
+                        "com.apple.developer.icloud-services", "keychain-access-groups",
+                    ].iter().any(|key| signed.contains_key(key)) {
+                    return Err(cli::Error::DistributionProfileMissing {
+                        identifier: identifier.into(),
+                    }.into());
+                }
+            }
+
+            let certificates = tempfile::tempdir()?;
+            Project::output(Command::new("codesign")
+                .args(["--display", "--arch", architecture])
+                .arg(format!(
+                    "--extract-certificates={}", certificates.path().join("certificate").display(),
+                ))
+                .arg(bundle))?;
+            let leaf = certificates.path().join("certificate0");
+            let certificate = fs::read(&leaf).map_err(|source| crate::cli::Error::ReadFile {
+                path: leaf.clone(), source,
+            })?;
+            if let Some(profile) = profile
+                && !profile.get("DeveloperCertificates").and_then(Plist::as_array)
+                    .is_some_and(|values| values.iter()
+                        .any(|value| value.as_data() == Some(certificate.as_slice()))) {
+                return Err(cli::Error::DistributionCertificateMismatch {
+                    bundle: bundle.into(),
+                }.into());
+            }
+            let mut verify = Command::new("security");
+            verify.args(["verify-cert", "-p", "basic", "-c"]).arg(leaf);
+            let mut index = 1;
+            loop {
+                let path = certificates.path().join(format!("certificate{index}"));
+                if !path.try_exists()? { break; }
+                verify.arg("-c").arg(path);
+                index += 1;
+            }
+            let verified = verify.output().map_err(|source| crate::cli::Error::CommandSpawn {
+                program: "security".into(), source,
+            })?;
+            if !verified.status.success() {
+                return Err(cli::Error::DistributionCertificate {
+                    bundle: bundle.into(), output: verified,
+                }.into());
+            }
+        }
+        Ok(())
+    }
 
     pub fn sign_macos(&self, bundle: &Path, work: &Path, entitlements: &Path, release: bool, external: bool) -> Result<PathBuf> {
         let configuration = if release { "Release" } else { "Debug" };
@@ -117,8 +366,25 @@ impl XcodeSigning {
             .arg(&options)
             .arg("-allowProvisioningUpdates");
         self.run(command, &work.join("export.log"))?;
+        let info_path = bundle.join("Contents/Info.plist");
+        let info = Plist::from_file(&info_path).map_err(|source| {
+            cli::Error::DistributionPlist { path: info_path.clone(), source }
+        })?;
+        let identifier = info.as_dictionary().and_then(|info| info.get("CFBundleIdentifier"))
+            .and_then(Plist::as_string).filter(|value| !value.is_empty())
+            .ok_or(cli::Error::DistributionField {
+                path: info_path, key: "CFBundleIdentifier",
+            })?;
+        let target = if external {
+            AppleSigningTarget::MacExternal
+        } else {
+            AppleSigningTarget::MacAppStore
+        };
         let app = exported.join(format!("{name}.app"));
-        if app.is_dir() { return Ok(app); }
+        if app.is_dir() {
+            self.verify_distribution(&app, target, identifier)?;
+            return Ok(app);
+        }
 
         let packages = fs::read_dir(&exported)
             .map_err(|error| apple::cli::Error::Codesign(error.to_string()))?
@@ -162,7 +428,9 @@ impl XcodeSigning {
         if apps.len() != 1 {
             return Err(cli::Error::SigningExportAppCount { count: apps.len() }.into());
         }
-        Ok(apps.remove(0))
+        let app = apps.remove(0);
+        self.verify_distribution(&app, target, identifier)?;
+        Ok(app)
     }
 
     pub fn project(&self, bundle: &Path, work: &Path, entitlements: Option<&Path>, configuration: &str) -> Result<PathBuf> {

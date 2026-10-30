@@ -46,40 +46,6 @@ impl PushBuild {
 }
 
 impl PushSigning {
-    pub fn verify_ipa(&self, ipa: &Path, work: &Path) -> Result<()> {
-        let output = work.join("notification-verification");
-        if output.exists() {
-            std::fs::remove_dir_all(&output)
-                .map_err(|source| crate::cli::Error::RemoveSubdir { path: output.clone(), source })?;
-        }
-        let extracted = Command::new("ditto")
-            .args(["-x", "-k"])
-            .arg(ipa)
-            .arg(&output)
-            .output()
-            .map_err(|source| crate::cli::Error::CommandSpawn { program: "ditto".into(), source })?;
-        if !extracted.status.success() {
-            return Err(crate::cli::Error::CommandFailed { program: "ditto".into(), output: extracted }.into());
-        }
-        let apps = std::fs::read_dir(output.join("Payload"))
-            .map_err(|source| crate::cli::Error::ReadDir { path: output.join("Payload"), source })?
-            .map(|entry| entry.map(|entry| entry.path()))
-            .collect::<std::io::Result<Vec<_>>>()
-            .map_err(|source| crate::cli::Error::MapDir { path: output.join("Payload"), source })?;
-        let apps: Vec<_> = apps
-            .into_iter()
-            .filter(|path| path.extension().is_some_and(|value| value == "app"))
-            .collect();
-        let result = if let [app] = apps.as_slice() {
-            self.verify(app)
-        } else {
-            Err(cli::Error::PushIpaApplicationCount { count: apps.len() }.into())
-        };
-        std::fs::remove_dir_all(&output)
-            .map_err(|source| crate::cli::Error::RemoveSubdir { path: output.clone(), source })?;
-        result
-    }
-
     pub fn entitlements(&self, source: Option<&Path>, output: &Path) -> Result<PathBuf> {
         let mut entitlements = match source {
             Some(path) => Value::from_file(path).map_err(|error| {

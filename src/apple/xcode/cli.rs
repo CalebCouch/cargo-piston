@@ -31,6 +31,20 @@ pub enum Error {
     SigningPushUnavailable { team: String, log: PathBuf },
     SigningProfileUnavailable { team: String, log: PathBuf },
     SigningBuildFailed { log: PathBuf, details: Vec<String> },
+    DistributionSignature { bundle: PathBuf, output: std::process::Output },
+    DistributionCertificate { bundle: PathBuf, output: std::process::Output },
+    DistributionCertificateMismatch { bundle: PathBuf },
+    DistributionPlist { path: PathBuf, source: plist::Error },
+    DistributionField { path: PathBuf, key: &'static str },
+    DistributionIdentifier { bundle: PathBuf, expected: String },
+    DistributionProfileMissing { identifier: String },
+    DistributionProfileInvalid { identifier: String, key: &'static str },
+    DistributionDebugEntitlement { identifier: String, key: &'static str },
+    DistributionEnvironment {
+        identifier: String,
+        key: &'static str,
+        expected: &'static str,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -191,6 +205,40 @@ impl std::fmt::Display for Error {
                      Xcode log: {}", log.display(),
                 )
             }
+            Self::DistributionSignature { bundle, output } => write!(f,
+                "{} does not have a valid distribution signature for the selected team. \
+                 Rebuild with the matching Apple Distribution or Developer ID certificate.\n{}",
+                bundle.display(), String::from_utf8_lossy(&output.stderr).trim()),
+            Self::DistributionCertificate { bundle, output } => write!(f,
+                "The signing certificate for {} is not currently valid or trusted. \
+                 Renew or replace it in your Apple developer account, then rebuild.\n{}",
+                bundle.display(), String::from_utf8_lossy(&output.stderr).trim()),
+            Self::DistributionCertificateMismatch { bundle } => write!(f,
+                "The provisioning profile in {} does not authorize its signing certificate. \
+                 Rebuild with Xcode automatic distribution signing.", bundle.display()),
+            Self::DistributionPlist { path, source } => write!(f,
+                "Cannot read distribution metadata {}: {source}", path.display()),
+            Self::DistributionField { path, key } => write!(f,
+                "Distribution metadata {} needs a valid {key}. Rebuild the app bundle.",
+                path.display()),
+            Self::DistributionIdentifier { bundle, expected } => write!(f,
+                "The signed app {} must use bundle identifier {expected}. \
+                 Rebuild for the selected application.", bundle.display()),
+            Self::DistributionProfileMissing { identifier } => write!(f,
+                "The distribution app {identifier} needs a provisioning profile for its platform \
+                 or enabled capabilities. Rebuild with automatic distribution signing."),
+            Self::DistributionProfileInvalid { identifier, key } => write!(f,
+                "The distribution profile for {identifier} has an invalid {key}. \
+                 Regenerate the profile for the selected team, app, and distribution destination, \
+                 then rebuild."),
+            Self::DistributionDebugEntitlement { identifier, key } => write!(f,
+                "The distribution app or profile for {identifier} enables {key}. \
+                 This debugging entitlement must be false or absent when deploying. \
+                 Rebuild using distribution signing."),
+            Self::DistributionEnvironment { identifier, key, expected } => write!(f,
+                "The distribution app and profile for {identifier} must allow {key}={expected}. \
+                 Select the production service environment and regenerate the distribution profile, \
+                 then rebuild."),
         }
     }
 }
@@ -199,6 +247,7 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::TeamMenuWrite(source) | Self::TeamSelectionRead(source) => Some(source),
+            Self::DistributionPlist { source, .. } => Some(source),
             _ => None,
         }
     }

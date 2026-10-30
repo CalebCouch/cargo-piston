@@ -141,7 +141,7 @@ impl std::error::Error for Error {
 pub struct Cli;
 
 impl Cli {
-    pub fn start(args: DevelopmentArgs) -> Result<()> {
+    pub fn start(mut args: DevelopmentArgs) -> Result<()> {
         let application = Self::application(args.application.clone(), false)?;
         let developer = host::Cli::prepare_xcode("iphoneos", 0)?;
         let mut session = IOSDevelopment::new(application, developer);
@@ -214,7 +214,7 @@ impl Cli {
             session.application.verify_notifications(&signed)?;
             println!("Installing {} on {}", session.application.package().name, device.name);
             session.install(&signed, &device)?;
-            loop {
+            'launch: loop {
                 println!("Launching {identifier}. App output follows; press Ctrl-C to stop.");
                 match session.launch(&identifier, &device, &args.app_args) {
                     Err(error) if host::Cli::interactive()
@@ -222,48 +222,52 @@ impl Cli {
                             Some(Error::IosDeviceLocked { .. })) =>
                     {
                         eprintln!("\n{} is locked. Unlock it and keep the screen awake.", device.name);
-                        eprintln!("The app is installed; Piston will retry launching it.\n");
+                        eprintln!("The app is already installed.\n");
+                        eprintln!("  1. Retry after unlocking\n  2. Cancel\n  3. Switch to Simulator\n");
                         loop {
-                            eprint!("Press Enter after unlocking, or q to cancel: ");
+                            eprint!("Choose [1-3]: ");
                             io::stderr().flush()?;
                             let mut input = String::new();
                             let count = io::stdin().read_line(&mut input)?;
-                            if count == 0 || input.trim().eq_ignore_ascii_case("q") {
+                            if count == 0 || input.trim() == "2" {
                                 println!("Launch cancelled. The app is still installed.");
                                 return Ok(());
                             }
-                            if input.trim().is_empty() { break; }
-                            eprintln!("Press Enter to retry, or type q to cancel.");
+                            match input.trim() {
+                                "1" => break,
+                                "3" => break 'launch,
+                                _ => eprintln!("Enter 1 to retry, 2 to cancel, or 3 for Simulator."),
+                            }
                         }
                     }
                     result => return result,
                 }
             }
-        } else {
-            if args.setup {
-                return Err(Error::NotificationSetupDeviceRequired.into());
-            }
-            println!("Using the iOS Simulator.");
-            session.application.simulator_target()?;
-            session.developer = Self::prepare(&session.application, false)?;
-            let simulator = Simulator::select(&session.developer, args.device.as_deref())?;
-            println!("Opening {}", simulator.name);
-            simulator.boot(&session.developer)?;
-            let team = session.application.team().unwrap_or("simulator").to_owned();
-            println!(
-                "Building {} for {} ({})",
-                session.application.package().name,
-                simulator.name,
-                session.application.target()
-            );
-            let (bundle, identifier) =
-                session
-                    .application
-                    .build(&session.developer, &team, &mut |message| eprint!("{message}"))?;
-            simulator.install(&session.developer, &bundle)?;
-            println!("Launching {identifier}. App output follows; press Ctrl-C to stop.");
-            simulator.launch(&session.developer, &identifier, &args.app_args)
+            args.application.cargo.target = None;
+            args.device = None;
+            args.setup = false;
+            session.application = Self::application(args.application, false)?;
         }
+        if args.setup { return Err(Error::NotificationSetupDeviceRequired.into()); }
+        println!("Using the iOS Simulator.");
+        session.application.simulator_target()?;
+        session.developer = Self::prepare(&session.application, false)?;
+        let simulator = Simulator::select(&session.developer, args.device.as_deref())?;
+        println!("Opening {}", simulator.name);
+        simulator.boot(&session.developer)?;
+        let team = session.application.team().unwrap_or("simulator").to_owned();
+        println!(
+            "Building {} for {} ({})",
+            session.application.package().name,
+            simulator.name,
+            session.application.target()
+        );
+        let (bundle, identifier) = session.application.build(
+            &session.developer, &team, &mut |message| eprint!("{message}"),
+        )?;
+        simulator.install(&session.developer, &bundle)?;
+        println!("Launching {identifier}. App output follows; press Ctrl-C to stop.");
+        simulator.launch(&session.developer, &identifier, &args.app_args)
     }
 
     pub fn application(args: ApplicationArgs, store: bool) -> Result<IOSApplication> {

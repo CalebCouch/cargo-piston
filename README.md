@@ -169,8 +169,12 @@ and builds inside Linux. The default VM uses two CPUs, 4 GiB RAM, and a sparse
 64 GiB disk. This is a capacity limit; the disk consumes host space as data is written.
 Setup provides 2 GiB of disk-backed swap for build memory peaks.
 Rust `target` directories are excluded from source copies at every depth.
-Piston replaces its previous source copy and removes temporary transfer archives;
-the Linux Cargo build cache remains in the VM for later runs. Host folders are not mounted.
+Linux Cargo artifacts are stored on the host under
+`target/piston/linux/<package>/target`, respecting Cargo's configured target directory
+and `--target-dir`. Piston mounts only this cache directory writable at
+`/mnt/piston-target`; compilation still runs in Linux. Keeping it separate avoids
+mixing Linux and macOS build scripts and proc macros. After stopping development,
+run `cargo clean` in the host project to remove the Linux artifacts too.
 
 Existing VMs keep their configured disk capacity. If a build reports `No space left
 on device`, check both the Mac's free space and the VM's disk capacity. With the VM
@@ -186,7 +190,18 @@ preserves its build cache and application data; rerun `cargo piston dev linux`
 afterward.
 
 Closing the window, stopping with Ctrl-C, or a build/run failure shuts down the
-VM started by that command. Piston refuses to take over an already-running VM.
+VM started by that command. Shutdown removes the transferred sources, transfer
+archives, and desktop-session files, then trims the guest root filesystem to return
+freed disk blocks to the Mac. The host build cache and application data are preserved.
+Guest cleanup failures are reported, and Piston still attempts to stop the VM.
+
+Only one Piston Linux VM session may run on a Mac, including across projects,
+login accounts, `--vm` selections, and `--lima-home` directories. A second command
+asks you to stop the active session. Piston also refuses to start while another
+Lima VM is running, including one left running after a previous Piston process
+was killed. It does not take over or stop that VM. The lock at
+`/Users/Shared/.cargo-piston-linux-vm.lock` is released when the process exits;
+do not delete its file while a command is running.
 An existing stopped Lima VM can be selected explicitly:
 
 ```sh
@@ -239,6 +254,11 @@ Development and production have separate settings; configuring development does
 not assume that its APNs key also permits production. iPhone development uses the
 sandbox even with `--release`; TestFlight and App Store exports use production.
 For macOS, development builds use the sandbox and distribution exports use production.
+Piston checks each imported or saved APNs key against the environment being used before
+accepting it. Deployment requires production access; sandbox-only keys are valid only
+for development. A key supporting both environments can be used for either. Rejected
+keys reopen interactive setup, while unattended commands stop before building or uploading.
+App Store Connect credentials are separately checked against its production API.
 
 To import replacement APNs credentials for an enabled app, use:
 
@@ -250,9 +270,9 @@ cargo piston deploy testflight --setup
 
 Development setup replaces the development APNs credentials; iOS requires a physical
 device. Deployment setup also replaces App Store Connect credentials and replaces
-enabled production APNs credentials when preparing the actual application build.
-With `--prepare-only`, deployment setup checks App Store Connect and tools without
-registering notifications.
+enabled production APNs credentials before preparing the application build.
+`--prepare-only` also checks and configures enabled production notifications. Resuming
+TestFlight checks the saved production key again; `--screenshots-only` does not use APNs.
 
 Piston stores APNs keys and notification registration state in the selected team's
 encrypted AIR developer contract. Each app, platform, and environment has its own
@@ -355,9 +375,13 @@ macOS builder's default identifier.
 Piston creates or opens an ordinary `air_notifications::NotificationApplication`
 contract, waits for confirmed credential acceptance in AIR, and shares its private
 location with the notification service using AIR Inbox. Interrupted setup resumes
-the same application. Confirmed AIR storage is distinct from Apple accepting an
-APNs delivery; key scope and revocation are ultimately checked when the notification
-service contacts Apple.
+the same application. Credential preflight authenticates an HTTP/2 request with the
+selected key and app topic against the required APNs endpoint, using a nonexistent
+device token. It accepts only Apple's `BadDeviceToken` response, following Apple's
+[documented authentication-before-device-lookup flow](https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns).
+Authentication, environment, topic, connection, and unexpected response failures block
+setup. Failed imports do not replace saved credentials. This checks current access;
+it does not verify delivery to a real device or protect against later key revocation.
 
 Only the public ID is supplied as `RAMP_NOTIFICATION_APPLICATION` to the actual
 Cargo compilation, including both architectures in universal macOS builds.
@@ -389,9 +413,10 @@ application, prepares an app bundle, asks Xcode to sign it for development, inst
 and launches it with its standard output and standard error attached to your terminal.
 Ctrl-C stops the console session and is forwarded to the app. Repeating the command
 installs an update without uninstalling the app or erasing its container.
-If the phone locks before launch, Piston pauses. Unlock it and press Enter in the
-terminal to retry launching the installed app without rebuilding or reinstalling.
-Type `q` or press Ctrl-C to cancel. Commands without an interactive terminal report
+If the phone locks before launch, Piston offers a numbered menu: `1` retries after
+unlocking without rebuilding or reinstalling, `2` cancels, and `3` switches to the
+iOS Simulator. Switching rebuilds for the simulator and keeps the phone app installed.
+Press Ctrl-C to stop at any time. Commands without an interactive terminal report
 the locked device and exit instead of waiting for input.
 Each run cleans Xcode's generated signing products before importing the Rust app,
 so Xcode signs the copied executable again. Cargo's compilation cache is preserved.
@@ -511,6 +536,20 @@ command performs a single build/install/launch cycle; automatic reload and store
 submission are separate future workflows.
 
 ## Deploy iOS to App Store Connect
+
+Deployment checks production credentials independently of whether the app uses push
+notifications. Every exported IPA is checked for Apple distribution signing, the
+selected team and bundle ID, a valid App Store profile, and a signing certificate
+authorized by that profile. Development/ad-hoc/enterprise profiles and debugging
+entitlements are rejected. APNs entitlements must be production when present;
+iCloud containers must use Production when enabled. Xcode and App Store Connect
+continue to validate signing and account permissions during export and upload.
+
+`cargo piston dev` keeps development signing and sandbox notifications, including
+when using `--release` for an optimized development build. `--prepare-only` checks
+available account/APNs credentials; final certificate and profile checks require
+an exported app. Resuming TestFlight rechecks production APNs access without
+rebuilding the app Apple already received.
 
 Run `cargo piston deploy` from the app crate. It validates the screenshot folders,
 checks App Store access, prepares images, builds a release ARM64 iOS app, archives

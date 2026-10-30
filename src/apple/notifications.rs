@@ -4,9 +4,10 @@ use air_server::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::Duration;
+use std::process::{Command, Stdio};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use crate::developer::Credentials;
 use crate::manifest::Manifest;
 use crate::Result;
@@ -76,9 +77,6 @@ impl NotificationSetup {
         self.runtime.block_on(store.load(team))?;
         let credentials = match key {
             Some((path, key_id)) => {
-                if !Self::valid_id(key_id) || !Self::valid_id(team) {
-                    return Err(cli::Error::PushIdentifiersInvalid.into());
-                }
                 if Self::key_id(path).is_some_and(|id| id != key_id) {
                     return Err(cli::Error::PushKeyIdMismatch {
                         key_id: key_id.into(), path: path.to_path_buf(),
@@ -87,24 +85,22 @@ impl NotificationSetup {
                 let key = fs::read_to_string(path).map_err(|source| {
                     cli::Error::PushKeyRead { path: path.to_path_buf(), source }
                 })?;
-                let encoding = jsonwebtoken::EncodingKey::from_ec_pem(key.as_bytes())
-                    .map_err(cli::Error::PushKeyEncoding)?;
-                jsonwebtoken::encode(
-                    &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256),
-                    &serde_json::json!({"iss": team, "iat": 0}), &encoding,
-                ).map_err(cli::Error::PushKeySigning)?;
                 let credentials = ApnsCredentials { key, key_id: key_id.into(), team_id: team.clone() };
+                self.verify_credentials(&credentials)?;
                 let bytes = serde_json::to_vec(&credentials).unwrap();
                 self.runtime.block_on(store.save(team, &account, bytes))?;
                 credentials
             }
             None => match store.get(team, &account) {
-                Some(bytes) => serde_json::from_slice(bytes)
-                    .map_err(cli::Error::PushCredentialsInvalid)?,
+                Some(bytes) => {
+                    let credentials = serde_json::from_slice(bytes)
+                        .map_err(cli::Error::PushCredentialsInvalid)?;
+                    self.verify_credentials(&credentials)?;
+                    credentials
+                }
                 None => return Ok(None),
             },
         };
-        if credentials.team_id != *team { return Err(cli::Error::PushIdentifiersInvalid.into()); }
         let secret = store.identity(team, None)?
             .ok_or_else(|| cli::Error::PushIdentityMissing { team: team.clone() })?;
         let owner = secret.name().to_string();
@@ -130,6 +126,63 @@ impl NotificationSetup {
             ],
         )?;
         Ok(Some(application))
+    }
+}
+
+impl NotificationSetup {
+    fn verify_credentials(&self, credentials: &ApnsCredentials) -> Result<()> {
+        if !Self::valid_id(&credentials.key_id) || !Self::valid_id(&credentials.team_id)
+            || credentials.team_id != self.signing.team
+        { return Err(cli::Error::PushIdentifiersInvalid.into()); }
+        let encoding = jsonwebtoken::EncodingKey::from_ec_pem(credentials.key.as_bytes())
+            .map_err(cli::Error::PushKeyEncoding)?;
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::ES256);
+        header.kid = Some(credentials.key_id.clone());
+        let token = jsonwebtoken::encode(&header, &serde_json::json!({
+            "iss": credentials.team_id,
+            "iat": SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs(),
+        }), &encoding).map_err(cli::Error::PushKeySigning)?;
+        let endpoint = if self.signing.sandbox {
+            "https://api.sandbox.push.apple.com"
+        } else { "https://api.push.apple.com" };
+        let mut child = Command::new("/usr/bin/curl")
+            .args([
+                "--disable", "--http2", "--proto", "=https", "--silent", "--show-error",
+                "--connect-timeout", "10", "--max-time", "30", "--request", "POST",
+                "--header", "@-", "--header", "apns-push-type: background",
+                "--header", "apns-priority: 5", "--header", "apns-expiration: 0",
+                "--data-raw", "{\"aps\":{\"content-available\":1}}", "--write-out", "\n%{http_code}",
+            ])
+            .arg(format!("{endpoint}/3/device/{}", "0".repeat(64)))
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()
+            .map_err(|source| crate::cli::Error::CommandSpawn {
+                program: "/usr/bin/curl".into(), source,
+            })?;
+        let headers = format!("authorization: bearer {token}\napns-topic: {}\n", self.signing.topic);
+        let written = child.stdin.take().unwrap().write_all(headers.as_bytes());
+        let output = child.wait_with_output().map_err(|source| crate::cli::Error::CommandSpawn {
+            program: "/usr/bin/curl".into(), source,
+        })?;
+        if !output.status.success() {
+            return Err(cli::Error::PushAccessUnavailable {
+                sandbox: self.signing.sandbox, output,
+            }.into());
+        }
+        written?;
+        let response = String::from_utf8_lossy(&output.stdout);
+        let (body, status) = response.rsplit_once('\n')
+            .ok_or(cli::Error::PushAccessResponseInvalid)?;
+        let status = status.parse::<u16>().map_err(|_| cli::Error::PushAccessResponseInvalid)?;
+        let body: serde_json::Value = serde_json::from_str(body)
+            .map_err(|_| cli::Error::PushAccessResponseInvalid)?;
+        let reason = body.get("reason").and_then(serde_json::Value::as_str)
+            .ok_or(cli::Error::PushAccessResponseInvalid)?;
+        // APNs authenticates before looking up the deliberately nonexistent device token.
+        if status == 400 && reason == "BadDeviceToken" { return Ok(()); }
+        Err(cli::Error::PushKeyRejected {
+            key_id: credentials.key_id.clone(), topic: self.signing.topic.clone(),
+            sandbox: self.signing.sandbox, status, reason: reason.into(),
+        }.into())
     }
 }
 

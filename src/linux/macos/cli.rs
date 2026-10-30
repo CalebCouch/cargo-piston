@@ -13,13 +13,18 @@ pub enum Error {
     ManifestStringRequired { path: PathBuf, key: String },
     LinuxVmNameInvalid { name: String },
     LinuxVmHomeMissing,
-    LinuxVmLocked { name: String, source: Box<dyn std::error::Error> },
+    LinuxVmLockAccess(std::io::Error),
+    LinuxVmLockInvalid,
+    LinuxVmLocked(Box<dyn std::error::Error>),
+    LinuxVmRunning { process: String },
+    LinuxVmCacheMount { path: PathBuf, source: Box<dyn std::error::Error> },
     LinuxVmSignalHandler(ctrlc::Error),
     LinuxVmUnavailable { name: String, state: Option<String> },
     LinuxVmTargetMissing,
     LinuxVmTargetMismatch { actual: String, requested: String },
     LinuxVmDesktopTimeout,
-    LinuxVmStopFailed { name: String, home: PathBuf },
+    LinuxVmStopFailed { name: String, home: PathBuf, source: Box<dyn std::error::Error> },
+    LinuxVmShutdownTimeout,
     LinuxVmInterrupted,
     WritePlUtil(String),
     Shutdown { source: Box<dyn std::error::Error>, cleanup: Box<dyn std::error::Error> },
@@ -39,9 +44,20 @@ impl fmt::Display for Error {
             Self::LinuxVmNameInvalid { name } => write!(f,
                 "Invalid Lima VM name {name:?}. Use an alphanumeric name with '.', '_' or '-'."),
             Self::LinuxVmHomeMissing => write!(f, "Set HOME or provide --lima-home."),
-            Self::LinuxVmLocked { name, source } => {
-                write!(f, "Another Piston session owns VM {name}: {source}")
-            }
+            Self::LinuxVmLockAccess(source) => write!(f,
+                "Cannot open the machine's Linux VM lock: {source}"),
+            Self::LinuxVmLockInvalid => write!(f,
+                "/Users/Shared/.cargo-piston-linux-vm.lock must be a regular file."),
+            Self::LinuxVmLocked(source) => write!(f,
+                "Another Piston Linux session is active on this Mac. Close its window or stop \
+                 its command before starting another Linux VM.\n{source}"),
+            Self::LinuxVmRunning { process } => write!(f,
+                "A Lima VM is already running on this Mac. Stop it before starting a Piston \
+                 Linux session.\nRunning VM process: {process}"),
+            Self::LinuxVmCacheMount { path, source } => write!(f,
+                "The Linux VM could not access its build cache at {}. Check that the host \
+                 directory is available and writable, then rerun the command.\n{source}",
+                path.display()),
             Self::LinuxVmSignalHandler(source) => {
                 write!(f, "Cannot install Linux session shutdown handler: {source}")
             }
@@ -53,9 +69,11 @@ impl fmt::Display for Error {
                 "This VM builds {actual}; choose a VM matching the requested --target {requested}."),
             Self::LinuxVmDesktopTimeout => write!(f,
                 "Linux desktop forwarding did not become ready. Check the VM desktop logs."),
-            Self::LinuxVmStopFailed { name, home } => write!(f,
-                "Could not stop VM {name}. Run limactl stop --force with LIMA_HOME={}",
+            Self::LinuxVmStopFailed { name, home, source } => write!(f,
+                "Could not stop VM {name}. Run limactl stop --force {name} with LIMA_HOME={}\n{source}",
                 home.display()),
+            Self::LinuxVmShutdownTimeout => write!(f,
+                "Timed out while cleaning or stopping the Linux VM."),
             Self::LinuxVmInterrupted => write!(f, "Linux development interrupted."),
             Self::WritePlUtil(err) => write!(f, "Failed to write Plutil contents: {}", err),
             Self::Shutdown { source, cleanup } => write!(f, "{source}\n{cleanup}"),
@@ -67,7 +85,10 @@ impl std::error::Error for Error {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::LinuxVmHomeAccess { source, .. } => Some(source),
-            Self::LinuxVmLocked { source, .. } => Some(source.as_ref()),
+            Self::LinuxVmLockAccess(source) => Some(source),
+            Self::LinuxVmLocked(source) => Some(source.as_ref()),
+            Self::LinuxVmCacheMount { source, .. } => Some(source.as_ref()),
+            Self::LinuxVmStopFailed { source, .. } => Some(source.as_ref()),
             Self::LinuxVmSignalHandler(source) => Some(source),
             Self::Shutdown { source, .. } => Some(source.as_ref()),
             _ => None,
@@ -129,7 +150,7 @@ impl linux::Cli {
             development.show(&executable, "Piston Linux — ", "Close Linux VM", "Quit")
         })();
         if development.owns_vm() {
-            println!("Stopping Linux development VM {}", development.name());
+            println!("Cleaning temporary files and stopping Linux VM {}", development.name());
         }
         let stopped = development.stop();
         match (result, stopped) {

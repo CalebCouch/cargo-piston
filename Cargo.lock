@@ -594,7 +594,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-piston"
-version = "0.5.8"
+version = "0.5.9"
 dependencies = [
  "air",
  "air_notifications",

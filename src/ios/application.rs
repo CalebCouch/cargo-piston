@@ -177,13 +177,6 @@ impl IOSApplication {
         Ok(())
     }
 
-    pub fn verify_store_notifications(&self, ipa: &Path) -> Result<()> {
-        if let Some(notifications) = &self.notifications {
-            notifications.signing.verify_ipa(ipa, &self.work)?;
-        }
-        Ok(())
-    }
-
     pub fn remember_build(&mut self, number: String) -> Result<()> {
         Manifest::new(self.package.manifest_path.as_std_path())?
             .save(&["ios"], &[("build_number", &number)])?;

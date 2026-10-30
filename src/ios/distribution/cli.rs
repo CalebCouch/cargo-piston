@@ -4,13 +4,13 @@ use std::process::ExitStatus;
 use crate::Result;
 use crate::apple::xcode;
 use crate::host;
-use crate::ios;
 use super::IOSStore;
 
 #[derive(Debug)]
 pub enum Error {
     ArchiveMissing { path: PathBuf, log: PathBuf },
     ExportMissing { path: PathBuf, log: PathBuf },
+    ExportAppCount { count: usize },
     DistributionFailed { log: PathBuf, output: String, status: ExitStatus },
 }
 
@@ -22,6 +22,8 @@ impl fmt::Display for Error {
                 path.display(), log.display()),
             Self::ExportMissing { path, log } => write!(f,
                 "Xcode did not export {}. See {}.", path.display(), log.display()),
+            Self::ExportAppCount { count } => write!(f,
+                "The exported IPA must contain one app; found {count}. Rerun deployment to rebuild it."),
             Self::DistributionFailed { log, output, status } =>
                 Cli::failure(f, log, output, status),
         }
@@ -33,10 +35,9 @@ impl std::error::Error for Error {}
 pub struct Cli;
 
 impl Cli {
-    pub fn build(store: &mut IOSStore<'_>, setup: bool) -> Result<PathBuf> {
+    pub fn build(store: &mut IOSStore<'_>) -> Result<PathBuf> {
         let signing = xcode::Cli::store(store.application.team(), &store.developer)?;
         store.application.remember_team(signing.team())?;
-        ios::Cli::notifications(&mut store.application, signing.team(), false, setup)?;
         println!(
             "Building {} for the App Store (aarch64-apple-ios, release)",
             store.application.package().name
@@ -51,7 +52,7 @@ impl Cli {
         );
         store.archive(&signing, &bundle)?;
         println!(
-            "Exporting the signed app. Log: {}",
+            "Exporting and verifying production signing. Log: {}",
             store.application.work().join("store/export.log").display()
         );
         store.export()

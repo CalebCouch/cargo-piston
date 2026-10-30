@@ -64,6 +64,9 @@ impl Cli {
         let identifier = application.store_bundle_id()?.to_owned();
         let (key, team) = setup::Cli::from_project(root, application.team(), args.setup)?;
         application.remember_team(&team)?;
+        if !args.screenshots_only {
+            ios::Cli::notifications(&mut application, &team, false, args.setup)?;
+        }
         let version = &application.package().version;
         let version = format!("{}.{}.{}", version.major, version.minor, version.patch);
         println!("Checking App Store Connect for {identifier} {version}");
@@ -78,7 +81,7 @@ impl Cli {
         release::Cli::validate(&release, &screenshots)?;
         println!("Prepared {} screenshots in {}", screenshots.len(), output.display());
         if args.prepare_only {
-            println!("Screenshot and account checks passed. No app was built or uploaded.");
+            println!("Screenshot and credential checks passed. No app was built or uploaded.");
             if let Some(number) = build_number {
                 println!("Next upload: version {version}, build {number}.");
             }
@@ -89,7 +92,7 @@ impl Cli {
         } else {
             let developer = ios::Cli::prepare(&application, true)?;
             let mut store = IOSStore::new(application, &key, developer, build_number.unwrap())?;
-            let ipa = distribution::Cli::build(&mut store, args.setup)?;
+            let ipa = distribution::Cli::build(&mut store)?;
             println!("Prepared App Store build: {}", ipa.display());
             release::Cli::upload(&mut release, &screenshots)?;
             distribution::Cli::upload(&store)?;
@@ -113,6 +116,7 @@ impl Cli {
         let root = application.package().manifest_path.parent().unwrap().as_std_path();
         let (key, team) = setup::Cli::from_project(root, application.team(), args.setup)?;
         application.remember_team(&team)?;
+        ios::Cli::notifications(&mut application, &team, false, args.setup)?;
         let version = &application.package().version;
         let version = format!("{}.{}.{}", version.major, version.minor, version.patch);
         let identifier = application.store_bundle_id()?;
@@ -133,7 +137,7 @@ impl Cli {
         }
         if args.prepare_only {
             ios::Cli::prepare(&application, true)?;
-            println!("TestFlight account and toolchain checks passed. No build was uploaded.");
+            println!("TestFlight credential and toolchain checks passed. No build was uploaded.");
             if flight.uploaded {
                 println!("Will resume version {version}, build {}.", flight.build_number);
             } else {
@@ -153,7 +157,7 @@ impl Cli {
             let developer = ios::Cli::prepare(&application, true)?;
             let mut store =
                 IOSStore::new(application, &key, developer, flight.build_number.clone())?;
-            let ipa = distribution::Cli::build(&mut store, args.setup)?;
+            let ipa = distribution::Cli::build(&mut store)?;
             println!("Prepared TestFlight build: {}", ipa.display());
             distribution::Cli::upload(&store)?;
             flight.record_upload(&manifest)?;

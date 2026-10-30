@@ -7,6 +7,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::io::{BufReader, Read};
 use std::net::TcpListener;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
@@ -38,6 +39,19 @@ pub struct LinuxDevelopment {
 
 impl LinuxDevelopment {
     pub fn new(args: DevelopmentArgs) -> Result<Self> {
+        let lock_path = Path::new("/Users/Shared/.cargo-piston-linux-vm.lock");
+        let lock = match File::options().create_new(true).read(true).write(true)
+            .mode(0o644).open(lock_path) {
+            Ok(file) => file.set_permissions(fs::Permissions::from_mode(0o644)).map(|_| file),
+            Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists => {
+                if !fs::symlink_metadata(lock_path)?.file_type().is_file() {
+                    return Err(cli::Error::LinuxVmLockInvalid.into());
+                }
+                File::open(lock_path)
+            }
+            Err(source) => Err(source),
+        }.map_err(cli::Error::LinuxVmLockAccess)?;
+        lock.try_lock().map_err(|source| cli::Error::LinuxVmLocked(Box::new(source)))?;
         let project = Project::new(args.application, "linux", false)?;
         let manifest = Manifest::new(project.package.manifest_path.as_std_path())?;
         let settings = manifest.settings(&["linux"])?;
@@ -76,15 +90,6 @@ impl LinuxDevelopment {
         let home = env::current_dir()?.join(home);
         fs::create_dir_all(&home)
             .map_err(|source| cli::Error::LinuxVmHomeAccess { path: home.clone(), source })?;
-        let lock = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(home.join(format!(".piston-{name}.lock")))
-            .map_err(|source| cli::Error::LinuxVmHomeAccess { path: home.clone(), source })?;
-        lock.try_lock().map_err(|source| cli::Error::LinuxVmLocked {
-            name: name.clone(), source: Box::new(source),
-        })?;
         let interrupted = Arc::new(AtomicBool::new(false));
         let cancelled = interrupted.clone();
         ctrlc::set_handler(move || cancelled.store(true, Ordering::SeqCst))
@@ -177,6 +182,14 @@ impl LinuxDevelopment {
     }
 
     pub fn start_vm(&mut self) -> Result<()> {
+        let processes = Project::output(Command::new("/bin/ps").args(["-axo", "pid=,args="]))?;
+        if let Some(process) = String::from_utf8(processes)?.lines().find(|line| {
+            let arguments: Vec<_> = line.split_whitespace().collect();
+            arguments.windows(2).any(|pair| pair == ["hostagent", "--pidfile"])
+                && arguments.contains(&"--socket")
+        }) {
+            return Err(cli::Error::LinuxVmRunning { process: process.trim().into() }.into());
+        }
         let output = Project::output(self.lima().args(["list", "--json"]))?;
         let instances = String::from_utf8_lossy(&output)
             .lines()
@@ -208,11 +221,27 @@ impl LinuxDevelopment {
                 ]),
             )?;
         }
+        let target = self.project.work.join("target");
+        fs::create_dir_all(&target)?;
+        let mount = serde_json::json!({
+            "location": fs::canonicalize(target)?,
+            "mountPoint": "/mnt/piston-target",
+            "writable": true,
+        });
+        self.run(self.lima().args(["edit", "--tty=false", "--set"]).arg(format!(
+            ".mounts = ((.mounts // []) | map(select(.mountPoint != \"/mnt/piston-target\"))) \
+             + [{mount}]"
+        )).arg(&self.name))?;
         self.owned = true;
         self.run(self.lima().args(["start", "--tty=false", &self.name]))
     }
 
     pub fn prepare_guest(&mut self) -> Result<()> {
+        Project::output(&mut self.shell(
+            "mountpoint -q /mnt/piston-target && test -w /mnt/piston-target"
+        )).map_err(|source| cli::Error::LinuxVmCacheMount {
+            path: self.project.work.join("target"), source,
+        })?;
         let output = Project::output(&mut self.shell("printf '%s' \"$HOME\""))?;
         let home = String::from_utf8(output)?;
         self.guest = PathBuf::from(home).join(".local/share/piston").join(&self.identity);
@@ -307,7 +336,7 @@ impl LinuxDevelopment {
         let mut args = self.project.args.cargo.clone();
         args.manifest_path =
             Some(self.guest_path(self.project.package.manifest_path.as_std_path()));
-        args.target_dir = Some(self.guest.join("target"));
+        args.target_dir = Some(PathBuf::from("/mnt/piston-target"));
         args.target = Some(target.clone());
         let mut cargo = Command::new("cargo");
         cargo.args(["build", "--message-format=json-render-diagnostics"]);
@@ -454,29 +483,45 @@ impl LinuxDevelopment {
             if child.try_wait().ok().flatten().is_none() { let _ = child.kill(); }
             let _ = child.wait();
         }
-        if !self.owned { return Ok(()); }
-        for force in [false, true] {
-            let mut command = self.lima();
-            command.args(["stop", "--tty=false"]);
-            if force { command.arg("--force"); }
-            command.arg(&self.name);
-            let mut child = command
-                .spawn()
-                .map_err(|source| Error::CommandSpawn {
-                    program: self.lima.clone().into(), source,
-                })?;
-            let deadline = Instant::now() + Duration::from_secs(30);
-            loop {
-                if let Some(status) =
-                    child.try_wait().map_err(|source| Error::CommandWait {
-                        program: self.lima.clone().into(), source,
-                    })?
-                { if status.success() { self.owned = false; return Ok(()); } break; }
-                if Instant::now() > deadline { let _ = child.kill(); let _ = child.wait(); break; }
-                thread::sleep(Duration::from_millis(100));
+        let mut errors: Vec<Box<dyn std::error::Error>> = Vec::new();
+        for path in [
+            self.project.work.join("source.tar"), self.project.work.join("manifest-overlay.toml"),
+            self.project.work.join("viewer-pending.swift"), self.viewer_binary().with_extension("pending"),
+        ] {
+            if let Err(source) = fs::remove_file(&path)
+                && source.kind() != std::io::ErrorKind::NotFound {
+                errors.push(Error::RemoveFile { path, source }.into());
             }
         }
-        Err(cli::Error::LinuxVmStopFailed { name: self.name.clone(), home: self.home.clone() }.into())
+        if self.owned && !self.guest.as_os_str().is_empty()
+            && let Err(error) = self.finish(&mut self.shell(&format!(
+                "rm -rf -- {0}/source {0}/source.tar {0}/setup.sh {0}/session-* \
+                 && sudo -n fstrim /",
+                Self::quote(&self.guest),
+            ))) {
+            errors.push(error);
+        }
+        if self.owned {
+            let mut failure = None;
+            for force in [false, true] {
+                let mut command = self.lima();
+                command.args(["stop", "--tty=false"]);
+                if force { command.arg("--force"); }
+                command.arg(&self.name);
+                match self.finish(&mut command) {
+                    Ok(()) => { self.owned = false; break; }
+                    Err(error) => failure = Some(error),
+                }
+            }
+            if self.owned {
+                errors.push(cli::Error::LinuxVmStopFailed {
+                    name: self.name.clone(), home: self.home.clone(), source: failure.unwrap(),
+                }.into());
+            }
+        }
+        errors.into_iter().reduce(|source, cleanup| {
+            cli::Error::Shutdown { source, cleanup }.into()
+        }).map_or(Ok(()), Err)
     }
 
     fn lima(&self) -> Command {
@@ -510,6 +555,24 @@ impl LinuxDevelopment {
             if let Some(status) = child.try_wait()
                 .map_err(|source| Error::CommandWait { program: program.clone(), source })?
             { return Self::status(status, &program); }
+            thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    fn finish(&self, command: &mut Command) -> Result<()> {
+        let program = command.get_program().to_owned();
+        let mut child = command.spawn()
+            .map_err(|source| Error::CommandSpawn { program: program.clone(), source })?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait()
+                .map_err(|source| Error::CommandWait { program: program.clone(), source })?
+            { return Self::status(status, &program); }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(cli::Error::LinuxVmShutdownTimeout.into());
+            }
             thread::sleep(Duration::from_millis(100));
         }
     }

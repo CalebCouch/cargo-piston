@@ -10,7 +10,6 @@ pub enum Error {
     ApplePlistWait(std::io::Error),
     SigningCertificateMissing { name: String },
     SigningCertificateAmbiguous { name: String, teams: Vec<String> },
-    PushIpaApplicationCount { count: usize },
     PushProfileMissing { topic: String, output: std::process::Output },
     PushTopicMismatch { topic: String },
     PushArchitectures { output: std::process::Output },
@@ -59,9 +58,6 @@ impl std::fmt::Display for Error {
                 f, "Certificates named '{name}' belong to multiple teams: {}. Select a Team ID.",
                 teams.join(", "),
             ),
-            Self::PushIpaApplicationCount { count } => {
-                write!(f, "The exported IPA must contain one app; found {count}.")
-            }
             Self::PushProfileMissing { topic, output } => write!(
                 f, "Push notifications require an embedded provisioning profile for {topic}. \
                  Enable Push Notifications for this App ID and rebuild with automatic signing.\n{}",

@@ -18,6 +18,9 @@ pub enum Error {
     PushKeyIdMismatch { key_id: String, path: PathBuf },
     PushKeyEncoding(jsonwebtoken::errors::Error),
     PushKeySigning(jsonwebtoken::errors::Error),
+    PushKeyRejected { key_id: String, topic: String, sandbox: bool, status: u16, reason: String },
+    PushAccessUnavailable { sandbox: bool, output: std::process::Output },
+    PushAccessResponseInvalid,
     PushIdentityMissing { team: String },
     PushSetupTimeout,
     PushLocation(String),
@@ -78,6 +81,39 @@ impl std::fmt::Display for Error {
             Self::PushKeySigning(source) => {
                 write!(f, "The APNs .p8 file is not a valid P-256 signing key: {source}")
             }
+            Self::PushKeyRejected { key_id, topic, sandbox, status, reason } => {
+                let environment = if *sandbox { "Sandbox" } else { "Production" };
+                write!(f,
+                    "Apple rejected APNs key {key_id} for {topic} ({environment}): \
+                     HTTP {status}, {reason}.\n\n")?;
+                if matches!(status, 400 | 403) {
+                    if !sandbox {
+                        writeln!(f, "TestFlight and App Store deployments require Production access. \
+                            Sandbox-only keys can be used with cargo piston dev.")?;
+                    }
+                    write!(f,
+                        "1. Open the key's details:\n   {}\n\n\
+                         2. Under Apple Push Notification service, confirm {environment} access\n\
+                            and permission for {topic}, or create a key with that access.\n\
+                         3. Import the matching .p8 file and Key ID when Piston asks.\n\n\
+                         Rerun this command in a terminal to replace the rejected key.",
+                        host::Cli::link("Apple developer keys",
+                            "https://developer.apple.com/account/resources/authkeys/list"))
+                } else {
+                    write!(f, "Apple could not verify APNs access. Retry this command later.\n\
+                        Piston has not accepted or changed these credentials.")
+                }
+            }
+            Self::PushAccessUnavailable { sandbox, output } => {
+                let environment = if *sandbox { "sandbox" } else { "production" };
+                write!(f,
+                    "Could not check APNs {environment} access ({}).\n\
+                     Check your network connection and retry. Piston requires a successful check.\n{}",
+                    output.status, String::from_utf8_lossy(&output.stderr).trim())
+            }
+            Self::PushAccessResponseInvalid => write!(f,
+                "Apple returned an unexpected APNs credential-check response.\n\
+                 Access has not been verified; retry this command."),
             Self::PushIdentityMissing { team } => write!(
                 f, "Developer identity for team {team} is missing. \
                  Run cargo piston setup or cargo piston restore.",
@@ -168,8 +204,18 @@ impl Cli {
         let interactive = io::stdin().is_terminal() && io::stderr().is_terminal();
         let environment = if setup.signing.sandbox { "development" } else { "production" };
         println!("Checking {environment} notifications for {}", setup.signing.topic);
-        if !replace
-            && let Some(application) = setup.configure(None, &mut store)? { return Ok(application); }
+        if !replace {
+            match setup.configure(None, &mut store) {
+                Ok(Some(application)) => return Ok(application),
+                Ok(None) => {}
+                Err(error) if interactive && matches!(error.downcast_ref::<Error>(), Some(
+                    Error::PushKeyRejected { status: 400 | 403, .. }
+                    | Error::PushKeyEncoding(_) | Error::PushKeySigning(_)
+                    | Error::PushIdentifiersInvalid | Error::PushCredentialsInvalid(_)
+                )) => eprintln!("\n{error}"),
+                Err(error) => return Err(error),
+            }
+        }
         if !interactive {
             return Err(Error::SetupIncomplete {
                 topic: setup.signing.topic.clone(), sandbox: setup.signing.sandbox,
@@ -191,6 +237,11 @@ impl Cli {
              Piston saves the key encrypted in AIR and shares it with the notification service.\n\
              Back up the team's identity with cargo piston backup. Enter q to cancel."
         );
+        if setup.signing.sandbox {
+            println!("\nDevelopment requires Sandbox access; a key supporting both environments works.");
+        } else {
+            println!("\nDeployment requires Production access. Sandbox-only keys will be rejected.");
+        }
         loop {
             let input = Self::prompt("APNs Key ID or .p8 file path", "")?;
             let (path, key_id) = if NotificationSetup::valid_id(&input) {
@@ -242,13 +293,15 @@ impl Cli {
                 continue;
             }
             println!(
-                "\nRegistering {environment} notifications; waiting for AIR confirmation..."
+                "\nChecking APNs {environment} access, then waiting for AIR confirmation..."
             );
             let application = match setup.configure(Some((&path, &key_id)), &mut store) {
                 Ok(application) => application.unwrap(),
                 Err(error) if matches!(error.downcast_ref::<Error>(), Some(
                     Error::PushKeyRead { .. } | Error::PushKeyEncoding(_)
                     | Error::PushKeySigning(_) | Error::PushKeyIdMismatch { .. }
+                    | Error::PushIdentifiersInvalid
+                    | Error::PushKeyRejected { status: 400 | 403, .. }
                 )) => {
                     eprintln!("{error}"); continue;
                 }
@@ -258,7 +311,8 @@ impl Cli {
                 "\nNotifications configured.\n\
                  Registration confirmed in AIR and shared with the notification service.\n\
                  Public settings saved in Cargo.toml.\n\
-                 Apple checks the key's permissions when a push is sent."
+                 APNs credential preflight passed for {environment}.\n\
+                 Notification delivery still requires a valid device registration."
             );
             return Ok(application);
         }

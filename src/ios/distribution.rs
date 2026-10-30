@@ -4,8 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use crate::Result;
 use crate::cli::Error;
-use crate::apple::AscApiKey;
-use crate::apple::XcodeSigning;
+use crate::apple::{AppleSigningTarget, AscApiKey, XcodeSigning};
 use super::application::IOSApplication;
 
 pub mod cli;
@@ -77,12 +76,14 @@ impl<'a> IOSStore<'a> {
                 path: ipa, log: archive.work.join("export.log"),
             }.into());
         }
-        self.application.verify_store_notifications(&ipa)?;
+        self.verify_ipa(&ipa)?;
         Ok(ipa)
     }
 
     pub fn upload(&self) -> Result<()> {
         let archive = self.archive.as_ref().unwrap();
+        let name = archive.path.file_stem().unwrap().to_str().unwrap();
+        self.verify_ipa(&archive.work.join("export").join(format!("{name}.ipa")))?;
         self.export_archive(archive, "upload")?;
         Ok(())
     }
@@ -96,6 +97,30 @@ struct IOSArchive {
 }
 
 impl IOSStore<'_> {
+    fn verify_ipa(&self, ipa: &Path) -> Result<()> {
+        let output = tempfile::tempdir_in(self.application.work())?;
+        let extracted = Command::new("ditto").args(["-x", "-k"]).arg(ipa).arg(output.path()).output()
+            .map_err(|source| Error::CommandSpawn { program: "ditto".into(), source })?;
+        IOSApplication::check(extracted, "ditto")?;
+        let payload = output.path().join("Payload");
+        let apps = fs::read_dir(&payload)
+            .map_err(|source| Error::ReadDir { path: payload.clone(), source })?
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|source| Error::MapDir { path: payload, source })?;
+        let apps: Vec<_> = apps.into_iter()
+            .filter(|path| path.extension().is_some_and(|value| value == "app"))
+            .collect();
+        let [app] = apps.as_slice() else {
+            return Err(cli::Error::ExportAppCount { count: apps.len() }.into());
+        };
+        let archive = self.archive.as_ref().unwrap();
+        XcodeSigning::new(&archive.team, &self.developer).verify_distribution(
+            app, AppleSigningTarget::Ios, self.application.store_bundle_id()?,
+        )?;
+        self.application.verify_notifications(app)
+    }
+
     fn command(&self, archive: &IOSArchive) -> Command {
         let mut command = IOSApplication::command(&archive.developer, "xcodebuild");
         command
