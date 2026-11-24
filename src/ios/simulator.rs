@@ -112,7 +112,12 @@ impl Simulator {
                 IOSApplication::command(developer, "simctl").args(["boot", &self.id]),
             )?;
         }
-        let app = developer.join("Applications/Simulator.app");
+        let pre_xcode_v27_0_path = developer.join("Applications/Simulator.app");
+        let app = if pre_xcode_v27_0_path.exists() {
+            pre_xcode_v27_0_path
+        } else {
+            developer.parent().unwrap_or(developer).join("Applications/DeviceHub.app")
+        };
         Project::run(
             Command::new("open").arg("-a").arg(app).args([
                 "--args",
